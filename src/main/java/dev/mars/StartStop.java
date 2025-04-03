@@ -21,7 +21,7 @@ public class StartStop {
         System.out.println("To stop server, connect to port 9001");
 
         try (BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in))) {
-            System.out.println("Enter commands (status, shutdown, or quit to exit):");
+            System.out.println("> Enter commands (status, shutdown, or quit to exit):");
             String command;
             while (true) {
                 System.out.print("> ");
@@ -33,7 +33,7 @@ public class StartStop {
                 if (command.equalsIgnoreCase("status") || command.equalsIgnoreCase("shutdown")) {
                     checkServerStatus(command);
                 } else {
-                    System.out.println("Unknown command. Available commands: status, shutdown, quit");
+                    System.out.println("Unknown command. Available commands: status, shutdown");
                 }
             }
         } catch (IOException e) {
@@ -51,6 +51,7 @@ public class StartStop {
 
             out.println(cmd);
             String response = in.readLine();
+
             System.out.println("Server response: " + response);
 
         } catch (IOException e) {

@@ -8,7 +8,6 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ThreadPooledServer implements Runnable{
-
     protected int          serverPort   = 8080;
     protected ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
