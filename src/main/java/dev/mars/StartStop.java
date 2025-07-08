@@ -8,6 +8,9 @@ import java.net.Socket;
 
 public class StartStop {
 
+    /**
+     * Main entry point - starts the server and shutdown monitor, then provides a console interface for commands.
+     */
     public static void main(String[] args) {
 
         var threadPooledServer = new ThreadPooledServer(9000, 10);
