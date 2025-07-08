@@ -13,7 +13,7 @@ public class ThreadPooledServer implements Runnable{
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
     protected Thread       runningThread= null;
     protected ExecutorService threadPool = null;
-    protected String SERVER_NAME = "ThreadPooledServer";
+    final protected String SERVER_NAME = "ThreadPooledServer";
 
     public ThreadPooledServer(int port, int threadPoolSize) {
         this.serverPort = port;
@@ -30,6 +30,7 @@ public class ThreadPooledServer implements Runnable{
             try {
                 clientSocket = this.serverSocket.accept();
                 System.out.println("Client connected: " + clientSocket.getInetAddress());
+
             } catch (IOException e) {
                 if(isStopped()) {
                     System.out.println(SERVER_NAME + " Stopped.") ;
