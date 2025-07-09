@@ -44,7 +44,6 @@ public class ThreadPooledServer implements Runnable{
         System.out.println(SERVER_NAME + " Closed.") ;
     }
 
-
     public synchronized boolean isStopped() {
         return this.isStopped.get();
     }

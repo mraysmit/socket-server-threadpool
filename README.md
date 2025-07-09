@@ -5,7 +5,7 @@ A Java-based multi-threaded socket server implementation that demonstrates concu
 ## 🚀 Features
 
 - **Thread Pool Architecture**: Efficiently handles multiple concurrent client connections using a fixed-size thread pool
-- **HTTP Response Support**: Returns proper HTTP responses to client requests
+- **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
 - **Graceful Shutdown**: Administrative interface for controlled server shutdown
 - **Status Monitoring**: Real-time server status checking capabilities
 - **Console Management**: Interactive command-line interface for server administration
@@ -18,7 +18,10 @@ src/main/java/dev/mars/
 ├── StartStop.java           # Main application entry point
 ├── ThreadPooledServer.java  # Core server implementation
 ├── WorkerRunnable.java      # Client request handler
-└── ShutdownMonitor.java     # Administrative monitoring service
+├── ShutdownMonitor.java     # Administrative monitoring service
+├── HttpResponse.java        # HTTP response data model
+├── HttpResponseBuilder.java # HTTP response builder (Builder pattern)
+└── HttpResponseWriter.java  # HTTP response writer service
 ```
 
 ## 🏗️ Architecture Overview
@@ -32,8 +35,21 @@ src/main/java/dev/mars/
 
 2. **WorkerRunnable**: Handles individual client requests
    - Processes each client connection in a separate thread
-   - Returns HTTP-compliant responses
+   - Uses HTTP response classes for clean separation of concerns
    - Logs request processing details
+
+5. **HttpResponse**: Data model for HTTP responses
+   - Encapsulates status line, headers, and body
+   - Provides content length calculation
+
+6. **HttpResponseBuilder**: Builder pattern for creating HTTP responses
+   - Fluent API for constructing responses
+   - Provides common response factory methods
+   - Automatically handles content-length calculation
+
+7. **HttpResponseWriter**: Service for writing HTTP responses
+   - Handles the serialization of HTTP responses to output streams
+   - Provides convenience methods for common response types
 
 3. **ShutdownMonitor**: Administrative service running on port 9001
    - Provides server status checking
@@ -161,6 +177,25 @@ The default thread pool size is 10. Consider adjusting based on:
 - Expected concurrent connections
 - Server hardware capabilities
 - Response time requirements
+
+## 🏗️ SOLID Design Principles
+
+This project demonstrates SOLID design principles in action:
+
+### Single Responsibility Principle (SRP)
+- **HttpResponse**: Only handles HTTP response data
+- **HttpResponseBuilder**: Only responsible for building HTTP responses
+- **HttpResponseWriter**: Only handles writing responses to output streams
+- **WorkerRunnable**: Focuses on client request processing, delegates response creation
+
+### Open/Closed Principle (OCP)
+- Easy to extend with new response types without modifying existing classes
+- HttpResponseBuilder provides factory methods for common responses
+- New response writers can be added without changing existing code
+
+### Dependency Inversion Principle (DIP)
+- WorkerRunnable can accept HttpResponseWriter via constructor injection
+- Classes depend on abstractions rather than concrete implementations
 
 ## 🛡️ Thread Safety
 
