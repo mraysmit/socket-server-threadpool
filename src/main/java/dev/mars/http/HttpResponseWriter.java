@@ -1,4 +1,4 @@
-package dev.mars;
+package dev.mars.http;
 
 import java.io.IOException;
 import java.io.PrintWriter;

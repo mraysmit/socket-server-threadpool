@@ -1,4 +1,6 @@
-package dev.mars;
+package dev.mars.server;
+
+import dev.mars.worker.WorkerRunnable;
 
 import java.net.ServerSocket;
 import java.net.Socket;

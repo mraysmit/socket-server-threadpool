@@ -1,4 +1,8 @@
-package dev.mars;
+package dev.mars.worker;
+
+import dev.mars.http.HttpResponse;
+import dev.mars.http.HttpResponseBuilder;
+import dev.mars.http.HttpResponseWriter;
 
 import java.io.*;
 import java.net.Socket;

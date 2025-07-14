@@ -1,4 +1,4 @@
-package dev.mars;
+package dev.mars.server;
 
         import java.io.*;
         import java.net.ServerSocket;
