@@ -22,7 +22,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @Timeout(15)
 class TextMessageClientTest {
     private static final UUID MESSAGE_ID = UUID.fromString("11111111-1111-4111-8111-111111111111");
-    private static final UUID SERVER_ID = UUID.fromString("22222222-2222-4222-8222-222222222222");
+    private static final String SERVER_ID = "server-test";
     @ParameterizedTest
     @NullAndEmptySource
     @ValueSource(strings = {"   ", "hello\nshutdown", "hello\rshutdown"})
@@ -49,14 +49,14 @@ class TextMessageClientTest {
             "reply",
             "reply {messageId} {serverId} Received: Hello",
             "reply not-a-uuid {serverId} 1 Received: Hello",
-            "reply {messageId} not-a-uuid 1 Received: Hello",
+            "reply {messageId} invalid|server 1 Received: Hello",
             "reply {messageId} {serverId} invalid Received: Hello",
             "reply {messageId} {serverId} 0 Received: Hello",
             "reply {messageId} {serverId} -1 Received: Hello"
     })
     void rejectsMissingAndMalformedReplyIds(String reply) throws Exception {
         assertRejectedReply(reply.replace("{messageId}", MESSAGE_ID.toString())
-                .replace("{serverId}", SERVER_ID.toString()), "Invalid message reply");
+                .replace("{serverId}", SERVER_ID), "Invalid message reply");
     }
 
     @Test

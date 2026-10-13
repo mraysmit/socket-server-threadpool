@@ -98,11 +98,23 @@ mvn clean compile
 
 ### Running the Server
 
-Compile and start the interactive application:
+Compile and start the interactive application with the server ID `Server-001`:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001"
+```
+
+The server ID is the first startup argument. To use a generated UUID default,
+omit that argument:
 
 ```powershell
 mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop"
 ```
+
+The ID may contain letters, digits, dots, underscores, and hyphens. Leading and
+trailing whitespace is removed. An omitted, empty, or whitespace-only ID defaults
+to a generated UUID. The chosen ID appears in the startup log, request logs, and
+text-message replies. Choose a distinct ID for each running server.
 
 In PowerShell, keep the entire `-Dexec.mainClass=...` argument in quotes.
 Quoting only the class name can cause an `Unknown lifecycle phase` error.
@@ -111,6 +123,12 @@ Alternatively, compile with Maven and launch directly with Java:
 
 ```powershell
 mvn compile
+java -cp target/classes dev.mars.StartStop Server-001
+```
+
+To use a generated UUID default when launching directly:
+
+```powershell
 java -cp target/classes dev.mars.StartStop
 ```
 
@@ -148,15 +166,15 @@ Start the app, then enter a message at its console prompt:
 ```text
 > send Hello server
 Sending: messageId=11111111-1111-4111-8111-111111111111 | text=Hello server
-Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=22222222-2222-4222-8222-222222222222 | connectionId=1 | text=Received: Hello server
+Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | text=Received: Hello server
 ```
 
 The client generates a UUID for each message and checks that the reply contains
 the same ID and expected echoed text. Replies also include the server instance's
-UUID and connection ID. Missing or malformed IDs, mismatched message IDs, and
+ID and connection ID. Missing or malformed IDs, mismatched message IDs, and
 incorrect reply text cause an error instead of being displayed as successful replies.
-Each server creates its instance ID when constructed and keeps it for its lifetime;
-restarting the application creates a new instance ID.
+Each server keeps its selected ID for its lifetime. A provided ID can be reused
+after restart; an automatically generated UUID changes on each startup.
 
 The server logs the message ID, server ID, connection ID, and client address.
 Messages support UTF-8, including non-English text. Each message is one nonempty
@@ -218,6 +236,16 @@ To run a single test class:
 mvn test "-Dtest=HttpResponseWriterTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
+
+To run the test that starts `Server-001` and verifies its ID in a text-message reply:
+
+```powershell
+mvn test "-Dtest=ServerLifecycleTest#configuredServerIdAppearsInMessageReply" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+The terminal displays startup and message logs with `serverId=Server-001`, followed
+by `Named server test PASSED` and the verified reply. The two-server test uses
+`Server-001` and `Server-002` and checks that each reply identifies the correct server.
 
 #### 1,000-Request Load Test
 
@@ -367,8 +395,8 @@ IP address and source port, server name and instance ID, message ID when availab
 thread ID, and virtual-thread status:
 
 ```text
-[2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=22222222-2222-4222-8222-222222222222 | messageId=- | thread=42 | virtual=true
-[2026-10-13 14:30:00.124 +08:00] Message received: Hello server | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=22222222-2222-4222-8222-222222222222 | messageId=11111111-1111-4111-8111-111111111111 | thread=42 | virtual=true
+[2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=Server-001 | messageId=- | thread=42 | virtual=true
+[2026-10-13 14:30:00.124 +08:00] Message received: Hello server | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=Server-001 | messageId=11111111-1111-4111-8111-111111111111 | thread=42 | virtual=true
 ```
 
 The same connection ID appears in both entries and is unique within the running

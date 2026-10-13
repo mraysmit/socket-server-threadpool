@@ -29,10 +29,10 @@ public class WorkerRunnable implements Runnable {
     protected String serverText = null;
     private final HttpResponseWriter responseWriter;
     private final long connectionId = NEXT_CONNECTION_ID.incrementAndGet();
-    private final UUID serverId;
+    private final String serverId;
     private UUID messageId;
 
-    public WorkerRunnable(Socket clientSocket, String serverText, UUID serverId) {
+    public WorkerRunnable(Socket clientSocket, String serverText, String serverId) {
         this(clientSocket, serverText, serverId, new HttpResponseWriter());
     }
 
@@ -40,7 +40,7 @@ public class WorkerRunnable implements Runnable {
      * Constructor that allows dependency injection of HttpResponseWriter.
      * This follows the Dependency Inversion Principle.
      */
-    public WorkerRunnable(Socket clientSocket, String serverText, UUID serverId, HttpResponseWriter responseWriter) {
+    public WorkerRunnable(Socket clientSocket, String serverText, String serverId, HttpResponseWriter responseWriter) {
         this.clientSocket = clientSocket;
         this.serverText = serverText;
         this.responseWriter = responseWriter;

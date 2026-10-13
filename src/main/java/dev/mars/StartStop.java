@@ -17,8 +17,10 @@ public class StartStop {
      * Main entry point - starts the server and shutdown monitor, then provides a console interface for commands.
      */
     public static void main(String[] args) {
-
-        var threadPooledServer = new ThreadPooledServer(9000);
+        if (args.length > 1) {
+            throw new IllegalArgumentException("Usage: StartStop [serverId]");
+        }
+        var threadPooledServer = new ThreadPooledServer(9000, args.length == 0 ? null : args[0]);
         var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);
 
         System.out.println("Starting Main Server");

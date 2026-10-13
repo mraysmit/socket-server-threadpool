@@ -51,7 +51,7 @@ class ServerLifecycleTest {
             serverPort = serverReservation.getLocalPort();
             monitorPort = monitorReservation.getLocalPort();
         }
-        server = new ThreadPooledServer(serverPort);
+        server = new ThreadPooledServer(serverPort, "Server-001");
         monitor = new ShutdownMonitor(monitorPort, server);
         serverTask = servers.submit(server);
         try (var client = awaitConnection(serverPort, serverTask)) {
@@ -157,6 +157,18 @@ class ServerLifecycleTest {
         }
     }
 
+    @Test
+    void configuredServerIdAppearsInMessageReply() throws Exception {
+        UUID messageId = UUID.randomUUID();
+        var reply = new TextMessageClient("127.0.0.1", serverPort).send(messageId, "Hello Server-001");
+
+        assertEquals("Server-001", server.getServerId());
+        assertEquals("Server-001", reply.serverId());
+        assertEquals(messageId, reply.messageId());
+        assertEquals("Received: Hello Server-001", reply.text());
+        System.out.println("Named server test PASSED: " + reply);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"Hello server", "你好 🌍", "status", "shutdown", "  keep these spaces  "})
     void textMessagesReceiveUtf8Replies(String message) throws Exception {
@@ -231,7 +243,7 @@ class ServerLifecycleTest {
         try (var reservation = new ServerSocket(0)) {
             otherPort = reservation.getLocalPort();
         }
-        var other = new ThreadPooledServer(otherPort);
+        var other = new ThreadPooledServer(otherPort, "Server-002");
         try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
             var task = executor.submit(other);
             try {
@@ -245,6 +257,8 @@ class ServerLifecycleTest {
                 assertEquals(messageId, second.messageId());
                 assertEquals(server.getServerId(), first.serverId());
                 assertEquals(other.getServerId(), second.serverId());
+                assertEquals("Server-001", first.serverId());
+                assertEquals("Server-002", second.serverId());
                 assertNotEquals(first.serverId(), second.serverId());
                 assertEquals("Received: Hello", first.text());
                 assertEquals("Received: Hello", second.text());

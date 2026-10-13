@@ -59,7 +59,10 @@ public class TextMessageClient {
         }
         MessageReply parsed;
         try {
-            parsed = new MessageReply(UUID.fromString(fields[1]), UUID.fromString(fields[2]),
+            if (!fields[2].matches("[A-Za-z0-9._-]+")) {
+                throw new IllegalArgumentException("Invalid server ID");
+            }
+            parsed = new MessageReply(UUID.fromString(fields[1]), fields[2],
                     Long.parseLong(fields[3]), fields[4]);
             if (parsed.connectionId() <= 0) {
                 throw new IllegalArgumentException("Connection ID must be positive");

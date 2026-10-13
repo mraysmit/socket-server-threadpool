@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ThreadPooledServer implements Runnable{
     private static final int CONNECTION_BACKLOG = 256;
-    private final UUID serverId = UUID.randomUUID();
+    private final String serverId;
     protected int          serverPort   = 8080;
     protected ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
@@ -21,6 +21,16 @@ public class ThreadPooledServer implements Runnable{
     final protected String SERVER_NAME = "ThreadPooledServer";
 
     public ThreadPooledServer(int port) {
+        this(port, null);
+    }
+
+    public ThreadPooledServer(int port, String serverId) {
+        String selectedId = serverId == null || serverId.isBlank()
+                ? UUID.randomUUID().toString() : serverId.strip();
+        if (!selectedId.matches("[A-Za-z0-9._-]+")) {
+            throw new IllegalArgumentException("Server ID must contain only letters, digits, dots, underscores, or hyphens");
+        }
+        this.serverId = selectedId;
         this.serverPort = port;
         requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
@@ -58,7 +68,7 @@ public class ThreadPooledServer implements Runnable{
         return this.isStopped.get();
     }
 
-    public UUID getServerId() {
+    public String getServerId() {
         return serverId;
     }
 
