@@ -151,11 +151,33 @@ mvn clean compile
 
 ### Running the Server
 
-Compile and start the interactive application with the server ID `Server-001`:
+From the project root in PowerShell, compile and start the interactive application
+with the server ID `Server-001`:
 
 ```powershell
 mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001"
 ```
+
+This starts the main server on **9000** and the admin listener on **9001**.
+Keep this terminal open to use the interactive console.
+
+To choose a different port pair:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --port 9010 --admin-port 9011"
+```
+
+Once the server reports `Server ready`, enter these commands at its console
+prompt, one at a time:
+
+```text
+send {"instruction":"math.add","parameters":{"a":10,"b":20}}
+status
+quit
+```
+
+The plugin command returns `status=OK | result=30`, `status` checks the running
+server, and `quit` stops the server and exits the application.
 
 The server ID is the first startup argument, or can be passed with `--server-id`.
 To use a generated UUID default,
@@ -486,7 +508,15 @@ mvn test "-Dtest=ThreadPooledServerTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
 
-To run the plugin and JSON client tests with command-line output:
+#### Plugin Tests
+
+Run only the plugin tests with command-line output:
+
+```powershell
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+To include the JSON client's reply-validation tests as well:
 
 ```powershell
 mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
@@ -507,6 +537,22 @@ To see just the three built-ins with their results from both servers:
 ```powershell
 mvn test "-Dtest=PluginExecutionTest#commandsReturnResultsAndCorrelatedIdsFromEachServer" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
+
+This runs three parameterized cases, one per built-in. Each case checks both
+servers, producing six `Plugin test PASSED` entries. Abridged examples:
+
+```text
+Plugin test PASSED | instruction=math.add | ... | serverId=Server-001 | ... | result=30
+Plugin test PASSED | instruction=text.concat | ... | serverId=Server-001 | ... | result="你好\nworld 🌍"
+Plugin test PASSED | instruction=echo | ... | serverId=Server-001 | ... | result="Received: Hello plugin"
+```
+
+The actual entries also include inputs, message ID, connection ID, and status.
+The tests start their own servers on automatically allocated ports and close them
+afterward; you do not need to start the app first. Registry unit tests call plugins
+directly, so they do not produce socket request logs.
+
+#### Startup and Lifecycle Tests
 
 To test startup options, simultaneous instances, occupied ports, cleanup, and
 the actual command-line applications:
