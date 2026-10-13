@@ -24,7 +24,7 @@ public class StartStop {
             var console = new BufferedReader(new InputStreamReader(System.in))) {
             var client = new TextMessageClient("localhost", instance.getPort(), instance.getServerId());
             System.out.println("To stop this server, connect to admin port " + instance.getAdminPort());
-            System.out.println("> Enter commands (send <text>, status, shutdown, or quit to exit):");
+            System.out.println("> Enter commands (send <text or JSON command>, status, shutdown, or quit to exit):");
             while (true) {
                 System.out.print("> ");
                 String command = console.readLine();
@@ -36,14 +36,14 @@ public class StartStop {
                         String message = command.substring(5);
                         UUID messageId = UUID.randomUUID();
                         System.out.println("Sending: messageId=" + messageId + " | text=" + message);
-                        System.out.println("Server response: " + client.send(messageId, message));
+                        System.out.println("Server response: " + client.executeInput(messageId, message));
                     } catch (IOException | IllegalArgumentException e) {
                         System.out.println("Error sending message: " + e.getMessage());
                     }
                 } else if (command.equalsIgnoreCase("send")) {
-                    System.out.println("Usage: send <text>");
+                    System.out.println("Usage: send <text or JSON command>");
                 } else {
-                    System.out.println("Unknown command. Available commands: send <text>, status, shutdown, quit");
+                    System.out.println("Unknown command. Available commands: send <text or JSON command>, status, shutdown, quit");
                 }
             }
         }

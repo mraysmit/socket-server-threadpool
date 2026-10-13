@@ -3,6 +3,13 @@ package dev.mars.worker;
 import dev.mars.http.HttpResponse;
 import dev.mars.http.HttpResponseBuilder;
 import dev.mars.http.HttpResponseWriter;
+import dev.mars.plugin.PluginRegistry;
+import dev.mars.protocol.CommandRequest;
+import dev.mars.protocol.CommandReply;
+import dev.mars.protocol.CommandProtocol;
+import dev.mars.protocol.InvalidRequestException;
+import dev.mars.protocol.Json;
+import dev.mars.protocol.CommandError;
 
 import java.io.*;
 import java.net.Socket;
@@ -12,6 +19,7 @@ import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
 import java.util.UUID;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -31,20 +39,23 @@ public class WorkerRunnable implements Runnable {
     private final long connectionId = NEXT_CONNECTION_ID.incrementAndGet();
     private final String serverId;
     private UUID messageId;
+    private final PluginRegistry plugins;
 
-    public WorkerRunnable(Socket clientSocket, String serverText, String serverId) {
-        this(clientSocket, serverText, serverId, new HttpResponseWriter());
+    public WorkerRunnable(Socket clientSocket, String serverText, String serverId, PluginRegistry plugins) {
+        this(clientSocket, serverText, serverId, new HttpResponseWriter(), plugins);
     }
 
     /**
      * Constructor that allows dependency injection of HttpResponseWriter.
      * This follows the Dependency Inversion Principle.
      */
-    public WorkerRunnable(Socket clientSocket, String serverText, String serverId, HttpResponseWriter responseWriter) {
+    public WorkerRunnable(Socket clientSocket, String serverText, String serverId, HttpResponseWriter responseWriter,
+                          PluginRegistry plugins) {
         this.clientSocket = clientSocket;
         this.serverText = serverText;
         this.responseWriter = responseWriter;
         this.serverId = serverId;
+        this.plugins = plugins;
     }
 
     @Override
@@ -76,13 +87,22 @@ public class WorkerRunnable implements Runnable {
                             + " Message must not be empty");
                 } else {
                     logEvent("Message received: " + message, Instant.now());
-                    writer.println("reply " + messageId + " " + serverId + " " + connectionId
-                            + " Received: " + message);
+                    var reply = plugins.dispatch(new CommandRequest(1, messageId, "echo", Map.of("text", message)),
+                            serverId, connectionId);
+                    if (reply.error() != null) {
+                        writer.println("error " + messageId + " " + serverId + " " + connectionId + " " + reply.error().message());
+                    } else {
+                        writer.println("reply " + messageId + " " + serverId + " " + connectionId + " " + reply.result());
+                    }
                     logEvent("Message reply sent", Instant.now());
                 }
                 if (writer.checkError()) {
                     throw new IOException("Could not send message reply");
                 }
+                return;
+            }
+            if (!request.matches("[A-Z]+\\s+\\S+\\s+HTTP/[0-9.]+")) {
+                handleCommand(request, writer);
                 return;
             }
             // Consume the request headers before closing the socket to avoid a TCP reset.
@@ -131,6 +151,22 @@ public class WorkerRunnable implements Runnable {
                 System.err.println("Error closing client socket: " + e.getMessage());
             }
         }
+    }
+
+    private void handleCommand(String text, PrintWriter writer) throws IOException {
+        CommandReply reply;
+        try {
+            var command = CommandProtocol.parseRequest(text);
+            messageId = command.messageId();
+            logEvent("Executing instruction: " + command.instruction(), Instant.now());
+            reply = plugins.dispatch(command, serverId, connectionId);
+        } catch (InvalidRequestException e) {
+            messageId = e.messageId();
+            reply = CommandReply.failure(messageId, serverId, connectionId, CommandError.Code.INVALID_REQUEST, e.getMessage());
+        }
+        writer.println(Json.write(reply));
+        if (writer.checkError()) { throw new IOException("Could not send command reply"); }
+        logEvent("Command reply sent: " + reply.status(), Instant.now());
     }
 
     private void logEvent(String event, Instant timestamp) {

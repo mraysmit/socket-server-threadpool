@@ -1,6 +1,7 @@
 package dev.mars.server;
 
 import dev.mars.worker.WorkerRunnable;
+import dev.mars.plugin.PluginRegistry;
 
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -13,6 +14,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class ThreadPooledServer implements Runnable{
     private static final int CONNECTION_BACKLOG = 256;
     private final String serverId;
+    private final PluginRegistry plugins;
     protected int          serverPort   = 8080;
     protected volatile ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
@@ -25,9 +27,15 @@ public class ThreadPooledServer implements Runnable{
     }
 
     public ThreadPooledServer(int port, String serverId) {
+        this(port, serverId, null);
+    }
+
+    public ThreadPooledServer(int port, String serverId, PluginRegistry plugins) {
         this.serverId = ServerOptions.resolveServerId(serverId);
         ServerOptions.validatePort(port, "Main port");
         this.serverPort = port;
+        try { this.plugins = plugins == null ? PluginRegistry.load(null) : plugins; }
+        catch (IOException e) { throw new UncheckedIOException("Cannot load command plugins", e); }
         requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
@@ -52,7 +60,7 @@ public class ThreadPooledServer implements Runnable{
                     }
                     throw new RuntimeException("Error accepting client connection", e);
                 }
-                this.requestExecutor.execute(new WorkerRunnable(clientSocket, SERVER_NAME, serverId));
+                this.requestExecutor.execute(new WorkerRunnable(clientSocket, SERVER_NAME, serverId, plugins));
             }
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot start " + SERVER_NAME, e);

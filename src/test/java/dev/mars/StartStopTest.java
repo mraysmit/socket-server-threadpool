@@ -23,6 +23,28 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(20)
 class StartStopTest {
+    @Test
+    void consoleExecutesJsonCommandsAndContinuesAfterPluginError() throws Exception {
+        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
+                "send {\"instruction\":\"unknown\",\"parameters\":{}}\n"
+                + "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\nquit\n");
+        assertEquals(0, result.exitCode(), result.output());
+        assertTrue(result.output().contains("UNKNOWN_INSTRUCTION"), result.output());
+        assertTrue(result.output().contains("status=OK | result=30"), result.output());
+        assertReleased(result);
+    }
+
+    @Test
+    void standaloneClientExecutesJsonCommand() throws Exception {
+        try (var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0))) {
+            var result = run("dev.mars.client.TextMessageClient", new String[]{"--port", "" + instance.getPort(),
+                    "--expected-server-id", "Server-001",
+                    "{\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"hello \",\"b\":\"world\"}}"}, "");
+            assertEquals(0, result.exitCode(), result.output());
+            assertTrue(result.output().contains("status=OK | result=\"hello world\""), result.output());
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"quit\n", "shutdown\nquit\n"})
     void consoleUsesAllocatedPortsAndCleansUpOnExit(String exitCommands) throws Exception {
@@ -30,7 +52,7 @@ class StartStopTest {
                 "send Hello CLI\nstatus\n" + exitCommands);
         assertEquals(0, result.exitCode(), result.output());
         assertTrue(result.output().contains("serverId=CLI-001"), result.output());
-        assertTrue(result.output().contains("text=Received: Hello CLI"), result.output());
+        assertTrue(result.output().contains("result=\"Received: Hello CLI\""), result.output());
         assertTrue(result.output().contains("Server status: ALIVE"), result.output());
         assertFalse(result.output().contains("Error connecting"), result.output());
         assertReleased(result);
@@ -48,7 +70,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"CLI-001", "--port", "" + main,
                 "--admin-port", "" + admin}, "send Explicit ports\nstatus\nquit\n");
         assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("text=Received: Explicit ports"), result.output());
+        assertTrue(result.output().contains("result=\"Received: Explicit ports\""), result.output());
         assertTrue(result.output().contains("Server status: ALIVE"), result.output());
         int[] actual = ports(result);
         if (main != 0) { assertEquals(main, actual[0]); }
@@ -71,7 +93,7 @@ class StartStopTest {
         var match = Pattern.compile("Server ready \\| serverId=([^ ]+)").matcher(result.output());
         assertTrue(match.find(), result.output());
         assertDoesNotThrow(() -> UUID.fromString(match.group(1)));
-        assertTrue(result.output().contains("text=Received: Hello"), result.output());
+        assertTrue(result.output().contains("result=\"Received: Hello\""), result.output());
         assertReleased(result);
     }
 
@@ -115,7 +137,7 @@ class StartStopTest {
             if (expected.equals("Target-001")) {
                 assertEquals(0, result.exitCode(), result.output());
                 assertTrue(result.output().contains("serverId=Target-001"), result.output());
-                assertTrue(result.output().contains("text=Received: Hello from CLI"), result.output());
+                assertTrue(result.output().contains("result=\"Received: Hello from CLI\""), result.output());
             } else {
                 assertNotEquals(0, result.exitCode(), result.output());
                 assertTrue(result.output().contains("Server ID mismatch"), result.output());
@@ -126,10 +148,12 @@ class StartStopTest {
     private Result run(String mainClass, String[] args, String input) throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
-        Path classes = Path.of(StartStop.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        String classes = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         var command = new ArrayList<String>();
-        command.add(java.toString()); command.add("-cp"); command.add(classes.toString()); command.add(mainClass);
-        command.addAll(Arrays.asList(args));
+        command.add(java.toString()); command.add("-cp"); command.add(classes); command.add(mainClass);
+        // Preserve embedded JSON quotes through Windows' native command-line parser.
+        boolean windows = System.getProperty("os.name").startsWith("Windows");
+        command.addAll(Arrays.stream(args).map(arg -> windows ? arg.replace("\"", "\\\"") : arg).toList());
         Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
         try (var outputReader = Executors.newVirtualThreadPerTaskExecutor()) {
             var output = outputReader.submit(() -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));

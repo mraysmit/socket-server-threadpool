@@ -8,8 +8,13 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.Map;
+import dev.mars.protocol.CommandRequest;
+import dev.mars.protocol.CommandReply;
+import dev.mars.protocol.CommandProtocol;
+import dev.mars.protocol.Json;
 
-/** Sends one UTF-8 text message and receives the server's reply. */
+/** Sends one UTF-8 JSON command and validates its correlated reply. */
 public class TextMessageClient {
     private final String host;
     private final int port;
@@ -31,6 +36,27 @@ public class TextMessageClient {
     }
 
     public MessageReply send(UUID messageId, String message) throws IOException {
+        validateInput(messageId, message);
+        var reply = execute(messageId, "echo", Map.of("text", message));
+        if (!(reply.result() instanceof String text)) { throw new IOException("Echo plugin returned a non-text result"); }
+        return new MessageReply(reply.messageId(), reply.serverId(), reply.connectionId(), text);
+    }
+
+    public CommandReply execute(String instruction, Map<String, Object> parameters) throws IOException {
+        return execute(UUID.randomUUID(), instruction, parameters);
+    }
+
+    public CommandReply execute(UUID messageId, String instruction, Map<String, Object> parameters) throws IOException {
+        return exchange(new CommandRequest(1, messageId, instruction, parameters));
+    }
+
+    public CommandReply executeInput(UUID messageId, String input) throws IOException {
+        validateInput(messageId, input);
+        return input.stripLeading().startsWith("{") ? exchange(CommandProtocol.submission(messageId, input))
+                : execute(messageId, "echo", Map.of("text", input));
+    }
+
+    private static void validateInput(UUID messageId, String message) {
         if (messageId == null) {
             throw new IllegalArgumentException("Message ID must not be null");
         }
@@ -41,12 +67,16 @@ public class TextMessageClient {
             throw new IllegalArgumentException("Message must fit on one line");
         }
 
+    }
+
+    private CommandReply exchange(CommandRequest request) throws IOException {
+        String payload = Json.write(request);
         try (var socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), 5000);
             socket.setSoTimeout(10000);
             try (var writer = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
                  var reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
-                writer.println("message " + messageId + " " + message);
+                writer.println(payload);
                 if (writer.checkError()) {
                     throw new IOException("Could not send message");
                 }
@@ -54,41 +84,20 @@ public class TextMessageClient {
                 if (reply == null) {
                     throw new IOException("Server closed the connection without replying");
                 }
-                return validateReply(reply, messageId, message);
+                return validateReply(reply, request.messageId());
             }
         }
     }
 
-    private MessageReply validateReply(String reply, UUID expectedId, String message) throws IOException {
-        String[] fields = reply.split(" ", 5);
-        if (fields.length != 5 || !(fields[0].equals("reply") || fields[0].equals("error"))) {
-            throw new IOException("Invalid message reply: missing IDs or reply fields");
-        }
-        MessageReply parsed;
-        try {
-            if (!fields[2].matches("[A-Za-z0-9._-]+")) {
-                throw new IllegalArgumentException("Invalid server ID");
-            }
-            parsed = new MessageReply(UUID.fromString(fields[1]), fields[2],
-                    Long.parseLong(fields[3]), fields[4]);
-            if (parsed.connectionId() <= 0) {
-                throw new IllegalArgumentException("Connection ID must be positive");
-            }
-        } catch (IllegalArgumentException e) {
-            throw new IOException("Invalid message reply: malformed IDs", e);
-        }
+    private CommandReply validateReply(String reply, UUID expectedId) throws IOException {
+        CommandReply parsed = CommandProtocol.parseReply(reply);
         if (!expectedId.equals(parsed.messageId())) {
             throw new IOException("Message ID mismatch: sent " + expectedId + ", received " + parsed.messageId());
         }
         if (expectedServerId != null && !expectedServerId.equals(parsed.serverId())) {
             throw new IOException("Server ID mismatch: expected " + expectedServerId + ", received " + parsed.serverId());
         }
-        if (fields[0].equals("error")) {
-            throw new IOException("Server rejected message: " + parsed);
-        }
-        if (!parsed.text().equals("Received: " + message)) {
-            throw new IOException("Reply text does not match the sent message " + expectedId);
-        }
+        if (parsed.error() != null) { throw new CommandExecutionException(parsed); }
         return parsed;
     }
 
@@ -103,6 +112,6 @@ public class TextMessageClient {
         System.out.println("Sending: messageId=" + messageId + " | text=" + message);
         System.out.println("Target: " + options.host() + ":" + options.port());
         System.out.println("Server response: " + new TextMessageClient(options.host(), options.port(),
-                options.expectedServerId()).send(messageId, message));
+                options.expectedServerId()).executeInput(messageId, message));
     }
 }

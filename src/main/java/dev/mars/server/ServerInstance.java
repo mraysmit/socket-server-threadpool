@@ -5,6 +5,8 @@ import java.net.BindException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import dev.mars.plugin.PluginRegistry;
+import java.io.UncheckedIOException;
 
 /** Owns both listeners and starts them only after both ports have been bound. */
 public final class ServerInstance implements AutoCloseable {
@@ -13,16 +15,25 @@ public final class ServerInstance implements AutoCloseable {
     private final ExecutorService listeners;
     private Future<?> serverTask;
     private Future<?> monitorTask;
+    private final PluginRegistry plugins;
 
-    private ServerInstance(ServerOptions options) {
-        server = new ThreadPooledServer(options.port(), options.serverId());
+    private ServerInstance(ServerOptions options, PluginRegistry plugins) {
+        this.plugins = plugins;
+        server = new ThreadPooledServer(options.port(), options.serverId(), plugins);
         monitor = new ShutdownMonitor(options.adminPort(), server);
         listeners = Executors.newFixedThreadPool(2,
                 Thread.ofPlatform().name("listener-" + options.serverId() + "-", 0).factory());
     }
 
     public static ServerInstance start(ServerOptions options) throws IOException {
-        var instance = new ServerInstance(options);
+        var plugins = PluginRegistry.load(options.pluginsDir());
+        ServerInstance instance;
+        try {
+            instance = new ServerInstance(options, plugins);
+        } catch (RuntimeException e) {
+            try { plugins.close(); } catch (IOException cleanup) { e.addSuppressed(cleanup); }
+            throw e;
+        }
         try {
             // Reserve an explicit port before asking the OS to allocate the other one.
             if (options.port() == 0 && options.adminPort() != 0) {
@@ -35,7 +46,8 @@ public final class ServerInstance implements AutoCloseable {
             instance.serverTask = instance.listeners.submit(instance.server);
             instance.monitorTask = instance.listeners.submit(instance.monitor);
             System.out.println("Server ready | serverId=" + instance.getServerId()
-                    + " | main=localhost:" + instance.getPort() + " | admin=localhost:" + instance.getAdminPort());
+                    + " | main=localhost:" + instance.getPort() + " | admin=localhost:" + instance.getAdminPort()
+                    + " | instructions=" + plugins.instructions());
             return instance;
         } catch (IOException | RuntimeException e) {
             try { instance.close(); }
@@ -75,7 +87,13 @@ public final class ServerInstance implements AutoCloseable {
             try { server.stop(); }
             finally {
                 try { listeners.close(); }
-                finally { server.requestExecutor.close(); }
+                finally {
+                    try { server.requestExecutor.close(); }
+                    finally {
+                        try { plugins.close(); }
+                        catch (IOException e) { throw new UncheckedIOException("Cannot close plugin loader", e); }
+                    }
+                }
             }
         }
     }

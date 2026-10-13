@@ -16,6 +16,7 @@ class ServerOptionsTest {
         var options = ServerOptions.parse();
         assertEquals(9000, options.port());
         assertEquals(9001, options.adminPort());
+        assertNull(options.pluginsDir());
         assertDoesNotThrow(() -> UUID.fromString(options.serverId()));
     }
 
@@ -41,6 +42,12 @@ class ServerOptionsTest {
     }
 
     @Test
+    void parsesPluginDirectoryIncludingSpaces() {
+        assertEquals(java.nio.file.Path.of("custom plugins"),
+                ServerOptions.parse("Server-001", "--plugins-dir", "custom plugins").pluginsDir());
+    }
+
+    @Test
     void blankServerIdUsesDefaultWithConfiguredPorts() {
         var options = ServerOptions.parse(" ", "--port", "0", "--admin-port", "0");
         assertDoesNotThrow(() -> UUID.fromString(options.serverId()));
@@ -54,6 +61,8 @@ class ServerOptionsTest {
 
     static Stream<Arguments> invalidOptions() {
         return Stream.of(
+                new String[]{"--plugins-dir"}, new String[]{"--plugins-dir", " "},
+                new String[]{"--plugins-dir", "plugins", "--plugins-dir", "other"},
                 new String[]{"--port"}, new String[]{"--admin-port"}, new String[]{"--server-id"},
                 new String[]{"--port", "--admin-port", "9011"},
                 new String[]{"--port", "-1"}, new String[]{"--port", "65536"},

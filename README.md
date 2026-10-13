@@ -7,6 +7,7 @@ A Java-based socket server that handles each client connection on its own virtua
 - **Virtual Threads**: Handles each client connection on a new virtual thread
 - **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
 - **Text Messages**: Sends a UTF-8 text message and receives an echo reply over the main socket
+- **Execution Plugins**: Dispatches JSON instructions to built-in or external JAR plugins and returns typed results
 - **Graceful Shutdown**: Administrative interface for controlled server shutdown
 - **Status Monitoring**: Real-time server status checking capabilities
 - **Console Management**: Interactive command-line interface for server administration
@@ -21,7 +22,10 @@ src/
 │   ├── client/
 │   │   ├── ClientOptions.java
 │   │   ├── TextMessageClient.java
+│   │   ├── CommandExecutionException.java
 │   │   └── MessageReply.java
+│   ├── plugin/                  # CommandPlugin SPI, registry, validation, built-ins
+│   ├── protocol/                # JSON request/reply records and validation
 │   ├── server/
 │   │   ├── ServerOptions.java
 │   │   ├── ServerInstance.java
@@ -33,8 +37,13 @@ src/
 │       ├── HttpResponse.java
 │       ├── HttpResponseBuilder.java
 │       └── HttpResponseWriter.java
+├── main/resources/META-INF/services/dev.mars.plugin.CommandPlugin
 └── test/java/dev/mars/
     ├── StartStopTest.java
+    ├── plugin/
+    │   ├── PluginRegistryTest.java
+    │   ├── PluginExecutionTest.java
+    │   └── ExternalPluginTest.java
     ├── client/
     │   ├── ClientOptionsTest.java
     │   └── TextMessageClientTest.java
@@ -60,8 +69,8 @@ src/
 
 2. **WorkerRunnable**: Handles individual client requests
    - Processes each client connection in a separate virtual thread
-   - Reads either a text-message command or HTTP request headers
-   - Echoes text with message, server, and connection IDs
+   - Reads a JSON command, legacy text-message command, or HTTP request headers
+   - Dispatches instructions through the plugin registry and returns correlated results
    - Uses HTTP response classes for clean separation of concerns
    - Logs request processing details
 
@@ -91,7 +100,8 @@ src/
 
 8. **TextMessageClient**: Sends a message and validates its reply
    - Generates a message UUID or accepts one supplied by the caller
-   - Checks reply IDs and echoed text
+   - Checks protocol fields, message ID, and optional expected server ID
+   - Returns generic JSON results or throws `CommandExecutionException` with the structured error reply
    - Provides a command-line client with configurable host, port, and expected server ID
 
 9. **MessageReply**: Reply record containing the message ID, server ID, connection ID, and text
@@ -100,6 +110,8 @@ src/
 
 11. **ServerInstance**: Binds both listeners before reporting ready and closes all resources on failure or exit
 
+12. **CommandPlugin / PluginRegistry**: Discover providers with `ServiceLoader`, validate unique instruction names, and dispatch through an immutable registry
+
 ## 🛠️ Technical Specifications
 
 - **Java Version**: 27
@@ -107,7 +119,8 @@ src/
 - **Main Server Port**: 9000
 - **Admin Port**: 9001
 - **Request Executor**: One virtual thread per connection
-- **Text Protocol**: One UTF-8 message and reply per connection
+- **Command Protocol**: One UTF-8 JSON request line and reply line per connection, version 1
+- **JSON Library**: Jackson Databind 2.21.5
 - **HTTP Response Format**: HTTP/1.1 status, headers, and UTF-8 body
 - **Test Framework**: JUnit Jupiter 6.0.2 with Maven Surefire 3.5.4
 
@@ -160,17 +173,18 @@ text-message replies. Choose a distinct ID for each running server.
 In PowerShell, keep the entire `-Dexec.mainClass=...` argument in quotes.
 Quoting only the class name can cause an `Unknown lifecycle phase` error.
 
-Alternatively, compile with Maven and launch directly with Java:
+Alternatively, compile and copy runtime dependencies with Maven, then launch directly
+with Java. The JSON library must be on the runtime classpath:
 
 ```powershell
-mvn compile
-java -cp target/classes dev.mars.StartStop Server-001
+mvn compile dependency:copy-dependencies "-DincludeScope=runtime"
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-001
 ```
 
 To use a generated UUID default when launching directly:
 
 ```powershell
-java -cp target/classes dev.mars.StartStop
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop
 ```
 
 Keep the terminal open for console commands. Omitted port options default to
@@ -179,11 +193,13 @@ Each option defaults independently; supplying `--port` alone keeps admin port 90
 
 ### Running Multiple Servers
 
-After `mvn compile`, start each instance in its own terminal with distinct port pairs:
+After the compile and dependency-copy command above, start each instance in its
+own terminal with distinct port pairs. On Linux/macOS, use `:` instead of `;` in
+the Java classpath:
 
 ```powershell
-java -cp target/classes dev.mars.StartStop Server-001 --port 9000 --admin-port 9001
-java -cp target/classes dev.mars.StartStop Server-002 --port 9010 --admin-port 9011
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-001 --port 9000 --admin-port 9001
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-002 --port 9010 --admin-port 9011
 ```
 
 The equivalent Maven command for the second instance is:
@@ -197,6 +213,7 @@ mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-
 | `[serverId]` or `--server-id <id>` | Generated UUID | ID reported in logs and replies |
 | `--port <number>` | `9000` | HTTP/text-message listening port |
 | `--admin-port <number>` | `9001` | Administrative listening port |
+| `--plugins-dir <directory>` | Omitted | Load additional JAR providers from this directory; built-ins are always available |
 
 Ports must be integers from 0 through 65535. Nonzero main and admin ports must
 differ. Unknown/duplicate options, missing values, and invalid ports fail before
@@ -205,13 +222,13 @@ startup. Use `--help` to display usage.
 To let the operating system assign both ports automatically:
 
 ```powershell
-java -cp target/classes dev.mars.StartStop Server-003 --port 0 --admin-port 0
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-003 --port 0 --admin-port 0
 ```
 
 The app keeps both bound sockets open and reports the actual ports:
 
 ```text
-Server ready | serverId=Server-003 | main=localhost:52000 | admin=localhost:52001
+Server ready | serverId=Server-003 | main=localhost:52000 | admin=localhost:52001 | instructions=[echo, math.add, text.concat]
 ```
 
 Port numbers in this example are illustrative. The console automatically uses its
@@ -233,7 +250,7 @@ silently replaced with other ports.
 
 When you run the application, it will:
 
-1. Validate the startup arguments and bind both configured listening ports
+1. Validate arguments, discover plugins, and bind both configured listening ports
 2. Start the main server and shutdown monitor and print the actual endpoints
 3. Display a console prompt routed to this instance's ports
 
@@ -242,6 +259,7 @@ When you run the application, it will:
 The application provides an interactive console with the following commands:
 
 - `send <text>` - Send a text message to this instance's main port and display the verified reply
+- `send <JSON command>` - Execute an instruction with named parameters and display its result
 - `status` - Check if the server is running
 - `shutdown` - Stop the main server and shutdown monitor
 - `quit` - Close both listeners, wait for accepted work, and exit
@@ -259,13 +277,14 @@ Start the app, then enter a message at its console prompt:
 ```text
 > send Hello server
 Sending: messageId=11111111-1111-4111-8111-111111111111 | text=Hello server
-Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | text=Received: Hello server
+Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | status=OK | result="Received: Hello server"
 ```
 
 The client generates a UUID for each message and checks that the reply contains
-the same ID and expected echoed text. Replies also include the server instance's
-ID and connection ID. Missing or malformed IDs, mismatched message IDs, and
-incorrect reply text cause an error instead of being displayed as successful replies.
+the same ID. Replies also include the server instance's ID and connection ID.
+Missing or malformed fields and mismatched message or expected server IDs cause
+an error instead of being displayed as successful replies. Results are validated
+as JSON; their contents belong to the selected plugin.
 Each server keeps its selected ID for its lifetime. A provided ID can be reused
 after restart; an automatically generated UUID changes on each startup.
 
@@ -284,13 +303,13 @@ mvn compile exec:java "-Dexec.mainClass=dev.mars.client.TextMessageClient" "-Dex
 Or use the compiled client directly:
 
 ```powershell
-java -cp target/classes dev.mars.client.TextMessageClient "Hello server"
+java -cp "target/classes;target/dependency/*" dev.mars.client.TextMessageClient "Hello server"
 ```
 
 To target a different instance and require its server ID:
 
 ```powershell
-java -cp target/classes dev.mars.client.TextMessageClient --host localhost --port 9010 --expected-server-id Server-002 "Hello server"
+java -cp "target/classes;target/dependency/*" dev.mars.client.TextMessageClient --host localhost --port 9010 --expected-server-id Server-002 "Hello server"
 ```
 
 With Maven:
@@ -305,7 +324,8 @@ An expected server ID is checked exactly, including case. A mismatched ID fails
 the request. Use `--` before message text that starts with an option such as `--port`.
 Java callers can use `new TextMessageClient(host, port, expectedServerId)`.
 
-With telnet or another TCP client, connect to the instance's main port (default **9000**) and send one UTF-8 line
+The legacy text protocol is still supported for existing TCP clients. With telnet
+or another TCP client, connect to the instance's main port (default **9000**) and send one UTF-8 line
 in this format, using a new message UUID for each message:
 
 ```text
@@ -325,6 +345,121 @@ Open a new connection for each message. The `message` keyword is case-insensitiv
 message text is preserved. A missing or invalid message UUID receives an `Error: ...`
 line. Use the client and server built from the same version of this project.
 Administrative commands on the configured admin port remain `status` and `shutdown`.
+
+### Executing Plugin Commands
+
+At the application console, enter:
+
+```text
+send {"instruction":"math.add","parameters":{"a":10,"b":20}}
+send {"instruction":"text.concat","parameters":{"a":"Hello ","b":"world"}}
+send {"instruction":"echo","parameters":{"text":"Hello server"}}
+```
+
+The first command prints a reply such as:
+
+```text
+Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | status=OK | result=30
+```
+
+| Instruction | Required parameters | Result |
+|---|---|---|
+| `math.add` | Numbers `a`, `b` | Decimal sum |
+| `text.concat` | Strings `a`, `b` | Concatenated string |
+| `echo` | String `text` | `Received: <text>` |
+
+Built-ins reject missing, extra, or incorrectly typed parameters. Instruction names
+are case-sensitive and match `[A-Za-z][A-Za-z0-9._-]*`. Other plugins may accept
+any number of named parameters and return JSON numbers, strings, booleans, objects,
+arrays, or null. Plain text invokes `echo`; text beginning with `{` is interpreted
+as a command object, so use explicit `echo` to send literal text beginning with `{`.
+Use JSON escapes such as `\n` within strings; each request occupies one wire line.
+
+Java callers can obtain generic results directly:
+
+```java
+CommandReply reply = client.execute("math.add", Map.of("a", 10, "b", 20));
+System.out.println(reply.result()); // 30
+// execute(UUID, instruction, parameters) accepts a caller-supplied correlation ID.
+```
+
+JSON integers arrive as `BigInteger`, decimal numbers as `BigDecimal`, objects as
+maps, and arrays as lists. `send(String)` remains a convenience method returning
+the existing `MessageReply` text record. The standalone client also accepts a JSON
+command as its message argument; preserve embedded double quotes through your shell.
+
+For a raw TCP client, send the complete versioned envelope on the main port:
+
+```json
+{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","instruction":"math.add","parameters":{"a":10,"b":20}}
+```
+
+Example replies (the server also includes null `error` or `result` fields):
+
+```json
+{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":1,"status":"OK","result":30}
+{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":2,"status":"ERROR","error":{"code":"UNKNOWN_INSTRUCTION","message":"Unknown instruction: missing"}}
+```
+
+Error codes are `INVALID_REQUEST`, `UNKNOWN_INSTRUCTION`, `INVALID_PARAMETERS`,
+and `PLUGIN_ERROR`. A valid parsed request UUID is retained on errors; an unreadable
+request may have `messageId: null`. Java clients throw `CommandExecutionException`
+for correlated command errors; `reply()` exposes the error and IDs. Message IDs
+provide correlation only, so retries may execute the instruction again.
+
+### Adding an External Plugin
+
+Implement the public SPI in a separate Java 27 project using this project's built
+JAR as a compile-time dependency. For example:
+
+```java
+package example;
+
+import dev.mars.plugin.CommandPlugin;
+import dev.mars.plugin.InvalidParametersException;
+import dev.mars.plugin.PluginParameters;
+import java.util.Map;
+
+public final class MultiplyPlugin implements CommandPlugin {
+    public String instruction() { return "math.multiply"; }
+
+    public Object execute(Map<String, Object> parameters) throws InvalidParametersException {
+        PluginParameters.requireKeys(parameters, "a", "b");
+        return PluginParameters.number(parameters, "a")
+                .multiply(PluginParameters.number(parameters, "b"));
+    }
+}
+```
+
+In that plugin project, add
+`src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` containing:
+
+```text
+example.MultiplyPlugin
+```
+
+Package the plugin normally, create a `plugins` directory, and copy its JAR there
+along with any dependency JARs it needs. Do not bundle copies of the server SPI
+classes. Start the server with:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir plugins"
+```
+
+Then enter `send {"instruction":"math.multiply","parameters":{"a":6,"b":7}}`.
+The result is `42`. The directory must exist; an empty directory still enables
+built-ins. Providers already on the application classpath are also discovered.
+Invalid JAR archives/providers and duplicate or invalid instruction names fail
+startup before listeners open. The ready log lists all registered instructions.
+
+Plugins load once per startup. Instances are shared across concurrent virtual
+threads and must be thread-safe. Each invocation runs with the plugin's context
+class loader; returned values are normalized to JSON before replying. Plugins
+validate their own parameters and throw `InvalidParametersException` for caller
+errors; other exceptions become `PLUGIN_ERROR`. Plugins are trusted code inside
+the server process. There is no sandbox, hot reload, or per-command execution
+deadline. The class loader closes after accepted work completes when the instance
+is closed. See [EXEC_PLUGIN.md](EXEC_PLUGIN.md) for the one-page design.
 
 ### Testing the Server
 
@@ -350,6 +485,19 @@ mvn test "-Dtest=TextMessageClientTest"
 mvn test "-Dtest=ThreadPooledServerTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
+
+To run the plugin and JSON client tests with command-line output:
+
+```powershell
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+These verify built-in results, parameter validation, request/reply validation,
+correlation across two named servers, 100 concurrent commands, real external JAR
+compilation/discovery/execution, plugin exceptions, invalid providers, duplicate
+instructions, and release of JAR files at shutdown. The terminal includes
+`Plugin test PASSED`, `Concurrent plugin test PASSED`, and `External JAR test PASSED`
+with verified results. External plugin tests require a full JDK for Java compilation.
 
 To test startup options, simultaneous instances, occupied ports, cleanup, and
 the actual command-line applications:
@@ -416,6 +564,9 @@ you do not need to start the application first. Reports are in `target/surefire-
 Maven prints a test summary and `BUILD SUCCESS` when the suite passes. If a test
 fails, check the summary and the corresponding `.txt` or `.xml` report in that directory.
 `mvn clean verify` also creates `target/socket-client-server-1.0-SNAPSHOT.jar`.
+This is a regular JAR; direct Java execution still requires the runtime dependency
+classpath described above. A clean build removes `target/dependency`, so rerun
+`mvn dependency:copy-dependencies "-DincludeScope=runtime"` before direct launches.
 
 #### Test Client Connections
 
@@ -545,7 +696,7 @@ thread ID, and virtual-thread status:
 
 ```text
 [2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=Server-001 | messageId=- | thread=42 | virtual=true
-[2026-10-13 14:30:00.124 +08:00] Message received: Hello server | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=Server-001 | messageId=11111111-1111-4111-8111-111111111111 | thread=42 | virtual=true
+[2026-10-13 14:30:00.124 +08:00] Executing instruction: echo | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=Server-001 | messageId=11111111-1111-4111-8111-111111111111 | thread=42 | virtual=true
 ```
 
 The same connection ID appears in both entries and is unique within the running
@@ -558,7 +709,7 @@ Timestamps use the JVM's local time zone.
 ### Server Startup
 
 1. Resolve the supplied server ID or generate a UUID default
-2. Initialize the virtual thread executor
+2. Discover and validate plugins, then initialize the virtual thread executor
 3. Bind both listeners, releasing both if any bind fails
 4. Start the listener threads and report the actual main/admin endpoints
 5. Display the console command prompt
@@ -567,8 +718,8 @@ Timestamps use the JVM's local time zone.
 
 1. Accept client connection
 2. Start a virtual thread for the connection
-3. Read a text-message command or HTTP request headers
-4. Return a message reply with IDs or an HTTP response
+3. Read a JSON command, legacy text command, or HTTP request headers
+4. Dispatch the instruction and return a correlated result/error, or an HTTP response
 5. Close client socket
 
 ### Server Shutdown
@@ -580,6 +731,9 @@ Timestamps use the JVM's local time zone.
 
 Using `quit` directly, or closing console input, also closes the whole instance
 and waits for its listener and worker executors to terminate.
+Closing the instance also releases the external plugin class loader after accepted
+work finishes. An admin `shutdown` stops listeners; enter `quit` to close the console
+and finish instance cleanup.
 
 ## 🤝 Contributing
 

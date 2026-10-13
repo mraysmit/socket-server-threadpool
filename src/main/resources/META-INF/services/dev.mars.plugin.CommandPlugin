@@ -1,0 +1,3 @@
+dev.mars.plugin.builtin.MathAddPlugin
+dev.mars.plugin.builtin.TextConcatPlugin
+dev.mars.plugin.builtin.EchoPlugin
