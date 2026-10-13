@@ -1,53 +1,42 @@
 package dev.mars;
 
 import dev.mars.client.TextMessageClient;
-import dev.mars.server.ShutdownMonitor;
-import dev.mars.server.ThreadPooledServer;
+import dev.mars.server.ServerInstance;
+import dev.mars.server.ServerOptions;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
 public class StartStop {
-
-    /**
-     * Main entry point - starts the server and shutdown monitor, then provides a console interface for commands.
-     */
-    public static void main(String[] args) {
-        if (args.length > 1) {
-            throw new IllegalArgumentException("Usage: StartStop [serverId]");
+    public static void main(String[] args) throws IOException {
+        if (args.length == 1 && args[0].equals("--help")) {
+            System.out.println(ServerOptions.USAGE);
+            return;
         }
-        var threadPooledServer = new ThreadPooledServer(9000, args.length == 0 ? null : args[0]);
-        var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);
-
-        System.out.println("Starting Main Server");
-        new Thread(threadPooledServer).start();
-        System.out.println("Starting Shutdown Monitor");
-        new Thread(shutdownMonitor).start();
-
-        System.out.println("To stop server, connect to port 9001");
-
-        try (BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in))) {
+        var options = ServerOptions.parse(args);
+        try (var instance = ServerInstance.start(options);
+             var console = new BufferedReader(new InputStreamReader(System.in))) {
+            var client = new TextMessageClient("localhost", instance.getPort(), instance.getServerId());
+            System.out.println("To stop this server, connect to admin port " + instance.getAdminPort());
             System.out.println("> Enter commands (send <text>, status, shutdown, or quit to exit):");
-            String command;
             while (true) {
                 System.out.print("> ");
-                command = consoleReader.readLine();
-                if (command == null || command.equalsIgnoreCase("quit")) {
-                    break;
-                }
-
+                String command = console.readLine();
+                if (command == null || command.equalsIgnoreCase("quit")) { break; }
                 if (command.equalsIgnoreCase("status") || command.equalsIgnoreCase("shutdown")) {
-                    checkServerStatus(command);
+                    checkServerStatus(command, instance.getAdminPort());
                 } else if (command.regionMatches(true, 0, "send ", 0, 5)) {
                     try {
                         String message = command.substring(5);
                         UUID messageId = UUID.randomUUID();
                         System.out.println("Sending: messageId=" + messageId + " | text=" + message);
-                        System.out.println("Server response: " + new TextMessageClient("localhost", 9000).send(messageId, message));
+                        System.out.println("Server response: " + client.send(messageId, message));
                     } catch (IOException | IllegalArgumentException e) {
                         System.out.println("Error sending message: " + e.getMessage());
                     }
@@ -57,28 +46,24 @@ public class StartStop {
                     System.out.println("Unknown command. Available commands: send <text>, status, shutdown, quit");
                 }
             }
-        } catch (IOException e) {
-            System.out.println("Error reading from console: " + e.getMessage());
-        }
-
-        //checkServerStatus("status");
-
-    }
-
-    public static void checkServerStatus(String cmd) {
-        try (Socket socket = new Socket("localhost", 9001);
-             PrintWriter out = new PrintWriter(socket.getOutputStream(), true);
-             BufferedReader in = new BufferedReader(new InputStreamReader(socket.getInputStream()))) {
-
-            out.println(cmd);
-            String response = in.readLine();
-
-            System.out.println("Server response: " + response);
-
-        } catch (IOException e) {
-            System.out.println("Error connecting to server: " + e.getMessage());
         }
     }
 
+    public static void checkServerStatus(String command) {
+        checkServerStatus(command, ServerOptions.DEFAULT_ADMIN_PORT);
+    }
 
+    public static void checkServerStatus(String command, int port) {
+        try (var socket = new Socket()) {
+            socket.connect(new InetSocketAddress("localhost", port), 5000);
+            socket.setSoTimeout(10000);
+            try (var out = new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
+                 var in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+                out.println(command);
+                System.out.println("Server response: " + in.readLine());
+            }
+        } catch (IOException e) {
+            System.out.println("Error connecting to admin port " + port + ": " + e.getMessage());
+        }
+    }
 }

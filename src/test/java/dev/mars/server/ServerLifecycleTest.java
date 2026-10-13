@@ -34,10 +34,8 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(20)
 class ServerLifecycleTest {
-    private final ExecutorService servers = Executors.newFixedThreadPool(2,
-            Thread.ofPlatform().daemon().factory());
+    private ServerInstance instance;
     private ThreadPooledServer server;
-    private ShutdownMonitor monitor;
     private Future<?> serverTask;
     private Future<?> monitorTask;
     private int serverPort;
@@ -45,19 +43,15 @@ class ServerLifecycleTest {
 
     @BeforeEach
     void startServers() throws Exception {
-        // Reserve distinct OS-selected ports together, then release them immediately before startup.
-        try (var serverReservation = new ServerSocket(0);
-             var monitorReservation = new ServerSocket(0)) {
-            serverPort = serverReservation.getLocalPort();
-            monitorPort = monitorReservation.getLocalPort();
-        }
-        server = new ThreadPooledServer(serverPort, "Server-001");
-        monitor = new ShutdownMonitor(monitorPort, server);
-        serverTask = servers.submit(server);
+        instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0));
+        server = instance.server();
+        serverPort = instance.getPort();
+        monitorPort = instance.getAdminPort();
+        serverTask = instance.serverTask();
+        monitorTask = instance.monitorTask();
         try (var client = awaitConnection(serverPort, serverTask)) {
             assertHttpResponse(client);
         }
-        monitorTask = servers.submit(monitor);
         try (var client = awaitConnection(monitorPort, monitorTask)) {
             assertEquals("Server status: ALIVE", command(client, "status"));
         }
@@ -65,28 +59,15 @@ class ServerLifecycleTest {
 
     @AfterEach
     void stopServers() throws Exception {
-        try {
-            if (monitor != null) {
-                monitor.stop();
-            }
-            if (server != null && server.serverSocket != null) {
-                server.stop();
-            }
+        if (instance != null) {
+            instance.close();
             if (monitorTask != null) {
                 monitorTask.get(5, TimeUnit.SECONDS);
             }
             if (serverTask != null) {
                 serverTask.get(5, TimeUnit.SECONDS);
             }
-        } finally {
-            if (server != null) {
-                server.requestExecutor.shutdownNow();
-                assertTrue(server.requestExecutor.awaitTermination(5, TimeUnit.SECONDS),
-                        "Worker threads must terminate after each test");
-            }
-            servers.shutdownNow();
-            assertTrue(servers.awaitTermination(5, TimeUnit.SECONDS),
-                    "Server threads must terminate after each test");
+            assertTrue(server.requestExecutor.isTerminated(), "Worker threads must terminate after each test");
         }
     }
 
@@ -239,20 +220,10 @@ class ServerLifecycleTest {
 
     @Test
     void twoServersIdentifyWhichInstanceRepliedToTheMessage() throws Exception {
-        int otherPort;
-        try (var reservation = new ServerSocket(0)) {
-            otherPort = reservation.getLocalPort();
-        }
-        var other = new ThreadPooledServer(otherPort, "Server-002");
-        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            var task = executor.submit(other);
-            try {
-                try (var client = awaitConnection(otherPort, task)) {
-                    assertHttpResponse(client);
-                }
+        try (var other = ServerInstance.start(new ServerOptions("Server-002", 0, 0))) {
                 UUID messageId = UUID.randomUUID();
                 var first = new TextMessageClient("127.0.0.1", serverPort).send(messageId, "Hello");
-                var second = new TextMessageClient("127.0.0.1", otherPort).send(messageId, "Hello");
+                var second = new TextMessageClient("127.0.0.1", other.getPort()).send(messageId, "Hello");
                 assertEquals(messageId, first.messageId());
                 assertEquals(messageId, second.messageId());
                 assertEquals(server.getServerId(), first.serverId());
@@ -262,10 +233,6 @@ class ServerLifecycleTest {
                 assertNotEquals(first.serverId(), second.serverId());
                 assertEquals("Received: Hello", first.text());
                 assertEquals("Received: Hello", second.text());
-            } finally {
-                other.stop();
-                task.get(5, TimeUnit.SECONDS);
-            }
         }
     }
 

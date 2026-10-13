@@ -13,10 +13,17 @@ import java.util.UUID;
 public class TextMessageClient {
     private final String host;
     private final int port;
+    private final String expectedServerId;
 
     public TextMessageClient(String host, int port) {
-        this.host = host;
+        this(host, port, null);
+    }
+
+    public TextMessageClient(String host, int port, String expectedServerId) {
+        this.host = ClientOptions.normalizeHost(host);
+        ClientOptions.validatePort(port);
         this.port = port;
+        this.expectedServerId = ClientOptions.normalizeExpectedServerId(expectedServerId);
     }
 
     public MessageReply send(String message) throws IOException {
@@ -73,6 +80,9 @@ public class TextMessageClient {
         if (!expectedId.equals(parsed.messageId())) {
             throw new IOException("Message ID mismatch: sent " + expectedId + ", received " + parsed.messageId());
         }
+        if (expectedServerId != null && !expectedServerId.equals(parsed.serverId())) {
+            throw new IOException("Server ID mismatch: expected " + expectedServerId + ", received " + parsed.serverId());
+        }
         if (fields[0].equals("error")) {
             throw new IOException("Server rejected message: " + parsed);
         }
@@ -83,13 +93,16 @@ public class TextMessageClient {
     }
 
     public static void main(String[] args) throws IOException {
-        if (args.length == 0) {
-            System.out.println("Usage: TextMessageClient <message>");
+        if (args.length == 0 || (args.length == 1 && args[0].equals("--help"))) {
+            System.out.println(ClientOptions.USAGE);
             return;
         }
-        String message = String.join(" ", args);
+        var options = ClientOptions.parse(args);
+        String message = options.message();
         UUID messageId = UUID.randomUUID();
         System.out.println("Sending: messageId=" + messageId + " | text=" + message);
-        System.out.println("Server response: " + new TextMessageClient("localhost", 9000).send(messageId, message));
+        System.out.println("Target: " + options.host() + ":" + options.port());
+        System.out.println("Server response: " + new TextMessageClient(options.host(), options.port(),
+                options.expectedServerId()).send(messageId, message));
     }
 }

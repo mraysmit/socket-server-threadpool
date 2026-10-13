@@ -19,9 +19,12 @@ src/
 ├── main/java/dev/mars/
 │   ├── StartStop.java
 │   ├── client/
+│   │   ├── ClientOptions.java
 │   │   ├── TextMessageClient.java
 │   │   └── MessageReply.java
 │   ├── server/
+│   │   ├── ServerOptions.java
+│   │   ├── ServerInstance.java
 │   │   ├── ThreadPooledServer.java
 │   │   └── ShutdownMonitor.java
 │   ├── worker/
@@ -31,8 +34,13 @@ src/
 │       ├── HttpResponseBuilder.java
 │       └── HttpResponseWriter.java
 └── test/java/dev/mars/
-    ├── client/TextMessageClientTest.java
+    ├── StartStopTest.java
+    ├── client/
+    │   ├── ClientOptionsTest.java
+    │   └── TextMessageClientTest.java
     ├── server/
+    │   ├── ServerOptionsTest.java
+    │   ├── ServerInstanceTest.java
     │   ├── ServerLifecycleTest.java
     │   └── ThreadPooledServerTest.java
     └── http/
@@ -76,7 +84,7 @@ src/
    - Accepts administrative commands
 
 7. **StartStop**: Main application launcher
-   - Accepts an optional server ID as its first startup argument
+   - Accepts a server ID and optional main/admin port arguments
    - Initializes and starts both servers
    - Provides console-based command interface
    - Manages application lifecycle
@@ -84,9 +92,13 @@ src/
 8. **TextMessageClient**: Sends a message and validates its reply
    - Generates a message UUID or accepts one supplied by the caller
    - Checks reply IDs and echoed text
-   - Provides a command-line client for `localhost:9000`
+   - Provides a command-line client with configurable host, port, and expected server ID
 
 9. **MessageReply**: Reply record containing the message ID, server ID, connection ID, and text
+
+10. **ServerOptions / ClientOptions**: Parse and validate command-line settings and defaults
+
+11. **ServerInstance**: Binds both listeners before reporting ready and closes all resources on failure or exit
 
 ## 🛠️ Technical Specifications
 
@@ -132,7 +144,8 @@ Compile and start the interactive application with the server ID `Server-001`:
 mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001"
 ```
 
-The server ID is the first startup argument. To use a generated UUID default,
+The server ID is the first startup argument, or can be passed with `--server-id`.
+To use a generated UUID default,
 omit that argument:
 
 ```powershell
@@ -160,10 +173,59 @@ To use a generated UUID default when launching directly:
 java -cp target/classes dev.mars.StartStop
 ```
 
-Keep the terminal open for console commands. The app listens on port **9000** for
-HTTP and text-message clients and port **9001** for administrative commands; both ports must be free.
-If startup reports `Address already in use`, stop the previous instance or change
-the ports in `StartStop.java`.
+Keep the terminal open for console commands. Omitted port options default to
+**9000** for HTTP/text messages and **9001** for administrative commands.
+Each option defaults independently; supplying `--port` alone keeps admin port 9001.
+
+### Running Multiple Servers
+
+After `mvn compile`, start each instance in its own terminal with distinct port pairs:
+
+```powershell
+java -cp target/classes dev.mars.StartStop Server-001 --port 9000 --admin-port 9001
+java -cp target/classes dev.mars.StartStop Server-002 --port 9010 --admin-port 9011
+```
+
+The equivalent Maven command for the second instance is:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-002 --port 9010 --admin-port 9011"
+```
+
+| Server option | Default | Meaning |
+|---|---|---|
+| `[serverId]` or `--server-id <id>` | Generated UUID | ID reported in logs and replies |
+| `--port <number>` | `9000` | HTTP/text-message listening port |
+| `--admin-port <number>` | `9001` | Administrative listening port |
+
+Ports must be integers from 0 through 65535. Nonzero main and admin ports must
+differ. Unknown/duplicate options, missing values, and invalid ports fail before
+startup. Use `--help` to display usage.
+
+To let the operating system assign both ports automatically:
+
+```powershell
+java -cp target/classes dev.mars.StartStop Server-003 --port 0 --admin-port 0
+```
+
+The app keeps both bound sockets open and reports the actual ports:
+
+```text
+Server ready | serverId=Server-003 | main=localhost:52000 | admin=localhost:52001
+```
+
+Port numbers in this example are illustrative. The console automatically uses its
+own instance's actual ports and expected server ID. External clients must use the
+main port from the ready message.
+
+### When a Port Is Already in Use
+
+Startup binds both listeners before reporting ready. If either requested port is
+occupied or unavailable, the process exits unsuccessfully with the port's role and
+number, for example `Admin port 9011 is already in use or unavailable`.
+Any listener opened by that attempt is closed; existing server instances keep running.
+Choose another port pair or use `0` for automatic allocation. Fixed ports are never
+silently replaced with other ports.
 
 ## 💻 Usage
 
@@ -171,24 +233,24 @@ the ports in `StartStop.java`.
 
 When you run the application, it will:
 
-1. Start the main server on port 9000
-2. Start the shutdown monitor on port 9001
-3. Display a console prompt for commands
+1. Validate the startup arguments and bind both configured listening ports
+2. Start the main server and shutdown monitor and print the actual endpoints
+3. Display a console prompt routed to this instance's ports
 
 ### Console Commands
 
 The application provides an interactive console with the following commands:
 
-- `send <text>` - Send a text message to port 9000 and display the server's reply
+- `send <text>` - Send a text message to this instance's main port and display the verified reply
 - `status` - Check if the server is running
 - `shutdown` - Stop the main server and shutdown monitor
-- `quit` - Exit the console command loop
+- `quit` - Close both listeners, wait for accepted work, and exit
 
-Command keywords are case-insensitive. The admin socket on port 9001 accepts
+Command keywords are case-insensitive. The configured admin socket (default 9001) accepts
 `status` and `shutdown`; `send` and `quit` belong to the application console.
 
-To stop the application cleanly, enter `shutdown`, wait for the server to stop,
-then enter `quit`. Using `quit` alone does not request shutdown of either listener.
+Enter `quit` to stop and exit cleanly. You can also enter `shutdown` followed by
+`quit`. End-of-input closes the instance as well.
 
 ### Sending and Receiving Text Messages
 
@@ -225,7 +287,25 @@ Or use the compiled client directly:
 java -cp target/classes dev.mars.client.TextMessageClient "Hello server"
 ```
 
-With telnet or another TCP client, connect to port **9000** and send one UTF-8 line
+To target a different instance and require its server ID:
+
+```powershell
+java -cp target/classes dev.mars.client.TextMessageClient --host localhost --port 9010 --expected-server-id Server-002 "Hello server"
+```
+
+With Maven:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.client.TextMessageClient" "-Dexec.args=--host localhost --port 9010 --expected-server-id Server-002 Hello server"
+```
+
+Client defaults are host `localhost`, port `9000`, and no expected server ID.
+Client ports must be from 1 through 65535; use an actual listening port, not `0`.
+An expected server ID is checked exactly, including case. A mismatched ID fails
+the request. Use `--` before message text that starts with an option such as `--port`.
+Java callers can use `new TextMessageClient(host, port, expectedServerId)`.
+
+With telnet or another TCP client, connect to the instance's main port (default **9000**) and send one UTF-8 line
 in this format, using a new message UUID for each message:
 
 ```text
@@ -244,7 +324,7 @@ valid ID returns `error <messageId> <serverId> <connectionId> <reason>`.
 Open a new connection for each message. The `message` keyword is case-insensitive;
 message text is preserved. A missing or invalid message UUID receives an `Error: ...`
 line. Use the client and server built from the same version of this project.
-Administrative commands on port 9001 remain `status` and `shutdown`.
+Administrative commands on the configured admin port remain `status` and `shutdown`.
 
 ### Testing the Server
 
@@ -270,6 +350,18 @@ mvn test "-Dtest=TextMessageClientTest"
 mvn test "-Dtest=ThreadPooledServerTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
+
+To test startup options, simultaneous instances, occupied ports, cleanup, and
+the actual command-line applications:
+
+```powershell
+mvn test "-Dtest=ServerOptionsTest,ClientOptionsTest,ServerInstanceTest,StartStopTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+These tests cover omitted port defaults, explicit/automatic/mixed ports, invalid
+arguments, main/admin/cross-role conflicts, rollback after partial binding, six
+simultaneous instances, a race for one port pair, expected-server-ID validation,
+idle admin connection cleanup, and console `quit`, `shutdown`, and end-of-input.
 
 To run the test that starts `Server-001` and verifies its ID in a text-message reply:
 
@@ -328,6 +420,8 @@ fails, check the summary and the corresponding `.txt` or `.xml` report in that d
 #### Test Client Connections
 
 Start the application first, then run these commands in a second terminal.
+The examples below use the default ports; replace 9000/9001 with your instance's
+actual main/admin ports when configured differently.
 
 **Using curl:**
 
@@ -382,22 +476,20 @@ as a readable date and time. `Content-Length` counts the UTF-8 body bytes.
 
 ### Customizing Server Settings
 
-You can modify the server configuration by editing the `StartStop.java` file:
+Use the startup arguments described above to configure the server ID and ports.
+Java callers can start and close a complete instance with:
 
 ```java
-// Preserve the startup server ID when changing the listening ports
-var threadPooledServer = new ThreadPooledServer(9000, args.length == 0 ? null : args[0]);
-var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);  // admin port
+try (var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0))) {
+    var client = new TextMessageClient("localhost", instance.getPort(), instance.getServerId());
+    MessageReply reply = client.send("Hello server");
+    System.out.println(reply);
+}
 ```
 
-The startup argument sets only the server ID; listening ports are configured in
-code. To run multiple app instances on the same host, assign each instance a
-distinct pair of listening ports and update the client destinations to match:
-
-- The console's `TextMessageClient` and the standalone client's `main` method
-  currently target `localhost:9000`.
-- `StartStop.checkServerStatus` currently targets `localhost:9001`.
-- Java callers can use `new TextMessageClient(host, port)` to select a message server.
+`getPort()` and `getAdminPort()` return the actual bound ports, including when
+automatic allocation was requested. Closing the instance releases both listeners
+and waits for accepted tasks. The console uses these same resolved settings.
 
 ### Virtual Thread Execution
 
@@ -467,8 +559,9 @@ Timestamps use the JVM's local time zone.
 
 1. Resolve the supplied server ID or generate a UUID default
 2. Initialize the virtual thread executor
-3. Start the main listener and shutdown monitor on separate platform threads
-4. Display the console command prompt
+3. Bind both listeners, releasing both if any bind fails
+4. Start the listener threads and report the actual main/admin endpoints
+5. Display the console command prompt
 
 ### Request Processing
 
@@ -484,6 +577,9 @@ Timestamps use the JVM's local time zone.
 2. Mark the main server stopped and close its listening socket
 3. Close the request executor, waiting for accepted tasks to finish
 4. Enter `quit` to leave the console command loop and allow the application to exit
+
+Using `quit` directly, or closing console input, also closes the whole instance
+and waits for its listener and worker executors to terminate.
 
 ## 🤝 Contributing
 

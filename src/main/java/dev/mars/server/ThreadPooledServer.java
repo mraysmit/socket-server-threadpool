@@ -5,7 +5,7 @@ import dev.mars.worker.WorkerRunnable;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.io.IOException;
-import java.util.UUID;
+import java.io.UncheckedIOException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -14,7 +14,7 @@ public class ThreadPooledServer implements Runnable{
     private static final int CONNECTION_BACKLOG = 256;
     private final String serverId;
     protected int          serverPort   = 8080;
-    protected ServerSocket serverSocket = null;
+    protected volatile ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
     protected Thread       runningThread= null;
     protected final ExecutorService requestExecutor;
@@ -25,12 +25,8 @@ public class ThreadPooledServer implements Runnable{
     }
 
     public ThreadPooledServer(int port, String serverId) {
-        String selectedId = serverId == null || serverId.isBlank()
-                ? UUID.randomUUID().toString() : serverId.strip();
-        if (!selectedId.matches("[A-Za-z0-9._-]+")) {
-            throw new IllegalArgumentException("Server ID must contain only letters, digits, dots, underscores, or hyphens");
-        }
-        this.serverId = selectedId;
+        this.serverId = ServerOptions.resolveServerId(serverId);
+        ServerOptions.validatePort(port, "Main port");
         this.serverPort = port;
         requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
@@ -42,8 +38,9 @@ public class ThreadPooledServer implements Runnable{
                 if (isStopped.get()) {
                     return;
                 }
-                openServerSocket();
+                bind();
             }
+            System.out.println(SERVER_NAME + " started on port: " + getPort() + " | serverId=" + serverId);
             while(! isStopped()){
                 Socket clientSocket;
                 try {
@@ -57,9 +54,15 @@ public class ThreadPooledServer implements Runnable{
                 }
                 this.requestExecutor.execute(new WorkerRunnable(clientSocket, SERVER_NAME, serverId));
             }
+        } catch (IOException e) {
+            throw new UncheckedIOException("Cannot start " + SERVER_NAME, e);
         } finally {
-            // Virtual threads are daemon threads; wait for accepted requests before exiting.
-            this.requestExecutor.close();
+            try {
+                stop();
+            } finally {
+                // Wait for accepted requests before exiting, including after a bind failure.
+                this.requestExecutor.close();
+            }
             System.out.println(SERVER_NAME + " Closed.") ;
         }
     }
@@ -83,12 +86,16 @@ public class ThreadPooledServer implements Runnable{
         }
     }
 
-    private void openServerSocket() {
-        try {
-            this.serverSocket = new ServerSocket(this.serverPort, CONNECTION_BACKLOG);
-            System.out.println(SERVER_NAME + " started on port: " + this.serverPort + " | serverId=" + serverId);
-        } catch (IOException e) {
-            throw new RuntimeException(SERVER_NAME + "Cannot open port " + this.serverPort, e);
+    public synchronized void bind() throws IOException {
+        if (isStopped.get()) {
+            throw new IOException("Main server has already been stopped");
         }
+        if (serverSocket == null) {
+            serverSocket = new ServerSocket(serverPort, CONNECTION_BACKLOG);
+        }
+    }
+
+    public synchronized int getPort() {
+        return serverSocket == null ? serverPort : serverSocket.getLocalPort();
     }
 }
