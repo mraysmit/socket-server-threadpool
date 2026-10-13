@@ -13,6 +13,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.List;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
 import java.util.Set;
@@ -25,12 +26,18 @@ import static dev.mars.protocol.CommandError.Code.*;
 public final class PluginRegistry implements AutoCloseable {
     private final Map<String, CommandPlugin> plugins;
     private final URLClassLoader loader;
+    private final List<CommandPlugin> loadedPlugins;
+    private boolean startupAttempted;
+    private boolean closed;
 
     private PluginRegistry(Iterable<CommandPlugin> providers, URLClassLoader loader) {
         var selected = new LinkedHashMap<String, CommandPlugin>();
+        var discovered = new java.util.ArrayList<CommandPlugin>();
         for (var provider : providers) {
+            discovered.add(java.util.Objects.requireNonNull(provider, "provider"));
             String instruction = provider.instruction();
-            if (instruction == null || !instruction.matches("[A-Za-z][A-Za-z0-9._-]*")) {
+            if (instruction == null) { continue; }
+            if (!instruction.matches("[A-Za-z][A-Za-z0-9._-]*")) {
                 throw new IllegalArgumentException("Invalid plugin instruction: " + instruction);
             }
             if (selected.putIfAbsent(instruction, provider) != null) {
@@ -38,6 +45,8 @@ public final class PluginRegistry implements AutoCloseable {
             }
         }
         plugins = Map.copyOf(selected);
+        loadedPlugins = discovered.stream()
+                .sorted(java.util.Comparator.comparing(plugin -> plugin.getClass().getName())).toList();
         this.loader = loader;
     }
 
@@ -68,7 +77,7 @@ public final class PluginRegistry implements AutoCloseable {
                 discovery = loader;
             }
             var registry = new PluginRegistry(ServiceLoader.load(CommandPlugin.class, discovery), loader);
-            if (registry.plugins.isEmpty()) { throw new IllegalArgumentException("No command plugins discovered"); }
+            if (registry.loadedPlugins.isEmpty()) { throw new IllegalArgumentException("No plugins discovered"); }
             return registry;
         } catch (IOException | RuntimeException | ServiceConfigurationError e) {
             if (loader != null) {
@@ -79,6 +88,25 @@ public final class PluginRegistry implements AutoCloseable {
     }
 
     public Set<String> instructions() { return java.util.Collections.unmodifiableSet(new TreeSet<>(plugins.keySet())); }
+
+    /** Each registry belongs to one server instance; failed hooks are never retried automatically. */
+    public synchronized void start(PluginContext context) throws IOException {
+        if (closed || startupAttempted) { throw new IOException("Plugin startup has already run or registry is closed"); }
+        java.util.Objects.requireNonNull(context, "context");
+        startupAttempted = true;
+        Thread thread = Thread.currentThread();
+        ClassLoader previous = thread.getContextClassLoader();
+        for (var plugin : loadedPlugins) {
+            try {
+                thread.setContextClassLoader(plugin.getClass().getClassLoader());
+                plugin.start(context);
+            } catch (Exception e) {
+                throw new IOException("Cannot start plugin " + plugin.getClass().getName() + ": " + e.getMessage(), e);
+            } finally {
+                thread.setContextClassLoader(previous);
+            }
+        }
+    }
 
     public CommandReply dispatch(CommandRequest request, String serverId, long connectionId) {
         var plugin = plugins.get(request.instruction());
@@ -102,5 +130,8 @@ public final class PluginRegistry implements AutoCloseable {
         }
     }
 
-    @Override public void close() throws IOException { if (loader != null) { loader.close(); } }
+    @Override public synchronized void close() throws IOException {
+        closed = true;
+        if (loader != null) { loader.close(); }
+    }
 }

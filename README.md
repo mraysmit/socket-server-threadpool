@@ -8,6 +8,7 @@ A Java-based socket server that handles each client connection on its own virtua
 - **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
 - **Text Messages**: Sends a UTF-8 text message and receives an echo reply over the main socket
 - **Execution Plugins**: Dispatches JSON instructions to built-in or external JAR plugins and returns typed results
+- **Startup Discovery**: A built-in startup plugin announces the server's IPv4 addresses and bound ports over UDP and in terminal logs
 - **Graceful Shutdown**: Administrative interface for controlled server shutdown
 - **Status Monitoring**: Real-time server status checking capabilities
 - **Console Management**: Interactive command-line interface for server administration
@@ -43,6 +44,8 @@ src/
     ├── plugin/
     │   ├── PluginRegistryTest.java
     │   ├── PluginExecutionTest.java
+    │   ├── StartupPluginTest.java
+    │   ├── builtin/AddressBroadcastPluginTest.java
     │   └── ExternalPluginTest.java
     ├── client/
     │   ├── ClientOptionsTest.java
@@ -488,18 +491,23 @@ its source. The example's `clean` removes its previous JAR before rebuilding it.
 
 #### Why There Are Two META-INF Locations
 
-Each Maven project owns its own service registration file and packages it into
+Each Maven project owns its service registration files and packages them into
 its own JAR:
 
 | Source file | Packaged in | Registered providers |
 |---|---|---|
-| `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `MathAddPlugin`, `TextConcatPlugin`, and `EchoPlugin` (`math.add`, `text.concat`, and `echo`) |
+| `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `MathAddPlugin`, `TextConcatPlugin`, `EchoPlugin`, and startup-only `AddressBroadcastPlugin` |
 | `examples/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
 
 Inside each JAR, the registration has the same path:
 `META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
 resources in separate JARs. `ServiceLoader` discovers both and combines their
 provider lists at startup.
+
+All plugins share the `CommandPlugin` interface and this single service-file
+name. The optional `start(PluginContext)` method defaults to doing nothing.
+Startup-only plugins such as the address broadcaster use the same registration
+file and leave `instruction()` at its default `null`, so they add no command.
 
 With `--plugins-dir examples/multiply-plugin/target`, the server scans that
 directory for JARs and creates a class loader for them. `ServiceLoader` discovers
@@ -567,6 +575,106 @@ the server process. There is no sandbox, hot reload, or per-command execution
 deadline. The class loader closes after accepted work completes when the instance
 is closed. See [EXEC_PLUGIN.md](EXEC_PLUGIN.md) for the one-page design.
 
+#### Optional Plugin Startup
+
+All plugins implement the same `dev.mars.plugin.CommandPlugin` interface.
+Startup behavior is optional: override the default no-op `start(PluginContext)`
+method when initialization is needed. There is one interface and one service
+registration file per JAR:
+
+```java
+public interface CommandPlugin {
+    default void start(PluginContext context) throws Exception { }
+    default String instruction() { return null; }
+    default Object execute(Map<String, Object> parameters) throws Exception {
+        throw new UnsupportedOperationException("This plugin has no command handler");
+    }
+}
+```
+
+`PluginContext` supplies `serverId()`, `port()`, and `adminPort()` from the running
+instance. Both TCP ports are already bound and nonzero, including when startup
+options requested automatic allocation with `0`.
+
+A command plugin opts into startup behavior by overriding `start()`:
+
+```java
+public final class MultiplyPlugin implements CommandPlugin {
+    @Override
+    public void start(PluginContext context) throws Exception {
+        // Optional load-time function, such as loading configuration or a cache.
+        System.out.println("Plugin starting for " + context.serverId() + ":" + context.port());
+    }
+
+    // Implement the usual instruction() and execute(parameters) methods.
+}
+```
+
+Register every provider, including startup-only providers, in
+`META-INF/services/dev.mars.plugin.CommandPlugin`. The registry creates each
+provider once and calls `start()` on that same instance. Existing command plugins
+can keep their `instruction()` and `execute()` methods and inherit the no-op
+startup method. A startup-only plugin overrides `start()` and inherits the default
+`instruction()` value of `null`; it does not need to implement `execute()`.
+Non-null instruction names must be valid and unique.
+
+`ServerInstance` calls each plugin's startup method once after binding both listeners and before
+starting request processing or reporting ready. Hooks run synchronously on the
+startup thread with the provider's context class loader. A hook exception aborts
+startup, releases both listeners, and closes the external plugin loader. Command
+plugins using the default no-op startup method load and handle requests normally and
+require no changes. Requests continue to execute on virtual threads.
+
+#### Built-in Address Broadcast
+
+`AddressBroadcastPlugin` is a startup-only built-in, loaded automatically without
+an external JAR or a `send` command. It sends one UTF-8 JSON UDP datagram per
+distinct active IPv4 broadcast-capable interface to that subnet's broadcast
+address on **UDP port 9002**, and prints the same advertised endpoint in the
+terminal. This is a discovery destination port, independent of the server's main
+and admin TCP ports. Multiple servers can all announce to UDP port 9002.
+
+Start an instance normally, or with automatic TCP ports:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --port 0 --admin-port 0"
+```
+
+Example terminal entry (addresses and allocated ports vary by machine):
+
+```text
+Server announcement sent | serverId=Server-001 | ip=192.168.1.10 | port=52000 | adminPort=52001 | udp=192.168.1.255:9002
+```
+
+The UDP payload is:
+
+```json
+{"version":1,"type":"SERVER_STARTED","serverId":"Server-001","ip":"192.168.1.10","port":52000,"adminPort":52001}
+```
+
+A discovery client listening on UDP port 9002 can use `ip` and `port` for the
+main connection; `adminPort` identifies the administrative endpoint. On machines
+with multiple active interfaces, each announcement contains that interface's
+address. Loopback and IPv6 interfaces are excluded. There is one announcement per
+interface at startup, with no periodic heartbeat or retry; listeners must already
+be running to receive it. UDP delivery depends on the local network and firewall.
+
+Announcements are best effort: an unavailable interface or failed UDP send is
+logged and the TCP server continues starting. The plugin closes each UDP socket
+after sending. It does not appear in the ready log's command instruction list
+because it has no command handler.
+
+To run the startup-hook and broadcaster tests with terminal output:
+
+```powershell
+mvn test "-Dtest=StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+The broadcaster test receives a real UDP datagram using a controlled loopback
+destination, checks the server ID and resolved ports, and prints
+`Address broadcast test PASSED`. Other cases cover multiple interfaces, send
+failures, missing interfaces, opt-in initialization, and failed-startup cleanup.
+
 ### Testing the Server
 
 #### Automated Tests
@@ -597,13 +705,13 @@ mvn test "-Dtest=ServerLifecycleTest"
 Run only the plugin tests with command-line output:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 To include the JSON client's reply-validation tests as well:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 These verify built-in results, parameter validation, request/reply validation,
@@ -893,8 +1001,9 @@ Timestamps use the JVM's local time zone.
 1. Resolve the supplied server ID or generate a UUID default
 2. Discover and validate plugins, then initialize the virtual thread executor
 3. Bind both listeners, releasing both if any bind fails
-4. Start the listener threads and report the actual main/admin endpoints
-5. Display the console command prompt
+4. Run optional startup hooks with the resolved endpoints, including the address announcement
+5. Start the listener threads and report the actual main/admin endpoints
+6. Display the console command prompt
 
 ### Request Processing
 

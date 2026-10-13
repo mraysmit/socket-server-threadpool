@@ -1,3 +1,4 @@
 dev.mars.plugin.builtin.MathAddPlugin
 dev.mars.plugin.builtin.TextConcatPlugin
 dev.mars.plugin.builtin.EchoPlugin
+dev.mars.plugin.builtin.AddressBroadcastPlugin

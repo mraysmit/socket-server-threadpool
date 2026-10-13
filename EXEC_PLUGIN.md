@@ -34,8 +34,11 @@ A minimal plugin contract is:
 
 ```java
 public interface CommandPlugin {
-    String instruction();
-    Object execute(Map<String, Object> parameters) throws Exception;
+    default void start(PluginContext context) throws Exception { }
+    default String instruction() { return null; }
+    default Object execute(Map<String, Object> parameters) throws Exception {
+        throw new UnsupportedOperationException("This plugin has no command handler");
+    }
 }
 ```
 
@@ -50,6 +53,12 @@ inside the server process.
   Duplicate instruction names or invalid providers fail startup with resource cleanup.
 - **Execution:** Dispatch on the existing per-connection virtual thread. Shared
   plugin instances must be thread-safe; begin with stateless implementations.
+- **Optional startup:** `CommandPlugin.start(PluginContext)` defaults to no-op and runs once after both
+  listeners bind and before requests are accepted. The context supplies the server
+  ID and actual main/admin ports. All providers share the same interface and
+  `CommandPlugin` service file. Startup-only providers inherit a null instruction;
+  command handlers override `instruction()` and `execute()`. Existing command
+  plugins require no changes. Hook failures abort startup with listener cleanup.
 - **Errors:** Return `status: "ERROR"` with an error code and message, using
   `INVALID_REQUEST`, `UNKNOWN_INSTRUCTION`, `INVALID_PARAMETERS`, or `PLUGIN_ERROR`.
   Preserve the request ID whenever valid, plus server and connection IDs. A plugin
@@ -63,6 +72,11 @@ Built-ins are `math.add` (numeric `a`, `b`), `text.concat` (string `a`, `b`), an
 commands keep their existing roles. Plugins load once per startup, and their
 class loader closes after accepted work finishes during shutdown.
 Message IDs provide correlation; duplicate-request suppression is a separate feature.
+
+The built-in startup-only `AddressBroadcastPlugin` sends the server ID, interface
+IPv4 address, and actual TCP ports as JSON to each active subnet's UDP broadcast
+address on port 9002, and logs the endpoint. It runs once per interface and closes
+its UDP sockets. Announcement failures are logged without preventing TCP startup.
 
 Tests cover external-JAR discovery, duplicate instructions, numeric and text
 results, Unicode, invalid parameters, unknown instructions, malformed requests,

@@ -5,7 +5,7 @@ import dev.mars.protocol.CommandRequest;
 import dev.mars.protocol.Json;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.NullAndEmptySource;
+import org.junit.jupiter.params.provider.EmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigDecimal;
@@ -76,7 +76,7 @@ class PluginRegistryTest {
     }
 
     @ParameterizedTest
-    @NullAndEmptySource
+    @EmptySource
     @ValueSource(strings = {" ", "bad name", "bad|name"})
     void rejectsInvalidInstructionNames(String name) {
         assertThrows(IllegalArgumentException.class, () -> PluginRegistry.of(List.of(plugin(name, parameters -> 1))));

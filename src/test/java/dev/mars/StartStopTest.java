@@ -107,6 +107,7 @@ class StartStopTest {
             assertNotEquals(0, result.exitCode(), result.output());
             assertTrue(result.output().contains("port " + occupied.getLocalPort() + " is already in use"), result.output());
             assertFalse(result.output().contains("Server ready"), result.output());
+            assertFalse(result.output().contains("Server announcement"), result.output());
             assertFalse(occupied.isClosed());
         }
     }

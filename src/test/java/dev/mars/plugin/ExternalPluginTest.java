@@ -107,9 +107,72 @@ class ExternalPluginTest {
         }
     }
 
+    @Test
+    void externalCommandOptsIntoStartupAndReceivesResolvedPorts() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                import java.util.Map;
+                public class ExamplePlugin implements CommandPlugin {
+                    private static int instances;
+                    private PluginContext context;
+                    public ExamplePlugin() {
+                        if (++instances != 1) throw new IllegalStateException("Constructed twice");
+                    }
+                    public String instruction() { return "external.startup"; }
+                    public void start(PluginContext context) {
+                        if (this.context != null) throw new IllegalStateException("Started twice");
+                        this.context = context;
+                    }
+                    public Object execute(Map<String,Object> parameters) {
+                        return Map.of("serverId", context.serverId(), "port", context.port(), "adminPort", context.adminPort());
+                    }
+                }
+                """, "dev.mars.plugin.CommandPlugin");
+        try (var server = ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory))) {
+            var reply = new TextMessageClient("localhost", server.getPort()).execute("external.startup", Map.of());
+            assertEquals(Map.of("serverId", "Server-001", "port", BigInteger.valueOf(server.getPort()),
+                    "adminPort", BigInteger.valueOf(server.getAdminPort())), reply.result());
+        }
+        Files.delete(jar);
+    }
+
+    @Test
+    void failingStartupOnlyExternalPluginReleasesBothBoundPortsAndJar() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                public class ExamplePlugin implements CommandPlugin {
+                    public void start(PluginContext context) throws Exception {
+                        try (var a = new java.net.ServerSocket(context.port())) {
+                            throw new IllegalStateException("Main port was not bound");
+                        } catch (java.net.BindException expected) { }
+                        try (var b = new java.net.ServerSocket(context.adminPort())) {
+                            throw new IllegalStateException("Admin port was not bound");
+                        } catch (java.net.BindException expected) { }
+                        throw new java.io.IOException("Startup failed after binding both ports");
+                    }
+                }
+                """, "dev.mars.plugin.CommandPlugin");
+        int main;
+        int admin;
+        try (var a = new java.net.ServerSocket(0); var b = new java.net.ServerSocket(0)) {
+            main = a.getLocalPort(); admin = b.getLocalPort();
+        }
+        var error = assertThrows(IOException.class,
+                () -> ServerInstance.start(new ServerOptions("Server-001", main, admin, directory)));
+        assertTrue(error.getMessage().contains("Startup failed after binding both ports"), error.getMessage());
+        try (var a = new java.net.ServerSocket(main); var b = new java.net.ServerSocket(admin)) {
+            assertEquals(main, a.getLocalPort());
+            assertEquals(admin, b.getLocalPort());
+        }
+        Files.delete(jar);
+    }
+
     private Path providerJar(Path directory, String instruction, String body) throws Exception {
-        Path source = temporary.resolve("ExamplePlugin.java");
-        Files.writeString(source, """
+        return compileJar(directory, """
                 package example;
                 import dev.mars.plugin.CommandPlugin;
                 import java.util.Map;
@@ -119,7 +182,12 @@ class ExternalPluginTest {
                         %s
                     }
                 }
-                """.formatted(instruction, body));
+                """.formatted(instruction, body), "dev.mars.plugin.CommandPlugin");
+    }
+
+    private Path compileJar(Path directory, String content, String... services) throws Exception {
+        Path source = temporary.resolve("ExamplePlugin.java");
+        Files.writeString(source, content);
         Path classes = Files.createDirectory(temporary.resolve("compiled"));
         Path api = Path.of(CommandPlugin.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         var compiler = ToolProvider.getSystemJavaCompiler();
@@ -131,9 +199,11 @@ class ExternalPluginTest {
             output.putNextEntry(new JarEntry("example/ExamplePlugin.class"));
             Files.copy(classes.resolve("example/ExamplePlugin.class"), output);
             output.closeEntry();
-            output.putNextEntry(new JarEntry("META-INF/services/dev.mars.plugin.CommandPlugin"));
-            output.write("example.ExamplePlugin\n".getBytes(StandardCharsets.UTF_8));
-            output.closeEntry();
+            for (String service : services) {
+                output.putNextEntry(new JarEntry("META-INF/services/" + service));
+                output.write("example.ExamplePlugin\n".getBytes(StandardCharsets.UTF_8));
+                output.closeEntry();
+            }
         }
         return jar;
     }

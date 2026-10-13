@@ -6,6 +6,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import dev.mars.plugin.PluginRegistry;
+import dev.mars.plugin.PluginContext;
 import java.io.UncheckedIOException;
 
 /** Owns both listeners and starts them only after both ports have been bound. */
@@ -43,6 +44,7 @@ public final class ServerInstance implements AutoCloseable {
                 instance.bindMain(options.port());
                 instance.bindAdmin(options.adminPort());
             }
+            plugins.start(new PluginContext(instance.getServerId(), instance.getPort(), instance.getAdminPort()));
             instance.serverTask = instance.listeners.submit(instance.server);
             instance.monitorTask = instance.listeners.submit(instance.monitor);
             System.out.println("Server ready | serverId=" + instance.getServerId()
