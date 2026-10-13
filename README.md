@@ -63,7 +63,7 @@ src/main/java/dev/mars/
 
 ## 🛠️ Technical Specifications
 
-- **Java Version**: 24
+- **Java Version**: 27
 - **Build Tool**: Maven
 - **Main Server Port**: 9000
 - **Admin Port**: 9001
@@ -74,7 +74,7 @@ src/main/java/dev/mars/
 
 ### Prerequisites
 
-- Java 24 or higher
+- Java 27 or higher
 - Maven 3.6+
 
 ### Building the Project
@@ -86,7 +86,7 @@ mvn clean compile
 ### Running the Server
 
 ```bash
-mvn exec:java -Dexec.mainClass="dev.mars.StartStop"
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop"
 ```
 
 Or compile and run directly:
