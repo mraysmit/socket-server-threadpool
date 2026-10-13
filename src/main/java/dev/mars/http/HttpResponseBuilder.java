@@ -2,6 +2,7 @@ package dev.mars.http;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Builder class for creating HTTP responses.
@@ -77,9 +78,8 @@ public class HttpResponseBuilder {
      */
     public HttpResponse build() {
         // Automatically set Content-Length header
-        if (body != null) {
-            headers.put("Content-Length", String.valueOf(body.getBytes().length));
-        }
+        headers.put("Content-Length", String.valueOf(
+                body == null ? 0 : body.getBytes(StandardCharsets.UTF_8).length));
         
         return new HttpResponse(statusLine, headers, body);
     }

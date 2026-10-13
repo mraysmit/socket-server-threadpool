@@ -6,6 +6,12 @@ import dev.mars.http.HttpResponseWriter;
 
 import java.io.*;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Worker class that handles individual client requests.
@@ -13,10 +19,15 @@ import java.net.Socket;
  * to specialized classes, adhering to the Single Responsibility Principle.
  */
 public class WorkerRunnable implements Runnable {
+    private static final AtomicLong NEXT_CONNECTION_ID = new AtomicLong();
+    private static final DateTimeFormatter LOG_TIMESTAMP = DateTimeFormatter
+            .ofPattern("uuuu-MM-dd HH:mm:ss.SSS XXX", Locale.ROOT)
+            .withZone(ZoneId.systemDefault());
 
     protected Socket clientSocket = null;
     protected String serverText = null;
     private final HttpResponseWriter responseWriter;
+    private final long connectionId = NEXT_CONNECTION_ID.incrementAndGet();
 
     public WorkerRunnable(Socket clientSocket, String serverText) {
         this.clientSocket = clientSocket;
@@ -36,13 +47,24 @@ public class WorkerRunnable implements Runnable {
 
     @Override
     public void run() {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream()));
-             PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true)) {
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), StandardCharsets.US_ASCII));
+             PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true, StandardCharsets.UTF_8)) {
+
+            logEvent("Client connected", Instant.now());
+            clientSocket.setSoTimeout(10000);
+            // Consume the request headers before closing the socket to avoid a TCP reset.
+            String line;
+            do {
+                line = reader.readLine();
+                if (line == null) {
+                    return;
+                }
+            } while (!line.isEmpty());
 
             long time = System.currentTimeMillis();
 
             // Log the request processing
-            System.out.println("Request processed: at " + time + " from " + serverText + " on thread " + Thread.currentThread().getName());
+            logEvent("Request processed", Instant.ofEpochMilli(time));
 
             // Create response content
             String responseBody = "WorkerRunnable: " + this.serverText + " - " + time;
@@ -62,7 +84,7 @@ public class WorkerRunnable implements Runnable {
             e.printStackTrace();
 
             // Try to send an error response
-            try (PrintWriter errorWriter = new PrintWriter(clientSocket.getOutputStream(), true)) {
+            try (PrintWriter errorWriter = new PrintWriter(clientSocket.getOutputStream(), true, StandardCharsets.UTF_8)) {
                 responseWriter.writeInternalServerErrorResponse(errorWriter);
             } catch (IOException errorResponseException) {
                 System.err.println("Failed to send error response: " + errorResponseException.getMessage());
@@ -76,5 +98,15 @@ public class WorkerRunnable implements Runnable {
                 System.err.println("Error closing client socket: " + e.getMessage());
             }
         }
+    }
+
+    private void logEvent(String event, Instant timestamp) {
+        String host = clientSocket.getInetAddress().getHostAddress();
+        String client = (host.contains(":") ? "[" + host + "]" : host) + ":" + clientSocket.getPort();
+        Thread thread = Thread.currentThread();
+        System.out.println(String.format(Locale.ROOT,
+                "[%s] %s | connectionId=%d | client=%s | server=%s | thread=%d | virtual=%s",
+                LOG_TIMESTAMP.format(timestamp), event, connectionId, client, serverText,
+                thread.threadId(), thread.isVirtual()));
     }
 }

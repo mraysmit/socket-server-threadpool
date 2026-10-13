@@ -1,10 +1,10 @@
-# Socket Server with Thread Pool
+# Socket Server with Virtual Threads
 
-A Java-based multi-threaded socket server implementation that demonstrates concurrent client handling using a thread pool architecture. This project provides a robust server solution with graceful shutdown capabilities and administrative monitoring.
+A Java-based socket server that handles each client connection on its own virtual thread, with graceful shutdown and administrative monitoring.
 
 ## 🚀 Features
 
-- **Thread Pool Architecture**: Efficiently handles multiple concurrent client connections using a fixed-size thread pool
+- **Virtual Threads**: Handles each client connection on a new virtual thread
 - **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
 - **Graceful Shutdown**: Administrative interface for controlled server shutdown
 - **Status Monitoring**: Real-time server status checking capabilities
@@ -29,7 +29,7 @@ src/main/java/dev/mars/
 ### Core Components
 
 1. **ThreadPooledServer**: The main server that listens for client connections on port 9000
-   - Uses a fixed thread pool (default: 10 threads)
+   - Uses a virtual thread per accepted connection
    - Accepts incoming socket connections
    - Delegates client handling to worker threads
 
@@ -67,7 +67,7 @@ src/main/java/dev/mars/
 - **Build Tool**: Maven
 - **Main Server Port**: 9000
 - **Admin Port**: 9001
-- **Default Thread Pool Size**: 10 threads
+- **Request Executor**: One virtual thread per connection
 - **Response Format**: HTTP/1.1 with proper headers
 
 ## 🚦 Getting Started
@@ -77,6 +77,18 @@ src/main/java/dev/mars/
 - Java 27 or higher
 - Maven 3.6+
 
+Run the commands below from the project root, where `pom.xml` is located.
+Check that both Java and Maven use JDK 27 or higher:
+
+```powershell
+java -version
+mvn -version
+```
+
+If Maven reports an older Java version, set `JAVA_HOME` to your JDK 27 installation
+and make sure its `bin` directory is on `PATH` before opening a new terminal.
+The first Maven build requires internet access to download dependencies and plugins.
+
 ### Building the Project
 
 ```bash
@@ -85,16 +97,26 @@ mvn clean compile
 
 ### Running the Server
 
-```bash
+Compile and start the interactive application:
+
+```powershell
 mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop"
 ```
 
-Or compile and run directly:
+In PowerShell, keep the entire `-Dexec.mainClass=...` argument in quotes.
+Quoting only the class name can cause an `Unknown lifecycle phase` error.
 
-```bash
-javac -cp src/main/java src/main/java/dev/mars/*.java
-java -cp src/main/java dev.mars.StartStop
+Alternatively, compile with Maven and launch directly with Java:
+
+```powershell
+mvn compile
+java -cp target/classes dev.mars.StartStop
 ```
+
+Keep the terminal open for console commands. The app listens on port **9000** for
+HTTP clients and port **9001** for administrative commands; both ports must be free.
+If startup reports `Address already in use`, stop the previous instance or change
+the ports in `StartStop.java`.
 
 ## 💻 Usage
 
@@ -111,28 +133,93 @@ When you run the application, it will:
 The application provides an interactive console with the following commands:
 
 - `status` - Check if the server is running
-- `shutdown` - Gracefully shutdown the server
-- `quit` - Exit the console application
+- `shutdown` - Stop the main server and shutdown monitor
+- `quit` - Exit the console command loop
+
+To stop the application cleanly, enter `shutdown`, wait for the server to stop,
+then enter `quit`. Using `quit` alone does not request shutdown of either listener.
 
 ### Testing the Server
 
+#### Automated Tests
+
+Run all JUnit tests, including the socket tests:
+
+```powershell
+mvn test
+```
+
+For a clean build, tests, and JAR packaging:
+
+```powershell
+mvn clean verify
+```
+
+To run a single test class:
+
+```powershell
+mvn test "-Dtest=HttpResponseWriterTest"
+mvn test "-Dtest=ServerLifecycleTest"
+```
+
+#### 1,000-Request Load Test
+
+Run this command from the project root to execute only the load test:
+
+```powershell
+mvn test "-Dtest=ServerLifecycleTest#handlesOneThousandRequests" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+This test sends 1,000 HTTP GET requests from virtual-thread clients, with at most
+100 requests in flight. Every response must have status 200, the expected body,
+and a matching content length. All requests must finish within 30 seconds, and
+the server must still answer administrative status checks afterward. The test
+runs as part of `mvn test` too. It starts its own server on a temporary port;
+it does not send requests to an application you already have running on port 9000.
+
+The terminal displays request logs, progress every 100 verified responses, and
+a final summary such as `Load test PASSED: 1,000 responses verified in ... ms; server is ALIVE`.
+Maven reports `Tests run: 1` because this one test method sends all 1,000 requests.
+
+To save the request logs and progress to a file instead, use:
+
+```powershell
+mvn test "-Dtest=ServerLifecycleTest#handlesOneThousandRequests" "-Dmaven.test.redirectTestOutputToFile=true"
+```
+
+With redirection enabled, test output is in
+`target/surefire-reports/dev.mars.server.ServerLifecycleTest-output.txt`.
+
+Tests cover HTTP response construction, UTF-8 content lengths, wire formatting,
+output failures, concurrent socket clients, and administrative status/shutdown commands.
+Socket tests start their own servers on temporary ports and clean up afterward;
+you do not need to start the application first. Reports are in `target/surefire-reports/`.
+Maven prints a test summary and `BUILD SUCCESS` when the suite passes. If a test
+fails, check the summary and the corresponding `.txt` or `.xml` report in that directory.
+
 #### Test Client Connections
 
-You can test the server using various tools:
+Start the application first, then run these commands in a second terminal.
 
 **Using curl:**
+
 ```bash
 curl http://localhost:9000
 ```
+
+On Windows PowerShell, use `curl.exe http://localhost:9000` to invoke curl directly.
 
 **Using telnet:**
 ```bash
 telnet localhost 9000
 ```
 
+After connecting, enter `GET / HTTP/1.1`, then `Host: localhost`, then an empty
+line to finish the request headers.
+
 **Using netcat:**
 ```bash
-echo "GET / HTTP/1.1" | nc localhost 9000
+printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | nc localhost 9000
 ```
 
 #### Administrative Commands
@@ -166,17 +253,17 @@ WorkerRunnable: ThreadPooledServer - [timestamp]
 You can modify the server configuration by editing the `StartStop.java` file:
 
 ```java
-// Change port and thread pool size
-var threadPooledServer = new ThreadPooledServer(9000, 10);  // port, thread count
+// Change the listening ports
+var threadPooledServer = new ThreadPooledServer(9000);  // main port
 var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);  // admin port
 ```
 
-### Thread Pool Sizing
+### Virtual Thread Execution
 
-The default thread pool size is 10. Consider adjusting based on:
-- Expected concurrent connections
-- Server hardware capabilities
-- Response time requirements
+The request executor uses `Executors.newVirtualThreadPerTaskExecutor()`; there is
+no fixed worker pool size. The listener and shutdown monitor keep their platform
+threads. During shutdown, the listener stops accepting clients and waits for
+accepted request tasks to finish. Workers wait up to 10 seconds for request data.
 
 ## 🏗️ SOLID Design Principles
 
@@ -216,17 +303,29 @@ The server provides comprehensive logging:
 - Error handling with stack traces
 - Server lifecycle events
 
+Connection and request logs include a readable timestamp, connection ID, client
+IP address and source port, server name, thread ID, and virtual-thread status:
+
+```text
+[2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | thread=42 | virtual=true
+[2026-10-13 14:30:00.124 +08:00] Request processed | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | thread=42 | virtual=true
+```
+
+The same connection ID appears in both entries and is unique within the running
+JVM. The source port distinguishes clients sharing an IP address. Timestamps use
+the JVM's local time zone.
+
 ## 🔄 Lifecycle Management
 
 ### Server Startup
-1. Initialize thread pool
+1. Initialize the virtual thread executor
 2. Bind to server socket
 3. Start accepting connections
 4. Launch shutdown monitor
 
 ### Request Processing
 1. Accept client connection
-2. Submit to thread pool
+2. Start a virtual thread for the connection
 3. Process in worker thread
 4. Return HTTP response
 5. Close client socket
@@ -234,7 +333,7 @@ The server provides comprehensive logging:
 ### Server Shutdown
 1. Stop accepting new connections
 2. Complete existing requests
-3. Shutdown thread pool
+3. Close the request executor after accepted tasks finish
 4. Close server socket
 5. Clean up resources
 

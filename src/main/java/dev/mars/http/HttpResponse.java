@@ -2,6 +2,7 @@ package dev.mars.http;
 
 import java.util.HashMap;
 import java.util.Map;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Represents an HTTP response with status, headers, and body.
@@ -35,6 +36,6 @@ public class HttpResponse {
      * @return the length of the body in bytes
      */
     public int getContentLength() {
-        return body != null ? body.getBytes().length : 0;
+        return body != null ? body.getBytes(StandardCharsets.UTF_8).length : 0;
     }
 }

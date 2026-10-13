@@ -10,40 +10,46 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ThreadPooledServer implements Runnable{
+    private static final int CONNECTION_BACKLOG = 256;
     protected int          serverPort   = 8080;
     protected ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
     protected Thread       runningThread= null;
-    protected ExecutorService threadPool = null;
+    protected final ExecutorService requestExecutor;
     final protected String SERVER_NAME = "ThreadPooledServer";
 
-    public ThreadPooledServer(int port, int threadPoolSize) {
+    public ThreadPooledServer(int port) {
         this.serverPort = port;
-        threadPool = Executors.newFixedThreadPool(threadPoolSize);
+        requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
     public void run(){
-        synchronized(this){
-            this.runningThread = Thread.currentThread();
-        }
-        openServerSocket();
-        while(! isStopped()){
-            Socket clientSocket = null;
-            try {
-                clientSocket = this.serverSocket.accept();
-                System.out.println("Client connected: " + clientSocket.getInetAddress());
-
-            } catch (IOException e) {
-                if(isStopped()) {
-                    System.out.println(SERVER_NAME + " Stopped.") ;
-                    break;
+        try {
+            synchronized(this){
+                this.runningThread = Thread.currentThread();
+                if (isStopped.get()) {
+                    return;
                 }
-                throw new RuntimeException("Error accepting client connection", e);
+                openServerSocket();
             }
-            this.threadPool.execute(new WorkerRunnable(clientSocket, SERVER_NAME));
+            while(! isStopped()){
+                Socket clientSocket;
+                try {
+                    clientSocket = this.serverSocket.accept();
+                } catch (IOException e) {
+                    if(isStopped()) {
+                        System.out.println(SERVER_NAME + " Stopped.") ;
+                        break;
+                    }
+                    throw new RuntimeException("Error accepting client connection", e);
+                }
+                this.requestExecutor.execute(new WorkerRunnable(clientSocket, SERVER_NAME));
+            }
+        } finally {
+            // Virtual threads are daemon threads; wait for accepted requests before exiting.
+            this.requestExecutor.close();
+            System.out.println(SERVER_NAME + " Closed.") ;
         }
-        this.threadPool.shutdown();
-        System.out.println(SERVER_NAME + " Closed.") ;
     }
 
     public synchronized boolean isStopped() {
@@ -53,7 +59,9 @@ public class ThreadPooledServer implements Runnable{
     public synchronized void stop(){
         this.isStopped.getAndSet(true);
         try {
-            this.serverSocket.close();
+            if (this.serverSocket != null) {
+                this.serverSocket.close();
+            }
         } catch (IOException e) {
             throw new RuntimeException("Error closing " + SERVER_NAME , e);
         }
@@ -61,7 +69,7 @@ public class ThreadPooledServer implements Runnable{
 
     private void openServerSocket() {
         try {
-            this.serverSocket = new ServerSocket(this.serverPort);
+            this.serverSocket = new ServerSocket(this.serverPort, CONNECTION_BACKLOG);
             System.out.println(SERVER_NAME + " started on port: " + this.serverPort);
         } catch (IOException e) {
             throw new RuntimeException(SERVER_NAME + "Cannot open port " + this.serverPort, e);

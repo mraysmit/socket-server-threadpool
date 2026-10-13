@@ -28,24 +28,27 @@ public class HttpResponseWriter {
 
         try {
             // Write status line
-            writer.println(response.getStatusLine());
+            writer.print(response.getStatusLine() + "\r\n");
 
             // Write headers
             Map<String, String> headers = response.getHeaders();
             for (Map.Entry<String, String> header : headers.entrySet()) {
-                writer.println(header.getKey() + ": " + header.getValue());
+                writer.print(header.getKey() + ": " + header.getValue() + "\r\n");
             }
 
             // Write empty line to separate headers from body
-            writer.println();
+            writer.print("\r\n");
 
             // Write body
             if (response.getBody() != null) {
-                writer.println(response.getBody());
+                writer.print(response.getBody());
             }
 
             // Ensure all data is sent
             writer.flush();
+            if (writer.checkError()) {
+                throw new IOException("Output stream reported a write failure");
+            }
 
         } catch (Exception e) {
             throw new IOException("Failed to write HTTP response", e);

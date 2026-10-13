@@ -16,7 +16,7 @@ public class StartStop {
      */
     public static void main(String[] args) {
 
-        var threadPooledServer = new ThreadPooledServer(9000, 10);
+        var threadPooledServer = new ThreadPooledServer(9000);
         var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);
 
         System.out.println("Starting Main Server");
