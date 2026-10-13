@@ -1,5 +1,6 @@
 package dev.mars;
 
+import dev.mars.client.TextMessageClient;
 import dev.mars.server.ShutdownMonitor;
 import dev.mars.server.ThreadPooledServer;
 
@@ -8,6 +9,7 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.Socket;
+import java.util.UUID;
 
 public class StartStop {
 
@@ -27,7 +29,7 @@ public class StartStop {
         System.out.println("To stop server, connect to port 9001");
 
         try (BufferedReader consoleReader = new BufferedReader(new InputStreamReader(System.in))) {
-            System.out.println("> Enter commands (status, shutdown, or quit to exit):");
+            System.out.println("> Enter commands (send <text>, status, shutdown, or quit to exit):");
             String command;
             while (true) {
                 System.out.print("> ");
@@ -38,8 +40,19 @@ public class StartStop {
 
                 if (command.equalsIgnoreCase("status") || command.equalsIgnoreCase("shutdown")) {
                     checkServerStatus(command);
+                } else if (command.regionMatches(true, 0, "send ", 0, 5)) {
+                    try {
+                        String message = command.substring(5);
+                        UUID messageId = UUID.randomUUID();
+                        System.out.println("Sending: messageId=" + messageId + " | text=" + message);
+                        System.out.println("Server response: " + new TextMessageClient("localhost", 9000).send(messageId, message));
+                    } catch (IOException | IllegalArgumentException e) {
+                        System.out.println("Error sending message: " + e.getMessage());
+                    }
+                } else if (command.equalsIgnoreCase("send")) {
+                    System.out.println("Usage: send <text>");
                 } else {
-                    System.out.println("Unknown command. Available commands: status, shutdown");
+                    System.out.println("Unknown command. Available commands: send <text>, status, shutdown, quit");
                 }
             }
         } catch (IOException e) {

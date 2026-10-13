@@ -11,6 +11,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -28,30 +29,62 @@ public class WorkerRunnable implements Runnable {
     protected String serverText = null;
     private final HttpResponseWriter responseWriter;
     private final long connectionId = NEXT_CONNECTION_ID.incrementAndGet();
+    private final UUID serverId;
+    private UUID messageId;
 
-    public WorkerRunnable(Socket clientSocket, String serverText) {
-        this.clientSocket = clientSocket;
-        this.serverText = serverText;
-        this.responseWriter = new HttpResponseWriter();
+    public WorkerRunnable(Socket clientSocket, String serverText, UUID serverId) {
+        this(clientSocket, serverText, serverId, new HttpResponseWriter());
     }
 
     /**
      * Constructor that allows dependency injection of HttpResponseWriter.
      * This follows the Dependency Inversion Principle.
      */
-    public WorkerRunnable(Socket clientSocket, String serverText, HttpResponseWriter responseWriter) {
+    public WorkerRunnable(Socket clientSocket, String serverText, UUID serverId, HttpResponseWriter responseWriter) {
         this.clientSocket = clientSocket;
         this.serverText = serverText;
         this.responseWriter = responseWriter;
+        this.serverId = serverId;
     }
 
     @Override
     public void run() {
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), StandardCharsets.US_ASCII));
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(clientSocket.getInputStream(), StandardCharsets.UTF_8));
              PrintWriter writer = new PrintWriter(clientSocket.getOutputStream(), true, StandardCharsets.UTF_8)) {
 
             logEvent("Client connected", Instant.now());
             clientSocket.setSoTimeout(10000);
+            String request = reader.readLine();
+            if (request == null) {
+                return;
+            }
+            if (request.equalsIgnoreCase("message") || request.regionMatches(true, 0, "message ", 0, 8)) {
+                String[] fields = request.split(" ", 3);
+                if (fields.length < 2) {
+                    writer.println("Error: usage: message <messageId> <text>");
+                    return;
+                }
+                try {
+                    messageId = UUID.fromString(fields[1]);
+                } catch (IllegalArgumentException e) {
+                    writer.println("Error: invalid message ID; use a UUID");
+                    return;
+                }
+                String message = fields.length == 3 ? fields[2] : "";
+                if (message.isBlank()) {
+                    writer.println("error " + messageId + " " + serverId + " " + connectionId
+                            + " Message must not be empty");
+                } else {
+                    logEvent("Message received: " + message, Instant.now());
+                    writer.println("reply " + messageId + " " + serverId + " " + connectionId
+                            + " Received: " + message);
+                    logEvent("Message reply sent", Instant.now());
+                }
+                if (writer.checkError()) {
+                    throw new IOException("Could not send message reply");
+                }
+                return;
+            }
             // Consume the request headers before closing the socket to avoid a TCP reset.
             String line;
             do {
@@ -105,8 +138,9 @@ public class WorkerRunnable implements Runnable {
         String client = (host.contains(":") ? "[" + host + "]" : host) + ":" + clientSocket.getPort();
         Thread thread = Thread.currentThread();
         System.out.println(String.format(Locale.ROOT,
-                "[%s] %s | connectionId=%d | client=%s | server=%s | thread=%d | virtual=%s",
+                "[%s] %s | connectionId=%d | client=%s | server=%s | serverId=%s | messageId=%s | thread=%d | virtual=%s",
                 LOG_TIMESTAMP.format(timestamp), event, connectionId, client, serverText,
+                serverId, messageId == null ? "-" : messageId,
                 thread.threadId(), thread.isVirtual()));
     }
 }

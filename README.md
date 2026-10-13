@@ -6,6 +6,7 @@ A Java-based socket server that handles each client connection on its own virtua
 
 - **Virtual Threads**: Handles each client connection on a new virtual thread
 - **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
+- **Text Messages**: Sends a UTF-8 text message and receives an echo reply over the main socket
 - **Graceful Shutdown**: Administrative interface for controlled server shutdown
 - **Status Monitoring**: Real-time server status checking capabilities
 - **Console Management**: Interactive command-line interface for server administration
@@ -114,7 +115,7 @@ java -cp target/classes dev.mars.StartStop
 ```
 
 Keep the terminal open for console commands. The app listens on port **9000** for
-HTTP clients and port **9001** for administrative commands; both ports must be free.
+HTTP and text-message clients and port **9001** for administrative commands; both ports must be free.
 If startup reports `Address already in use`, stop the previous instance or change
 the ports in `StartStop.java`.
 
@@ -132,12 +133,68 @@ When you run the application, it will:
 
 The application provides an interactive console with the following commands:
 
+- `send <text>` - Send a text message to port 9000 and display the server's reply
 - `status` - Check if the server is running
 - `shutdown` - Stop the main server and shutdown monitor
 - `quit` - Exit the console command loop
 
 To stop the application cleanly, enter `shutdown`, wait for the server to stop,
 then enter `quit`. Using `quit` alone does not request shutdown of either listener.
+
+### Sending and Receiving Text Messages
+
+Start the app, then enter a message at its console prompt:
+
+```text
+> send Hello server
+Sending: messageId=11111111-1111-4111-8111-111111111111 | text=Hello server
+Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=22222222-2222-4222-8222-222222222222 | connectionId=1 | text=Received: Hello server
+```
+
+The client generates a UUID for each message and checks that the reply contains
+the same ID and expected echoed text. Replies also include the server instance's
+UUID and connection ID. Missing or malformed IDs, mismatched message IDs, and
+incorrect reply text cause an error instead of being displayed as successful replies.
+Each server creates its instance ID when constructed and keeps it for its lifetime;
+restarting the application creates a new instance ID.
+
+The server logs the message ID, server ID, connection ID, and client address.
+Messages support UTF-8, including non-English text. Each message is one nonempty
+line. Message IDs correlate requests and replies; the server processes each request
+independently and does not deduplicate repeated IDs.
+
+To send from a separate terminal while the app is running:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.client.TextMessageClient" "-Dexec.args=Hello server"
+```
+
+Or use the compiled client directly:
+
+```powershell
+java -cp target/classes dev.mars.client.TextMessageClient "Hello server"
+```
+
+With telnet or another TCP client, connect to port **9000** and send one UTF-8 line
+in this format, using a new message UUID for each message:
+
+```text
+message <messageId> <text>
+```
+
+The successful reply format is:
+
+```text
+reply <messageId> <serverId> <connectionId> Received: <text>
+```
+
+For example, send `message 11111111-1111-4111-8111-111111111111 Hello server`
+followed by Enter. The reply echoes that message ID. A rejected message with a
+valid ID returns `error <messageId> <serverId> <connectionId> <reason>`.
+Open a new connection for each message. The `message` keyword is case-insensitive;
+message text is preserved. Rebuild and restart the app before using the updated
+client, since the text protocol now requires a message ID.
+Administrative commands on port 9001 remain `status` and `shutdown`.
 
 ### Testing the Server
 
@@ -191,7 +248,9 @@ With redirection enabled, test output is in
 `target/surefire-reports/dev.mars.server.ServerLifecycleTest-output.txt`.
 
 Tests cover HTTP response construction, UTF-8 content lengths, wire formatting,
-output failures, concurrent socket clients, and administrative status/shutdown commands.
+output failures, concurrent socket clients, UTF-8 text-message round trips,
+message ID matching, malformed/mismatched replies, distinct server instances,
+empty-message validation, and administrative status/shutdown commands.
 Socket tests start their own servers on temporary ports and clean up afterward;
 you do not need to start the application first. Reports are in `target/surefire-reports/`.
 Maven prints a test summary and `BUILD SUCCESS` when the suite passes. If a test
@@ -304,16 +363,18 @@ The server provides comprehensive logging:
 - Server lifecycle events
 
 Connection and request logs include a readable timestamp, connection ID, client
-IP address and source port, server name, thread ID, and virtual-thread status:
+IP address and source port, server name and instance ID, message ID when available,
+thread ID, and virtual-thread status:
 
 ```text
-[2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | thread=42 | virtual=true
-[2026-10-13 14:30:00.124 +08:00] Request processed | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | thread=42 | virtual=true
+[2026-10-13 14:30:00.123 +08:00] Client connected | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=22222222-2222-4222-8222-222222222222 | messageId=- | thread=42 | virtual=true
+[2026-10-13 14:30:00.124 +08:00] Message received: Hello server | connectionId=1 | client=127.0.0.1:54321 | server=ThreadPooledServer | serverId=22222222-2222-4222-8222-222222222222 | messageId=11111111-1111-4111-8111-111111111111 | thread=42 | virtual=true
 ```
 
 The same connection ID appears in both entries and is unique within the running
-JVM. The source port distinguishes clients sharing an IP address. Timestamps use
-the JVM's local time zone.
+JVM. The source port distinguishes clients sharing an IP address. `messageId=-`
+means a text-message ID has not been read, or the connection carries HTTP traffic.
+Timestamps use the JVM's local time zone.
 
 ## 🔄 Lifecycle Management
 

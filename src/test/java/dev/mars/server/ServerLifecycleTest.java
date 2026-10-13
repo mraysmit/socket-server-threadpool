@@ -1,5 +1,7 @@
 package dev.mars.server;
 
+import dev.mars.client.TextMessageClient;
+import dev.mars.client.MessageReply;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -18,6 +20,8 @@ import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Locale;
+import java.util.UUID;
+import java.util.HashSet;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -149,6 +153,125 @@ class ServerLifecycleTest {
             }
             for (var request : requests) {
                 request.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Hello server", "你好 🌍", "status", "shutdown", "  keep these spaces  "})
+    void textMessagesReceiveUtf8Replies(String message) throws Exception {
+        var client = new TextMessageClient("127.0.0.1", serverPort);
+        UUID messageId = UUID.randomUUID();
+        var reply = client.send(messageId, message);
+        assertEquals(messageId, reply.messageId());
+        assertEquals(server.getServerId(), reply.serverId());
+        assertTrue(reply.connectionId() > 0);
+        assertEquals("Received: " + message, reply.text());
+        assertEquals("Server status: ALIVE", command("status"));
+        try (var httpClient = connect(serverPort)) {
+            assertHttpResponse(httpClient);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"message", "MESSAGE", "MeSsAgE"})
+    void textProtocolIsCaseInsensitive(String input) throws Exception {
+        UUID messageId = UUID.randomUUID();
+        try (var client = connect(serverPort)) {
+            String[] fields = command(client, input + " " + messageId + " Hello").split(" ", 5);
+            assertEquals(5, fields.length);
+            assertEquals("reply", fields[0]);
+            assertEquals(messageId.toString(), fields[1]);
+            assertEquals(server.getServerId().toString(), fields[2]);
+            assertTrue(Long.parseLong(fields[3]) > 0);
+            assertEquals("Received: Hello", fields[4]);
+            assertEquals(-1, client.getInputStream().read(), "Connection closes after the reply");
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "   "})
+    void emptyTextMessageReceivesAnError(String input) throws Exception {
+        UUID messageId = UUID.randomUUID();
+        try (var client = connect(serverPort)) {
+            String[] fields = command(client, "message " + messageId + " " + input).split(" ", 5);
+            assertEquals(5, fields.length);
+            assertEquals("error", fields[0]);
+            assertEquals(messageId.toString(), fields[1]);
+            assertEquals(server.getServerId().toString(), fields[2]);
+            assertEquals("Message must not be empty", fields[4]);
+        }
+        assertEquals("Server status: ALIVE", command("status"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"message", "message ", "message not-a-uuid Hello"})
+    void missingOrInvalidMessageIdReceivesAnError(String input) throws Exception {
+        try (var client = connect(serverPort)) {
+            assertTrue(command(client, input).startsWith("Error:"));
+        }
+        assertEquals("Server status: ALIVE", command("status"));
+    }
+
+    @Test
+    void identicalMessagesHaveDifferentIdsAndStableServerIdentity() throws Exception {
+        var client = new TextMessageClient("127.0.0.1", serverPort);
+        var first = client.send("Hello");
+        var second = client.send("Hello");
+        assertNotEquals(first.messageId(), second.messageId());
+        assertNotEquals(first.connectionId(), second.connectionId());
+        assertEquals(server.getServerId(), first.serverId());
+        assertEquals(first.serverId(), second.serverId());
+        assertEquals(first.text(), second.text());
+    }
+
+    @Test
+    void twoServersIdentifyWhichInstanceRepliedToTheMessage() throws Exception {
+        int otherPort;
+        try (var reservation = new ServerSocket(0)) {
+            otherPort = reservation.getLocalPort();
+        }
+        var other = new ThreadPooledServer(otherPort);
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            var task = executor.submit(other);
+            try {
+                try (var client = awaitConnection(otherPort, task)) {
+                    assertHttpResponse(client);
+                }
+                UUID messageId = UUID.randomUUID();
+                var first = new TextMessageClient("127.0.0.1", serverPort).send(messageId, "Hello");
+                var second = new TextMessageClient("127.0.0.1", otherPort).send(messageId, "Hello");
+                assertEquals(messageId, first.messageId());
+                assertEquals(messageId, second.messageId());
+                assertEquals(server.getServerId(), first.serverId());
+                assertEquals(other.getServerId(), second.serverId());
+                assertNotEquals(first.serverId(), second.serverId());
+                assertEquals("Received: Hello", first.text());
+                assertEquals("Received: Hello", second.text());
+            } finally {
+                other.stop();
+                task.get(5, TimeUnit.SECONDS);
+            }
+        }
+    }
+
+    @Test
+    void concurrentTextMessagesReceiveTheirOwnReplies() throws Exception {
+        try (var clients = Executors.newVirtualThreadPerTaskExecutor()) {
+            var replies = new ArrayList<Future<MessageReply>>();
+            for (int i = 0; i < 12; i++) {
+                String message = "Message " + i + " 你好";
+                replies.add(clients.submit(() -> {
+                    var reply = new TextMessageClient("127.0.0.1", serverPort).send(message);
+                    assertEquals("Received: " + message, reply.text());
+                    assertEquals(server.getServerId(), reply.serverId());
+                    return reply;
+                }));
+            }
+            var messageIds = new HashSet<UUID>();
+            for (var reply : replies) {
+                assertTrue(messageIds.add(reply.get(5, TimeUnit.SECONDS).messageId()),
+                        "Each sent message must have a unique ID");
             }
         }
     }
