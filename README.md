@@ -172,12 +172,22 @@ prompt, one at a time:
 
 ```text
 send {"instruction":"math.add","parameters":{"a":10,"b":20}}
+send {"instruction":"text.concat","parameters":{"a":"Hello ","b":"world"}}
+send {"instruction":"echo","parameters":{"text":"Hello server"}}
 status
 quit
 ```
 
-The plugin command returns `status=OK | result=30`, `status` checks the running
-server, and `quit` stops the server and exits the application.
+Each plugin reply includes `status=OK` and its result:
+
+| Command instruction | Expected result |
+|---|---|
+| `math.add` | `30` |
+| `text.concat` | `"Hello world"` |
+| `echo` | `"Received: Hello server"` |
+
+`status` checks the running server, and `quit` stops the server and exits the
+application. These three plugins are built in, so no external JAR is required.
 
 The server ID is the first startup argument, or can be passed with `--server-id`.
 To use a generated UUID default,
