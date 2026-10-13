@@ -497,7 +497,16 @@ correlation across two named servers, 100 concurrent commands, real external JAR
 compilation/discovery/execution, plugin exceptions, invalid providers, duplicate
 instructions, and release of JAR files at shutdown. The terminal includes
 `Plugin test PASSED`, `Concurrent plugin test PASSED`, and `External JAR test PASSED`
-with verified results. External plugin tests require a full JDK for Java compilation.
+with instruction names and verified results. Each built-in (`math.add`,
+`text.concat`, and `echo`) prints its inputs and result from both `Server-001` and
+`Server-002`. The concurrency test sends 100 `math.add` calls, so its request logs
+are more numerous. External plugin tests require a full JDK for Java compilation.
+
+To see just the three built-ins with their results from both servers:
+
+```powershell
+mvn test "-Dtest=PluginExecutionTest#commandsReturnResultsAndCorrelatedIdsFromEachServer" "-Dmaven.test.redirectTestOutputToFile=false"
+```
 
 To test startup options, simultaneous instances, occupied ports, cleanup, and
 the actual command-line applications:

@@ -43,7 +43,7 @@ class ExternalPluginTest {
             var result = client.execute("external.multiply", Map.of("a", 6, "b", 7));
             assertEquals(Map.of("product", BigInteger.valueOf(42), "plugin", "external"), result.result());
             assertEquals(BigInteger.valueOf(30), client.execute("math.add", Map.of("a", 10, "b", 20)).result());
-            System.out.println("External JAR test PASSED: " + result);
+            System.out.println("External JAR test PASSED | instruction=external.multiply | " + result);
         }
         Files.delete(jar); // Windows prevents deletion if the loader still owns an open JAR handle.
         assertFalse(Files.exists(jar));

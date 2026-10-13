@@ -8,6 +8,8 @@ import dev.mars.server.ServerOptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.BufferedReader;
@@ -19,29 +21,38 @@ import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Executors;
+import java.util.stream.Stream;
 
 import static dev.mars.protocol.CommandError.Code.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(30)
 class PluginExecutionTest {
-    @Test
-    void commandsReturnResultsAndCorrelatedIdsFromEachServer() throws Exception {
+    @ParameterizedTest(name = "{0} returns correlated results from two servers")
+    @MethodSource("builtinCommands")
+    void commandsReturnResultsAndCorrelatedIdsFromEachServer(String instruction,
+            Map<String, Object> parameters, Object expectedResult) throws Exception {
         try (var first = ServerInstance.start(new ServerOptions("Server-001", 0, 0));
              var second = ServerInstance.start(new ServerOptions("Server-002", 0, 0))) {
             UUID id = UUID.randomUUID();
             for (var server : new ServerInstance[]{first, second}) {
                 var client = new TextMessageClient("localhost", server.getPort(), server.getServerId());
-                var reply = client.execute(id, "math.add", Map.of("a", 10, "b", 20));
-                assertEquals(new BigInteger("30"), reply.result());
+                var reply = client.execute(id, instruction, parameters);
+                assertEquals(expectedResult, reply.result());
                 assertEquals(id, reply.messageId());
                 assertEquals(server.getServerId(), reply.serverId());
                 assertTrue(reply.connectionId() > 0);
-                assertEquals("你好\nworld 🌍", client.execute("text.concat",
-                        Map.of("a", "你好\n", "b", "world 🌍")).result());
-                System.out.println("Plugin test PASSED: " + reply);
+                System.out.println("Plugin test PASSED | instruction=" + instruction
+                        + " | parameters=" + Json.write(parameters) + " | " + reply);
             }
         }
+    }
+
+    static Stream<Arguments> builtinCommands() {
+        return Stream.of(
+                Arguments.of("math.add", Map.of("a", 10, "b", 20), BigInteger.valueOf(30)),
+                Arguments.of("text.concat", Map.of("a", "你好\n", "b", "world 🌍"), "你好\nworld 🌍"),
+                Arguments.of("echo", Map.of("text", "Hello plugin"), "Received: Hello plugin"));
     }
 
     @Test
@@ -65,7 +76,7 @@ class PluginExecutionTest {
             var connections = new java.util.HashSet<Long>();
             for (var task : tasks) { assertTrue(connections.add(task.get())); }
             assertEquals("Received: still healthy", client.send("still healthy").text());
-            System.out.println("Concurrent plugin test PASSED: 100 correlated results verified");
+            System.out.println("Concurrent plugin test PASSED | instruction=math.add | 100 correlated results verified");
         }
     }
 
