@@ -15,14 +15,30 @@ A Java-based socket server that handles each client connection on its own virtua
 ## 📋 Project Structure
 
 ```
-src/main/java/dev/mars/
-├── StartStop.java           # Main application entry point
-├── ThreadPooledServer.java  # Core server implementation
-├── WorkerRunnable.java      # Client request handler
-├── ShutdownMonitor.java     # Administrative monitoring service
-├── HttpResponse.java        # HTTP response data model
-├── HttpResponseBuilder.java # HTTP response builder (Builder pattern)
-└── HttpResponseWriter.java  # HTTP response writer service
+src/
+├── main/java/dev/mars/
+│   ├── StartStop.java
+│   ├── client/
+│   │   ├── TextMessageClient.java
+│   │   └── MessageReply.java
+│   ├── server/
+│   │   ├── ThreadPooledServer.java
+│   │   └── ShutdownMonitor.java
+│   ├── worker/
+│   │   └── WorkerRunnable.java
+│   └── http/
+│       ├── HttpResponse.java
+│       ├── HttpResponseBuilder.java
+│       └── HttpResponseWriter.java
+└── test/java/dev/mars/
+    ├── client/TextMessageClientTest.java
+    ├── server/
+    │   ├── ServerLifecycleTest.java
+    │   └── ThreadPooledServerTest.java
+    └── http/
+        ├── HttpResponseTest.java
+        ├── HttpResponseBuilderTest.java
+        └── HttpResponseWriterTest.java
 ```
 
 ## 🏗️ Architecture Overview
@@ -35,32 +51,42 @@ src/main/java/dev/mars/
    - Delegates client handling to worker threads
 
 2. **WorkerRunnable**: Handles individual client requests
-   - Processes each client connection in a separate thread
+   - Processes each client connection in a separate virtual thread
+   - Reads either a text-message command or HTTP request headers
+   - Echoes text with message, server, and connection IDs
    - Uses HTTP response classes for clean separation of concerns
    - Logs request processing details
 
-5. **HttpResponse**: Data model for HTTP responses
+3. **HttpResponse**: Data model for HTTP responses
    - Encapsulates status line, headers, and body
    - Provides content length calculation
 
-6. **HttpResponseBuilder**: Builder pattern for creating HTTP responses
+4. **HttpResponseBuilder**: Builder pattern for creating HTTP responses
    - Fluent API for constructing responses
    - Provides common response factory methods
    - Automatically handles content-length calculation
 
-7. **HttpResponseWriter**: Service for writing HTTP responses
+5. **HttpResponseWriter**: Service for writing HTTP responses
    - Handles the serialization of HTTP responses to output streams
    - Provides convenience methods for common response types
 
-3. **ShutdownMonitor**: Administrative service running on port 9001
+6. **ShutdownMonitor**: Administrative service running on port 9001
    - Provides server status checking
    - Enables graceful server shutdown
    - Accepts administrative commands
 
-4. **StartStop**: Main application launcher
+7. **StartStop**: Main application launcher
+   - Accepts an optional server ID as its first startup argument
    - Initializes and starts both servers
    - Provides console-based command interface
    - Manages application lifecycle
+
+8. **TextMessageClient**: Sends a message and validates its reply
+   - Generates a message UUID or accepts one supplied by the caller
+   - Checks reply IDs and echoed text
+   - Provides a command-line client for `localhost:9000`
+
+9. **MessageReply**: Reply record containing the message ID, server ID, connection ID, and text
 
 ## 🛠️ Technical Specifications
 
@@ -69,14 +95,16 @@ src/main/java/dev/mars/
 - **Main Server Port**: 9000
 - **Admin Port**: 9001
 - **Request Executor**: One virtual thread per connection
-- **Response Format**: HTTP/1.1 with proper headers
+- **Text Protocol**: One UTF-8 message and reply per connection
+- **HTTP Response Format**: HTTP/1.1 status, headers, and UTF-8 body
+- **Test Framework**: JUnit Jupiter 6.0.2 with Maven Surefire 3.5.4
 
 ## 🚦 Getting Started
 
 ### Prerequisites
 
 - Java 27 or higher
-- Maven 3.6+
+- Maven (verified with 3.9.16)
 
 Run the commands below from the project root, where `pom.xml` is located.
 Check that both Java and Maven use JDK 27 or higher:
@@ -111,7 +139,7 @@ omit that argument:
 mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop"
 ```
 
-The ID may contain letters, digits, dots, underscores, and hyphens. Leading and
+The ID may contain ASCII letters, digits, dots, underscores, and hyphens. Leading and
 trailing whitespace is removed. An omitted, empty, or whitespace-only ID defaults
 to a generated UUID. The chosen ID appears in the startup log, request logs, and
 text-message replies. Choose a distinct ID for each running server.
@@ -156,6 +184,9 @@ The application provides an interactive console with the following commands:
 - `shutdown` - Stop the main server and shutdown monitor
 - `quit` - Exit the console command loop
 
+Command keywords are case-insensitive. The admin socket on port 9001 accepts
+`status` and `shutdown`; `send` and `quit` belong to the application console.
+
 To stop the application cleanly, enter `shutdown`, wait for the server to stop,
 then enter `quit`. Using `quit` alone does not request shutdown of either listener.
 
@@ -177,9 +208,10 @@ Each server keeps its selected ID for its lifetime. A provided ID can be reused
 after restart; an automatically generated UUID changes on each startup.
 
 The server logs the message ID, server ID, connection ID, and client address.
-Messages support UTF-8, including non-English text. Each message is one nonempty
+Messages support UTF-8, including non-English text. Each message is one nonblank
 line. Message IDs correlate requests and replies; the server processes each request
 independently and does not deduplicate repeated IDs.
+The Java client has a 5-second connection timeout and a 10-second reply-read timeout.
 
 To send from a separate terminal while the app is running:
 
@@ -210,8 +242,8 @@ For example, send `message 11111111-1111-4111-8111-111111111111 Hello server`
 followed by Enter. The reply echoes that message ID. A rejected message with a
 valid ID returns `error <messageId> <serverId> <connectionId> <reason>`.
 Open a new connection for each message. The `message` keyword is case-insensitive;
-message text is preserved. Rebuild and restart the app before using the updated
-client, since the text protocol now requires a message ID.
+message text is preserved. A missing or invalid message UUID receives an `Error: ...`
+line. Use the client and server built from the same version of this project.
 Administrative commands on port 9001 remain `status` and `shutdown`.
 
 ### Testing the Server
@@ -234,6 +266,8 @@ To run a single test class:
 
 ```powershell
 mvn test "-Dtest=HttpResponseWriterTest"
+mvn test "-Dtest=TextMessageClientTest"
+mvn test "-Dtest=ThreadPooledServerTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
 
@@ -246,6 +280,12 @@ mvn test "-Dtest=ServerLifecycleTest#configuredServerIdAppearsInMessageReply" "-
 The terminal displays startup and message logs with `serverId=Server-001`, followed
 by `Named server test PASSED` and the verified reply. The two-server test uses
 `Server-001` and `Server-002` and checks that each reply identifies the correct server.
+
+To run only the two-server test with terminal output:
+
+```powershell
+mvn test "-Dtest=ServerLifecycleTest#twoServersIdentifyWhichInstanceRepliedToTheMessage" "-Dmaven.test.redirectTestOutputToFile=false"
+```
 
 #### 1,000-Request Load Test
 
@@ -283,6 +323,7 @@ Socket tests start their own servers on temporary ports and clean up afterward;
 you do not need to start the application first. Reports are in `target/surefire-reports/`.
 Maven prints a test summary and `BUILD SUCCESS` when the suite passes. If a test
 fails, check the summary and the corresponding `.txt` or `.xml` report in that directory.
+`mvn clean verify` also creates `target/socket-client-server-1.0-SNAPSHOT.jar`.
 
 #### Test Client Connections
 
@@ -323,7 +364,8 @@ echo "shutdown" | nc localhost 9001
 
 ## 📊 Server Response
 
-The server returns HTTP-compliant responses in the following format:
+HTTP GET requests return a demonstration response in the following format.
+The connection closes after the response:
 
 ```
 HTTP/1.1 200 OK
@@ -333,6 +375,9 @@ Content-Length: [length]
 WorkerRunnable: ThreadPooledServer - [timestamp]
 ```
 
+Here `[timestamp]` is Unix epoch milliseconds. Console log timestamps are formatted
+as a readable date and time. `Content-Length` counts the UTF-8 body bytes.
+
 ## 🔧 Configuration
 
 ### Customizing Server Settings
@@ -340,34 +385,46 @@ WorkerRunnable: ThreadPooledServer - [timestamp]
 You can modify the server configuration by editing the `StartStop.java` file:
 
 ```java
-// Change the listening ports
-var threadPooledServer = new ThreadPooledServer(9000);  // main port
+// Preserve the startup server ID when changing the listening ports
+var threadPooledServer = new ThreadPooledServer(9000, args.length == 0 ? null : args[0]);
 var shutdownMonitor = new ShutdownMonitor(9001, threadPooledServer);  // admin port
 ```
+
+The startup argument sets only the server ID; listening ports are configured in
+code. To run multiple app instances on the same host, assign each instance a
+distinct pair of listening ports and update the client destinations to match:
+
+- The console's `TextMessageClient` and the standalone client's `main` method
+  currently target `localhost:9000`.
+- `StartStop.checkServerStatus` currently targets `localhost:9001`.
+- Java callers can use `new TextMessageClient(host, port)` to select a message server.
 
 ### Virtual Thread Execution
 
 The request executor uses `Executors.newVirtualThreadPerTaskExecutor()`; there is
 no fixed worker pool size. The listener and shutdown monitor keep their platform
 threads. During shutdown, the listener stops accepting clients and waits for
-accepted request tasks to finish. Workers wait up to 10 seconds for request data.
+accepted request tasks to finish. Workers use a 10-second socket read timeout.
 
 ## 🏗️ SOLID Design Principles
 
 This project demonstrates SOLID design principles in action:
 
 ### Single Responsibility Principle (SRP)
+
 - **HttpResponse**: Only handles HTTP response data
 - **HttpResponseBuilder**: Only responsible for building HTTP responses
 - **HttpResponseWriter**: Only handles writing responses to output streams
 - **WorkerRunnable**: Focuses on client request processing, delegates response creation
 
 ### Open/Closed Principle (OCP)
+
 - Easy to extend with new response types without modifying existing classes
 - HttpResponseBuilder provides factory methods for common responses
 - New response writers can be added without changing existing code
 
 ### Dependency Inversion Principle (DIP)
+
 - WorkerRunnable can accept HttpResponseWriter via constructor injection
 - Classes depend on abstractions rather than concrete implementations
 
@@ -407,28 +464,30 @@ Timestamps use the JVM's local time zone.
 ## 🔄 Lifecycle Management
 
 ### Server Startup
-1. Initialize the virtual thread executor
-2. Bind to server socket
-3. Start accepting connections
-4. Launch shutdown monitor
+
+1. Resolve the supplied server ID or generate a UUID default
+2. Initialize the virtual thread executor
+3. Start the main listener and shutdown monitor on separate platform threads
+4. Display the console command prompt
 
 ### Request Processing
+
 1. Accept client connection
 2. Start a virtual thread for the connection
-3. Process in worker thread
-4. Return HTTP response
+3. Read a text-message command or HTTP request headers
+4. Return a message reply with IDs or an HTTP response
 5. Close client socket
 
 ### Server Shutdown
-1. Stop accepting new connections
-2. Complete existing requests
-3. Close the request executor after accepted tasks finish
-4. Close server socket
-5. Clean up resources
+
+1. Acknowledge `shutdown` and close the administrative listener
+2. Mark the main server stopped and close its listening socket
+3. Close the request executor, waiting for accepted tasks to finish
+4. Enter `quit` to leave the console command loop and allow the application to exit
 
 ## 🤝 Contributing
 
-This project serves as an educational example of socket programming and thread pool management in Java. Feel free to extend it with additional features such as:
+This project serves as an educational example of socket programming and virtual threads in Java. Feel free to extend it with additional features such as:
 
 - SSL/TLS support
 - Request routing
