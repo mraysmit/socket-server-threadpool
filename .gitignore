@@ -1,13 +1,46 @@
+### Java and Maven build output ###
 target/
-!.mvn/wrapper/maven-wrapper.jar
 !**/src/main/**/target/
 !**/src/test/**/target/
+out/
+*.class
+*.jar
+*.war
+*.ear
+*.jmod
+!.mvn/wrapper/maven-wrapper.jar
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+
+### Logs and JVM diagnostics ###
+logs/
+*.log
+hs_err_pid*
+replay_pid*
+*.hprof
+*.jfr
+
+### Editor history and temporary files ###
+.history/
+.localhistory/
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
 
 ### IntelliJ IDEA ###
-.idea/modules.xml
-.idea/jarRepositories.xml
-.idea/compiler.xml
-.idea/libraries/
+.idea/*
+!.idea/.gitignore
+!.idea/encodings.xml
+!.idea/misc.xml
+!.idea/vcs.xml
+!.idea/codeStyles/
+!.idea/inspectionProfiles/
 *.iws
 *.iml
 *.ipr
@@ -17,7 +50,7 @@ target/
 .classpath
 .factorypath
 .project
-.settings
+.settings/
 .springBeans
 .sts4-cache
 
@@ -34,5 +67,13 @@ build/
 ### VS Code ###
 .vscode/
 
-### Mac OS ###
+### Local environment configuration ###
+.env
+.env.*
+!.env.example
+!.env.sample
+
+### Operating system files ###
 .DS_Store
+Thumbs.db
+Desktop.ini

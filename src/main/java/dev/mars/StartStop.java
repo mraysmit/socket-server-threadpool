@@ -21,7 +21,7 @@ public class StartStop {
         }
         var options = ServerOptions.parse(args);
         try (var instance = ServerInstance.start(options);
-             var console = new BufferedReader(new InputStreamReader(System.in))) {
+            var console = new BufferedReader(new InputStreamReader(System.in))) {
             var client = new TextMessageClient("localhost", instance.getPort(), instance.getServerId());
             System.out.println("To stop this server, connect to admin port " + instance.getAdminPort());
             System.out.println("> Enter commands (send <text>, status, shutdown, or quit to exit):");
