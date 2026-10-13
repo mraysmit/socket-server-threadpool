@@ -1,5 +1,12 @@
 # Socket Server with Virtual Threads
 
+| Document metadata | Details |
+| --- | --- |
+| Author | Mark Andrew Ray-Smith, Cityline Ltd |
+| Status | Maintained project and usage guide |
+| Last updated | 2026-10-13 |
+| Applies to | Socket Client Server 1.0-SNAPSHOT |
+
 A Java-based socket server that handles each client connection on its own virtual thread, with graceful shutdown and administrative monitoring.
 
 ## 🚀 Features
@@ -573,7 +580,7 @@ validate their own parameters and throw `InvalidParametersException` for caller
 errors; other exceptions become `PLUGIN_ERROR`. Plugins are trusted code inside
 the server process. There is no sandbox, hot reload, or per-command execution
 deadline. The class loader closes after accepted work completes when the instance
-is closed. See [EXEC_PLUGIN.md](EXEC_PLUGIN.md) for the one-page design.
+is closed. See [EXEC_PLUGIN.md](docs/EXEC_PLUGIN.md) for the one-page design.
 
 #### Optional Plugin Startup
 
@@ -1038,4 +1045,7 @@ This project serves as an educational example of socket programming and virtual 
 
 ## 📄 License
 
-This project is provided as-is for educational purposes.
+Copyright 2026 Mark Andrew Ray-Smith
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details
+and [NOTICE](NOTICE) for attribution.

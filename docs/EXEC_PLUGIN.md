@@ -1,6 +1,13 @@
 # Execution Plugin Model
 
-**Status: Implemented.** See [README.md](README.md) for startup and test commands.
+| Document metadata | Details |
+| --- | --- |
+| Author | Mark Andrew Ray-Smith, Cityline Ltd |
+| Status | Implemented plugin architecture and design |
+| Last updated | 2026-10-13 |
+| Applies to | Socket Client Server 1.0-SNAPSHOT |
+
+See [README.md](../README.md) for startup and test commands.
 
 Make the server domain-independent by moving instruction handling into Java plugins.
 The server owns sockets, message correlation, dispatch, and reply serialization;

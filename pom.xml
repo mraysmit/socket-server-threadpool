@@ -8,6 +8,27 @@
     <artifactId>socket-client-server</artifactId>
     <version>1.0-SNAPSHOT</version>
 
+    <licenses>
+        <license>
+            <name>Apache License, Version 2.0</name>
+            <url>https://www.apache.org/licenses/LICENSE-2.0.txt</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
+    <developers>
+        <developer>
+            <id>mraysmit</id>
+            <name>Mark Andrew Ray-Smith</name>
+            <organization>Cityline Ltd</organization>
+            <organizationUrl>https://cityline.com</organizationUrl>
+            <roles>
+                <role>architect</role>
+                <role>developer</role>
+            </roles>
+        </developer>
+    </developers>
+
     <properties>
         <maven.compiler.source>27</maven.compiler.source>
         <maven.compiler.target>27</maven.compiler.target>
@@ -29,6 +50,19 @@
     </dependencies>
 
     <build>
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+            </resource>
+            <resource>
+                <directory>${project.basedir}</directory>
+                <targetPath>META-INF</targetPath>
+                <includes>
+                    <include>LICENSE</include>
+                    <include>NOTICE</include>
+                </includes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
