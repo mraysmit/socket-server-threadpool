@@ -441,6 +441,80 @@ provide correlation only, so retries may execute the instruction again.
 
 ### Adding an External Plugin
 
+#### Build and Run the Standalone Example
+
+A complete plugin project is included at [`examples/multiply-plugin`](examples/multiply-plugin).
+From the repository root, build and install the server API locally, then package
+and test the example:
+
+```powershell
+mvn clean install
+mvn -f examples/multiply-plugin/pom.xml clean verify
+```
+
+The reusable JAR is:
+
+```text
+examples/multiply-plugin/target/multiply-plugin-1.0-SNAPSHOT.jar
+```
+
+It stays on disk after the tests finish. Start a server that loads it directly
+from the example's output directory:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir examples/multiply-plugin/target"
+```
+
+The ready log includes `math.multiply`. At the server console, enter:
+
+```text
+send {"instruction":"math.multiply","parameters":{"a":6,"b":7}}
+```
+
+The reply includes `status=OK | result=42`. Enter `quit` to stop the server.
+You can also copy this JAR to your own plugin directory and select that directory
+with `--plugins-dir`. No additional dependency JARs are needed for this example;
+the server API dependency has Maven scope `provided` and is supplied by the host.
+The example JAR contains its provider class and service registration, without
+bundling the server classes.
+
+The example's `mvn verify` runs a packaged-JAR integration test in a separate
+server JVM, verifies parameter errors and the result `42`, and prints
+`Standalone plugin JAR test PASSED`. Its reports are under
+`examples/multiply-plugin/target/failsafe-reports/`. Root `mvn test` runs the server
+tests; use the separate example command above to test this standalone artifact.
+Reinstall the server after API changes and rebuild the example after changes to
+its source. The example's `clean` removes its previous JAR before rebuilding it.
+
+#### Why There Are Two META-INF Locations
+
+Each Maven project owns its own service registration file and packages it into
+its own JAR:
+
+| Source file | Packaged in | Registered providers |
+|---|---|---|
+| `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `MathAddPlugin`, `TextConcatPlugin`, and `EchoPlugin` (`math.add`, `text.concat`, and `echo`) |
+| `examples/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
+
+Inside each JAR, the registration has the same path:
+`META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
+resources in separate JARs. `ServiceLoader` discovers both and combines their
+provider lists at startup.
+
+With `--plugins-dir examples/multiply-plugin/target`, the server scans that
+directory for JARs and creates a class loader for them. `ServiceLoader` discovers
+the built-ins through the parent application class loader and the external
+provider through the plugin loader. The registry creates an instruction-to-plugin
+map using each provider's `instruction()` value, including `math.multiply`.
+Requests execute the selected plugin on the connection's virtual thread.
+
+Every external plugin JAR supplies its own service registration; adding one does
+not require editing the server's registration file. Duplicate instruction names
+fail startup. Discovery runs once per startup, so restart the server after adding
+or replacing a plugin JAR.
+
+#### Create Your Own Plugin
+
 Implement the public SPI in a separate Java 27 project using this project's built
 JAR as a compile-time dependency. For example:
 
@@ -561,6 +635,49 @@ The actual entries also include inputs, message ID, connection ID, and status.
 The tests start their own servers on automatically allocated ports and close them
 afterward; you do not need to start the app first. Registry unit tests call plugins
 directly, so they do not produce socket request logs.
+
+#### External Plugin JAR Test
+
+Run only the external plugin tests:
+
+```powershell
+mvn test "-Dtest=ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+To run just the successful external-JAR execution and shutdown-cleanup test:
+
+```powershell
+mvn test "-Dtest=ExternalPluginTest#externalJarExecutesOnVirtualThreadAndIsReleasedAtShutdown" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+This test compiles a separate `example.ExamplePlugin` class, packages it into a
+real JAR with a `META-INF/services/dev.mars.plugin.CommandPlugin` provider entry,
+and starts `Server-001` with that temporary plugin directory. It sends the
+equivalent of:
+
+```text
+send {"instruction":"external.multiply","parameters":{"a":6,"b":7}}
+```
+
+The plugin verifies that it runs on a virtual thread with its own context class
+loader. The client checks the returned object, and the terminal prints an entry
+like this (field order may vary):
+
+```text
+External JAR test PASSED | instruction=external.multiply | messageId=<uuid> | serverId=Server-001 | connectionId=<id> | status=OK | result={"product":42,"plugin":"external"}
+```
+
+After shutdown, the test deletes the JAR to check that the loader released it.
+The full `ExternalPluginTest` class also covers plugin exceptions, null results,
+duplicate instructions, invalid names, missing providers, corrupt JARs, and
+missing or empty plugin directories.
+
+The test creates and removes its own plugin files and server; `external.multiply`
+is available only in that test instance. For an external plugin you can run
+manually, follow [Adding an External Plugin](#adding-an-external-plugin) to package
+and load the standalone `math.multiply` example. Its JAR is retained under
+`examples/multiply-plugin/target/`; the test-generated `external.multiply` JAR
+described above is still temporary.
 
 #### Startup and Lifecycle Tests
 
