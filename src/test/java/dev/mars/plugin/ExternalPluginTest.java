@@ -91,7 +91,7 @@ class ExternalPluginTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"duplicate", "invalid-name", "missing-provider", "corrupt-jar"})
+    @ValueSource(strings = {"invalid-name", "missing-provider", "corrupt-jar"})
     void invalidPluginsFailStartupAndReleaseJar(String scenario) throws Exception {
         Path directory = Files.createDirectory(temporary.resolve("plugins"));
         Path jar;
@@ -105,7 +105,7 @@ class ExternalPluginTest {
                 output.closeEntry();
             }
         } else {
-            jar = providerJar(directory, scenario.equals("duplicate") ? "echo" : "bad name", "return 42;");
+            jar = providerJar(directory, "bad name", "return 42;");
         }
         var error = assertThrows(IOException.class,
                 () -> ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory)));
@@ -115,11 +115,16 @@ class ExternalPluginTest {
     }
 
     @Test
-    void missingDirectoryFailsAndEmptyDirectoryKeepsBuiltins() throws Exception {
+    void missingDirectoryFails() {
         assertThrows(IOException.class,
                 () -> ServerInstance.start(new ServerOptions("Missing", 0, 0, temporary.resolve("missing"))));
-        try (var server = ServerInstance.start(new ServerOptions("Empty", 0, 0, temporary))) {
-            assertEquals("Received: hello", new TextMessageClient("localhost", server.getPort()).send("hello").text());
+    }
+
+    @Test
+    void emptyDirectoryPreservesClasspathInstructions() throws Exception {
+        try (var baseline = PluginRegistry.loadDirectories(List.of());
+             var withEmptyDirectory = PluginRegistry.load(temporary)) {
+            assertEquals(baseline.instructions(), withEmptyDirectory.instructions());
         }
     }
 

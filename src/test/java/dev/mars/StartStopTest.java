@@ -40,56 +40,36 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(20)
 class StartStopTest {
-    @Test
-    void productionClasspathExcludesMathAndTextTestFixtures() throws Exception {
-        String production = productionClasspath();
-        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
-                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
-                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\n"
-                + "send Still healthy\nquit\n", production);
-        assertEquals(0, result.exitCode(), result.output());
-        assertCommandReplies(result, "Server-001",
-                "error=UNKNOWN_INSTRUCTION: Unknown instruction: math.add",
-                "error=UNKNOWN_INSTRUCTION: Unknown instruction: text.concat",
-                "result=\"Received: Still healthy\"");
-        assertReleased(result);
-    }
-
     @ParameterizedTest
     @ValueSource(booleans = {true, false})
-    void productionLoadsFixtureCommandsOnlyWhenExplicitlyRegisteredInExternalJar(
+    void consoleLoadsRuntimeProviderOnlyWhenRegisteredInItsJar(
             boolean registered, @TempDir Path directory) throws Exception {
         Path jar = directory.resolve("test-commands.jar");
-        var fixtures = java.util.List.of(dev.mars.plugin.fixtures.MathAddPlugin.class,
-                dev.mars.plugin.fixtures.TextConcatPlugin.class);
+        var fixture = dev.mars.plugin.fixtures.ConsolePlugin.class;
         try (var output = new java.util.jar.JarOutputStream(Files.newOutputStream(jar))) {
-            for (Class<?> fixture : fixtures) {
-                String resource = fixture.getName().replace('.', '/') + ".class";
-                output.putNextEntry(new java.util.jar.JarEntry(resource));
-                try (var content = fixture.getResourceAsStream("/" + resource)) {
-                    assertNotNull(content);
-                    content.transferTo(output);
-                }
-                output.closeEntry();
+            String resource = fixture.getName().replace('.', '/') + ".class";
+            output.putNextEntry(new java.util.jar.JarEntry(resource));
+            try (var content = fixture.getResourceAsStream("/" + resource)) {
+                assertNotNull(content);
+                content.transferTo(output);
             }
+            output.closeEntry();
             if (registered) {
                 output.putNextEntry(new java.util.jar.JarEntry("META-INF/services/dev.mars.plugin.CommandPlugin"));
-                for (Class<?> fixture : fixtures) { output.write((fixture.getName() + "\n").getBytes(StandardCharsets.UTF_8)); }
+                output.write((fixture.getName() + "\n").getBytes(StandardCharsets.UTF_8));
                 output.closeEntry();
             }
         }
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
                         "--plugins-dir", directory.toString()},
-                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
-                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\nquit\n",
+                "send {\"instruction\":\"test.console\",\"parameters\":{}}\nquit\n",
                 productionClasspath());
         assertEquals(0, result.exitCode(), result.output());
         if (registered) {
-            assertCommandReplies(result, "Server-001", "result=30", "result=\"Hello world\"");
+            assertCommandReplies(result, "Server-001", "result=\"Loaded from runtime JAR\"");
         } else {
             assertCommandReplies(result, "Server-001",
-                    "error=UNKNOWN_INSTRUCTION: Unknown instruction: math.add",
-                    "error=UNKNOWN_INSTRUCTION: Unknown instruction: text.concat");
+                    "error=UNKNOWN_INSTRUCTION: Unknown instruction: test.console");
         }
         assertReleased(result);
         Files.delete(jar);

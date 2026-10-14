@@ -5,7 +5,6 @@
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Proposed plugin architecture and implementation plan |
 | Last updated | 2026-10-13 |
-| Applies to | Socket Client Server 1.0-SNAPSHOT |
 
 ## Purpose and scope
 

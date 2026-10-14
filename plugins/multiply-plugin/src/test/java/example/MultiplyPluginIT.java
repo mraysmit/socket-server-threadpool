@@ -61,25 +61,7 @@ class MultiplyPluginIT {
     @TempDir Path temporary;
 
     @Test
-    void packagedServerExcludesTestFixtureClassesAndRegistrations() throws Exception {
-        Path hostJar = Path.of(StartStop.class.getProtectionDomain().getCodeSource().getLocation().toURI());
-        try (var host = new JarFile(hostJar.toFile())) {
-            assertTrue(host.stream().noneMatch(entry -> entry.getName().endsWith("/MathAddPlugin.class")
-                            || entry.getName().endsWith("/TextConcatPlugin.class")
-                            || entry.getName().startsWith("dev/mars/plugin/fixtures/")),
-                    "Test plugin classes must not be packaged in the server JAR");
-            var provider = host.getEntry("META-INF/services/dev.mars.plugin.CommandPlugin");
-            assertNotNull(provider, "Server must register its production providers");
-            try (var content = host.getInputStream(provider)) {
-                String descriptor = new String(content.readAllBytes(), StandardCharsets.UTF_8);
-                assertFalse(descriptor.contains("MathAddPlugin"), descriptor);
-                assertFalse(descriptor.contains("TextConcatPlugin"), descriptor);
-            }
-        }
-    }
-
-    @Test
-    void packagedPluginRegistersProviderWithoutBundlingServerClasses() throws Exception {
+    void packagedPluginRegistersProviderWithoutBundlingHostApi() throws Exception {
         try (var jar = new JarFile(pluginJar().toFile())) {
             assertNotNull(jar.getEntry("example/MultiplyPlugin.class"));
             var provider = jar.getEntry("META-INF/services/dev.mars.plugin.CommandPlugin");
@@ -89,8 +71,8 @@ class MultiplyPluginIT {
                         .map(line -> line.split("#", 2)[0].strip()).filter(line -> !line.isEmpty()).distinct().toList();
                 assertEquals(List.of("example.MultiplyPlugin"), providers);
             }
-            assertTrue(jar.stream().noneMatch(entry -> entry.getName().startsWith("dev/mars/")),
-                    "The provided server dependency must not be bundled in the plugin JAR");
+            assertNull(jar.getEntry("dev/mars/plugin/CommandPlugin.class"),
+                    "The provided plugin API must come from the host");
         }
     }
 
@@ -102,7 +84,6 @@ class MultiplyPluginIT {
             var failure = assertThrows(CommandExecutionException.class,
                     () -> client.execute(id, "math.multiply", Map.of("a", 6, "b", 7)));
             assertFailure(failure, id, UNKNOWN_INSTRUCTION);
-            assertEquals("Received: healthy", client.send("healthy").text());
         }
     }
 

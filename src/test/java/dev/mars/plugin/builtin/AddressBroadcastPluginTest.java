@@ -16,6 +16,7 @@
 package dev.mars.plugin.builtin;
 
 import dev.mars.plugin.PluginContext;
+import dev.mars.plugin.CommandPlugin;
 import dev.mars.protocol.Json;
 import dev.mars.server.ServerInstance;
 import dev.mars.server.ServerOptions;
@@ -28,11 +29,18 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.ServiceLoader;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(15)
 class AddressBroadcastPluginTest {
+    @Test
+    void broadcastProviderIsRegisteredThroughCommandPluginInterface() {
+        assertTrue(ServiceLoader.load(CommandPlugin.class).stream()
+                .anyMatch(provider -> provider.type() == AddressBroadcastPlugin.class));
+    }
+
     @Test
     void sendsUdpWithActualBoundPortsAndServerIdentity() throws Exception {
         var loopback = InetAddress.getByName("127.0.0.1");

@@ -15,25 +15,17 @@
  */
 package dev.mars.plugin;
 
-import dev.mars.plugin.builtin.AddressBroadcastPlugin;
 import dev.mars.protocol.CommandRequest;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.ServiceLoader;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class StartupPluginTest {
-    @Test
-    void discoversStartupOnlyBuiltin() {
-        assertTrue(ServiceLoader.load(CommandPlugin.class).stream()
-                .anyMatch(provider -> provider.type() == AddressBroadcastPlugin.class));
-    }
-
     @Test
     void callsOptedInCommandInstanceOnceWithResolvedContextAndCorrectLoader() throws Exception {
         var plugin = new BothCapabilities();
@@ -100,11 +92,16 @@ class StartupPluginTest {
 
     @Test
     void commandPluginsInheritOptionalNoOpStartupAndRemainUsable() throws Exception {
-        try (var registry = PluginRegistry.of(List.of(new dev.mars.plugin.fixtures.MathAddPlugin()))) {
+        var plugin = new CommandPlugin() {
+            @Override public String instruction() { return "test.no-startup"; }
+            @Override public Object execute(Map<String, Object> parameters) { return "ready"; }
+        };
+        try (var registry = PluginRegistry.of(List.of(plugin))) {
             registry.start(new PluginContext("Server-001", 9010, 9011));
-            var reply = registry.dispatch(new CommandRequest(1, UUID.randomUUID(), "math.add", Map.of("a", 10, "b", 20)),
+            var reply = registry.dispatch(new CommandRequest(1, UUID.randomUUID(), "test.no-startup", Map.of()),
                     "Server-001", 1);
-            assertEquals("30", reply.result().toString());
+            assertEquals("OK", reply.status());
+            assertEquals("ready", reply.result());
         }
     }
 

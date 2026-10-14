@@ -487,7 +487,7 @@ the server API dependency has Maven scope `provided` and is supplied by the host
 The example JAR contains its provider class and service registration, without
 bundling the server classes.
 
-The example's `mvn verify` checks the packaged plugin and server JARs, then uses
+The example's `mvn verify` checks the packaged plugin JAR, then uses
 separate server JVMs whose classpaths exclude the example classes. It verifies
 that `math.multiply` is unavailable without a runtime plugin folder and loads
 from either of two supplied folders, including paths with spaces. Real TCP
@@ -772,13 +772,13 @@ mvn test "-Dtest=ServerLifecycleTest"
 Run only the plugin tests with command-line output:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 To include the JSON client's reply-validation tests as well:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 These verify built-in and fixture results, parameter validation, request/reply validation,
@@ -791,9 +791,11 @@ with instruction names and verified results. The test fixtures (`math.add`,
 `Server-002`. The concurrency test sends 100 `math.add` calls, so its request logs
 are more numerous. External plugin tests require a full JDK for Java compilation.
 
-Regression cases verify that production launches exclude test fixtures, and that
-fixture commands become available only when explicitly packaged and registered
-in an external JAR. They also cover malformed/empty/commented service descriptors,
+The registry and startup unit tests use explicitly supplied providers; each
+plugin's arithmetic, text, and parameter rules are tested in its own test class.
+The CLI registration test supplies its own provider JAR and checks discovery with
+and without that JAR's service entry. These tests do not prescribe which other
+plugins a server may load. Regression cases also cover malformed/empty/commented service descriptors,
 duplicate provider entries, constructor and initializer failures, invalid provider
 types, missing runtime dependencies during discovery/startup/execution, recovery
 after replacing a bad JAR, uppercase JAR extensions, ignored files and nested
