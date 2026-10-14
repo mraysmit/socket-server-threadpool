@@ -11,7 +11,7 @@ A Java-based socket server that handles each client connection on its own virtua
 
 ## 🚀 Features
 
-- **Virtual Threads**: Handles each client connection on a new virtual thread
+- **Virtual Threads**: Main/admin listeners, client connections, and plugin startup use virtual threads
 - **HTTP Response Support**: Returns proper HTTP responses using SOLID design principles
 - **Text Messages**: Sends a UTF-8 text message and receives an echo reply over the main socket
 - **Execution Plugins**: Dispatches JSON instructions to built-in or external JAR plugins and returns typed results
@@ -131,6 +131,7 @@ src/
 - **Main Server Port**: 9000
 - **Admin Port**: 9001
 - **Request Executor**: One virtual thread per connection
+- **Listener Executor**: One named virtual thread per main/admin listener task
 - **Command Protocol**: One UTF-8 JSON request line and reply line per connection, version 1
 - **JSON Library**: Jackson Databind 2.21.5
 - **HTTP Response Format**: HTTP/1.1 status, headers, and UTF-8 body
@@ -652,6 +653,7 @@ registration file per JAR:
 ```java
 public interface CommandPlugin {
     default void start(PluginContext context) throws Exception { }
+    default void stop() throws Exception { }
     default String instruction() { return null; }
     default Object execute(Map<String, Object> parameters) throws Exception {
         throw new UnsupportedOperationException("This plugin has no command handler");
@@ -686,11 +688,56 @@ startup method. A startup-only plugin overrides `start()` and inherits the defau
 Non-null instruction names must be valid and unique.
 
 `ServerInstance` calls each plugin's startup method once after binding both listeners and before
-starting request processing or reporting ready. Hooks run synchronously on the
-startup thread with the provider's context class loader. A hook exception aborts
-startup, releases both listeners, and closes the external plugin loader. Command
+starting request processing or reporting ready. Discovery, construction, and
+instruction validation remain sequential. Initialization runs concurrently using
+one virtual thread per provider, with that provider's context class loader.
+Startup waits for every hook to finish. Providers must initialize independently;
+there is no guaranteed hook execution or completion order.
+
+Hook failures are collected, and startup waits for the other hooks to finish before
+stopping every provider whose startup was entered (including failing providers),
+releasing both listeners, and closing the external plugin loader. A shutdown or
+registry close during initialization waits for startup tasks to settle. Within one
+server instance, `start()` and `stop()` never overlap. Interrupting the startup caller cancels its startup
+tasks, waits for actual worker exit, restores the caller's interrupt flag, and
+fails startup. Hooks must cooperate with cancellation or finish independently;
+there is no host-enforced initialization deadline. Command
 plugins using the default no-op startup method load and handle requests normally and
 require no changes. Requests continue to execute on virtual threads.
+
+#### Optional Plugin Shutdown
+
+Override the default no-op `stop()` when a plugin owns background tasks, sockets,
+or other resources. The server invokes it at most once per entered provider,
+in reverse recorded startup-entry order, with that provider's context class loader. A partially
+initialized provider is included in cleanup; providers whose startup was never
+entered are not stopped. Constructors should avoid allocating resources.
+
+`ServerInstance.requestStop()` quiesces plugins before closing the admin and main
+listeners. Administrative `shutdown` uses this path without joining its own
+monitor task. `ServerInstance.close()` also requests a stop, then joins listeners
+and drains accepted requests before closing the plugin class loader. Console
+`quit` and end-of-input reach `close()`. After administrative shutdown, `quit` or
+owner close completes the joins and loader cleanup.
+
+A stop hook must prevent new background work, close sockets that unblock its
+workers, and join those workers before returning. Keep state needed by already
+accepted command handlers until they finish. Do not rely on daemon threads,
+interrupts alone, or a JVM shutdown hook for per-instance resource cleanup, and
+do not make synchronous departure calls to unreachable peers from `stop()`.
+Stop hooks run synchronously; the host supplies no forced timeout for plugin code.
+
+If a stop hook throws an exception or a nonfatal error, the registry still attempts
+the remaining hooks and aggregates failures using suppressed exceptions. Listener
+and loader cleanup still runs. Owner close reports the failure; admin shutdown
+logs it and owner close reports it after completing cleanup. Repeated stops do
+not retry hooks. Registry close supplies a fallback stop path for direct users.
+
+Run the lifecycle and real external-JAR cleanup tests with:
+
+```powershell
+mvn test "-Dtest=ConcurrentPluginStartupTest,PluginLifecycleTest,ExternalPluginTest,ServerLifecycleTest,StartStopTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
 
 #### Built-in Address Broadcast
 
@@ -772,13 +819,13 @@ mvn test "-Dtest=ServerLifecycleTest"
 Run only the plugin tests with command-line output:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,ConcurrentPluginStartupTest,PluginLifecycleTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 To include the JSON client's reply-validation tests as well:
 
 ```powershell
-mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
+mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,ConcurrentPluginStartupTest,PluginLifecycleTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
 These verify built-in and fixture results, parameter validation, request/reply validation,
@@ -1015,9 +1062,16 @@ and waits for accepted tasks. The console uses these same resolved settings.
 ### Virtual Thread Execution
 
 The request executor uses `Executors.newVirtualThreadPerTaskExecutor()`; there is
-no fixed worker pool size. The listener and shutdown monitor keep their platform
+no fixed worker pool size. Main and admin listeners each run on a named virtual
+thread through a thread-per-task executor. Plugin startup also uses virtual
 threads. During shutdown, the listener stops accepting clients and waits for
 accepted request tasks to finish. Workers use a 10-second socket read timeout.
+
+[Virtual threads are daemon threads](https://docs.oracle.com/en/java/javase/27/docs/api/java.base/java/lang/Thread.html),
+so an embedding application's main thread must remain alive while its servers
+are needed. The interactive server and swarm entry points do this while reading
+console commands and complete cleanup before returning. The swarm's JVM
+shutdown hook also runs on a virtual thread.
 
 ## 🏗️ SOLID Design Principles
 

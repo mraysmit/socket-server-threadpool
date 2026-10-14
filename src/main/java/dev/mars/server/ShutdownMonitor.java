@@ -29,13 +29,20 @@ public class ShutdownMonitor implements Runnable {
     protected final int port;
     protected final ThreadPooledServer server;
     protected volatile ServerSocket serverSocket;
+    protected volatile Thread runningThread;
     protected final AtomicBoolean running = new AtomicBoolean(true);
     private Socket activeClient;
+    private final Runnable stopRequest;
 
     public ShutdownMonitor(int port, ThreadPooledServer server) {
+        this(port, server, server::stop);
+    }
+
+    public ShutdownMonitor(int port, ThreadPooledServer server, Runnable stopRequest) {
         ServerOptions.validatePort(port, "Admin port");
         this.port = port;
         this.server = server;
+        this.stopRequest = java.util.Objects.requireNonNull(stopRequest, "stopRequest");
     }
 
     public synchronized void bind() throws IOException {
@@ -56,6 +63,7 @@ public class ShutdownMonitor implements Runnable {
         try {
             synchronized (this) {
                 if (!running.get()) { return; }
+                runningThread = Thread.currentThread();
                 bind();
             }
             System.out.println("Shutdown monitor listening on port " + getPort() + " | serverId=" + server.getServerId());
@@ -77,8 +85,11 @@ public class ShutdownMonitor implements Runnable {
                         System.out.println("Command received: " + command);
                         if ("shutdown".equalsIgnoreCase(command)) {
                             out.println("Shutting down server...");
-                            stop();
-                            server.stop();
+                            try { stopRequest.run(); }
+                            catch (RuntimeException e) {
+                                System.err.println("Server shutdown failed | serverId=" + server.getServerId()
+                                        + " | reason=" + e.getMessage());
+                            } finally { stop(); }
                             System.out.println("Server stopped by ShutdownMonitor");
                         } else if ("status".equalsIgnoreCase(command)) {
                             out.println("Server status: " + (server.isStopped() ? "STOPPED" : "ALIVE"));

@@ -32,13 +32,17 @@ public final class ServerInstance implements AutoCloseable {
     private Future<?> serverTask;
     private Future<?> monitorTask;
     private final PluginRegistry plugins;
+    private final Object closeLock = new Object();
+    private boolean stopRequested;
+    private boolean closed;
+    private RuntimeException stopFailure;
 
     private ServerInstance(ServerOptions options, PluginRegistry plugins) {
         this.plugins = plugins;
         server = new ThreadPooledServer(options.port(), options.serverId(), plugins);
-        monitor = new ShutdownMonitor(options.adminPort(), server);
-        listeners = Executors.newFixedThreadPool(2,
-                Thread.ofPlatform().name("listener-" + options.serverId() + "-", 0).factory());
+        monitor = new ShutdownMonitor(options.adminPort(), server, this::requestStop);
+        listeners = Executors.newThreadPerTaskExecutor(
+                Thread.ofVirtual().name("listener-" + options.serverId() + "-", 0).factory());
     }
 
     public static ServerInstance start(ServerOptions options) throws IOException {
@@ -94,24 +98,60 @@ public final class ServerInstance implements AutoCloseable {
     public int getPort() { return server.getPort(); }
     public int getAdminPort() { return monitor.getPort(); }
     ThreadPooledServer server() { return server; }
+    ShutdownMonitor monitor() { return monitor; }
     Future<?> serverTask() { return serverTask; }
     Future<?> monitorTask() { return monitorTask; }
 
+    /** Quiesce plugins and close listeners without joining the calling listener task. */
+    public synchronized void requestStop() {
+        if (stopRequested) {
+            if (stopFailure != null) { throw stopFailure; }
+            return;
+        }
+        stopRequested = true;
+        RuntimeException failure = null;
+        try { plugins.stop(); }
+        catch (IOException e) { failure = new UncheckedIOException("Cannot stop plugins", e); }
+        finally {
+            try { failure = attempt(failure, monitor::stop); }
+            finally {
+                failure = attempt(failure, server::stop);
+                stopFailure = failure;
+            }
+        }
+        if (failure != null) { throw failure; }
+    }
+
     @Override
     public void close() {
-        try { monitor.stop(); }
-        finally {
-            try { server.stop(); }
+        // Never hold the instance monitor while joining: admin shutdown also calls requestStop().
+        synchronized (closeLock) {
+            if (closed) { return; }
+            closed = true;
+            RuntimeException failure = null;
+            try { failure = attempt(failure, this::requestStop); }
             finally {
-                try { listeners.close(); }
+                try { failure = attempt(failure, listeners::close); }
                 finally {
-                    try { server.requestExecutor.close(); }
+                    try { failure = attempt(failure, server.requestExecutor::close); }
                     finally {
-                        try { plugins.close(); }
-                        catch (IOException e) { throw new UncheckedIOException("Cannot close plugin loader", e); }
+                        failure = attempt(failure, () -> {
+                            try { plugins.close(); }
+                            catch (IOException e) { throw new UncheckedIOException("Cannot close plugin loader", e); }
+                        });
                     }
                 }
             }
+            if (failure != null) { throw failure; }
         }
+    }
+
+    private static RuntimeException attempt(RuntimeException failure, Runnable cleanup) {
+        try { cleanup.run(); }
+        catch (RuntimeException e) {
+            if (failure == null) { return e; }
+            if (failure != e) { failure.addSuppressed(e); }
+        }
+        return failure;
     }
 }

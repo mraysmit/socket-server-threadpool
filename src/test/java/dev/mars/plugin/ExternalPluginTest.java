@@ -17,6 +17,7 @@ package dev.mars.plugin;
 
 import dev.mars.client.CommandExecutionException;
 import dev.mars.client.TextMessageClient;
+import dev.mars.protocol.Json;
 import dev.mars.server.ServerInstance;
 import dev.mars.server.ServerOptions;
 import org.junit.jupiter.api.Test;
@@ -424,6 +425,406 @@ class ExternalPluginTest {
             }
         }
         Files.delete(jar);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"close", "admin", "request-stop"})
+    void shutdownStopsExternalBackgroundWorkExactlyOnce(String mode) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, false);
+        var server = ServerInstance.start(new ServerOptions("Lifecycle-001", 0, 0, directory));
+        int main = server.getPort();
+        int admin = server.getAdminPort();
+        try (server) {
+            if (mode.equals("admin")) {
+                assertEquals("Shutting down server...", adminCommand(server, "shutdown"));
+                awaitFile("Lifecycle-001.stopped"); // Admin shutdown must quiesce before owner close.
+                server.requestStop(); // Wait for that stop request to finish closing its listeners.
+            } else if (mode.equals("request-stop")) {
+                server.requestStop();
+            } else {
+                server.close();
+            }
+            assertEquals("worker stopped", Files.readString(temporary.resolve("Lifecycle-001.worker-stopped")));
+            assertEquals("stop\n", Files.readString(temporary.resolve("Lifecycle-001.stopped")));
+            server.requestStop();
+        }
+        assertPortsReleased(main, admin);
+        Files.delete(jar);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void partialStartupStopsAllocatedResourcesAndPreservesOriginalFailure(boolean stopFails) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, true, stopFails);
+        var failure = assertThrows(IOException.class,
+                () -> ServerInstance.start(new ServerOptions("Partial", 0, 0, directory)));
+        assertEquals("Startup failed after allocation", failure.getCause().getMessage());
+        assertEquals(stopFails ? 1 : 0, failure.getSuppressed().length);
+        assertEquals("worker stopped", Files.readString(temporary.resolve("Partial.worker-stopped")));
+        assertEquals("stop\n", Files.readString(temporary.resolve("Partial.stopped")));
+        String[] ports = Files.readString(temporary.resolve("Partial.started")).split(",");
+        assertPortsReleased(Integer.parseInt(ports[0]), Integer.parseInt(ports[1]));
+        Files.delete(jar);
+    }
+
+    @Test
+    void startupFailureWaitsForConcurrentExternalInitializationBeforeRollback() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Files.writeString(temporary.resolve("Earlier.hold-start"), "hold");
+        Path running = lifecycleJar(directory, false, false);
+        Path failing = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                public class OtherPlugin implements CommandPlugin {
+                    public void start(PluginContext context) throws Exception {
+                        java.nio.file.Files.writeString(java.nio.file.Path.of(java.net.URI.create("%s")), "failed");
+                        throw new java.io.IOException("Concurrent provider failed");
+                    }
+                    public void stop() throws Exception {
+                        java.nio.file.Files.writeString(java.nio.file.Path.of(java.net.URI.create("%s")), "cleaned");
+                    }
+                }
+                """.formatted(temporary.resolve("peer.failed").toUri(), temporary.resolve("later.stopped").toUri()),
+                "dev.mars.plugin.CommandPlugin");
+        try (var caller = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var startup = caller.submit(() -> ServerInstance.start(new ServerOptions("Earlier", 0, 0, directory)));
+            try {
+                awaitFile("Earlier.start-waiting");
+                awaitFile("peer.failed");
+                assertFalse(startup.isDone(), "Failure must wait for the other hook to finish");
+                assertFalse(Files.exists(temporary.resolve("Earlier.stop-entered")), "Rollback must not overlap startup");
+                Files.writeString(temporary.resolve("Earlier.start-release"), "release");
+                var error = assertThrows(java.util.concurrent.ExecutionException.class,
+                        () -> startup.get(5, java.util.concurrent.TimeUnit.SECONDS));
+                var failure = assertInstanceOf(IOException.class, error.getCause());
+                assertEquals("Concurrent provider failed", failure.getCause().getMessage());
+            } finally { Files.writeString(temporary.resolve("Earlier.start-release"), "release"); }
+        }
+        assertEquals("cleaned", Files.readString(temporary.resolve("later.stopped")));
+        assertEquals("worker stopped", Files.readString(temporary.resolve("Earlier.worker-stopped")));
+        assertEquals("stop\n", Files.readString(temporary.resolve("Earlier.stopped")));
+        String[] ports = Files.readString(temporary.resolve("Earlier.started")).split(",");
+        assertPortsReleased(Integer.parseInt(ports[0]), Integer.parseInt(ports[1]));
+        Files.delete(running); Files.delete(failing);
+    }
+
+    @Test
+    void serverWaitsForEveryStartupHookBeforeAcceptingCommandsAndReportingReady() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Files.writeString(temporary.resolve("Readiness.hold-start"), "hold");
+        Path first = lifecycleJar(directory, false, false);
+        Path second = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                import java.nio.file.*;
+                import java.net.URI;
+                import java.util.Map;
+                public class OtherPlugin implements CommandPlugin {
+                    private boolean ready;
+                    public String instruction() { return "test.ready"; }
+                    public void start(PluginContext context) throws Exception {
+                        if (!Thread.currentThread().isVirtual()) throw new IllegalStateException("Startup must use a virtual thread");
+                        if (Thread.currentThread().getContextClassLoader() != getClass().getClassLoader())
+                            throw new IllegalStateException("Wrong startup class loader");
+                        Path root = Path.of(URI.create("%s"));
+                        Files.writeString(root.resolve("ready.entered"), "entered");
+                        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10);
+                        while (!Files.exists(root.resolve("ready.release"))) {
+                            if (System.nanoTime() >= deadline) throw new java.io.IOException("Startup release timed out");
+                            Thread.sleep(10);
+                        }
+                        ready = true;
+                        Files.writeString(root.resolve("ready.finished"), "finished");
+                    }
+                    public Object execute(Map<String,Object> parameters) { return ready; }
+                }
+                """.formatted(temporary.toUri()), "dev.mars.plugin.CommandPlugin");
+        try (var caller = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var startup = caller.submit(() -> ServerInstance.start(new ServerOptions("Readiness", 0, 0, directory)));
+            try {
+                awaitFile("ready.entered");
+                awaitFile("Readiness.start-waiting");
+                assertFalse(startup.isDone(), "Server must not report ready while a hook is running");
+                String[] ports = Files.readString(temporary.resolve("Readiness.started")).split(",");
+                int main = Integer.parseInt(ports[0]);
+                var id = java.util.UUID.randomUUID();
+                try (var socket = new java.net.Socket("localhost", main);
+                     var writer = new java.io.PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
+                     var reader = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+                    socket.setSoTimeout(150);
+                    writer.println(Json.write(new dev.mars.protocol.CommandRequest(1, id, "test.ready", Map.of())));
+                    assertThrows(java.net.SocketTimeoutException.class, reader::readLine,
+                            "Request processing must wait for every startup hook");
+                    Files.writeString(temporary.resolve("ready.release"), "release");
+                    awaitFile("ready.finished");
+                    assertFalse(startup.isDone(), "One completed hook must not make the server ready");
+                    assertThrows(java.net.SocketTimeoutException.class, reader::readLine);
+                    Files.writeString(temporary.resolve("Readiness.start-release"), "release");
+                    try (var server = startup.get(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                        assertEquals(main, server.getPort());
+                        socket.setSoTimeout(5000);
+                        var reply = dev.mars.protocol.CommandProtocol.parseReply(reader.readLine());
+                        assertEquals(id, reply.messageId());
+                        assertEquals("Readiness", reply.serverId());
+                        assertEquals("OK", reply.status());
+                        assertEquals(true, reply.result());
+                    }
+                }
+                assertPortsReleased(main, Integer.parseInt(ports[1]));
+            } finally {
+                Files.writeString(temporary.resolve("ready.release"), "release");
+                Files.writeString(temporary.resolve("Readiness.start-release"), "release");
+                startup.get(5, java.util.concurrent.TimeUnit.SECONDS).close();
+            }
+        }
+        Files.delete(first); Files.delete(second);
+    }
+
+    @Test
+    void interruptedServerStartupRollsBackPluginResourcesAndRestoresCallerInterrupt() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Files.writeString(temporary.resolve("Interrupted.hold-start"), "hold");
+        Path jar = lifecycleJar(directory, false, false);
+        var failure = new java.util.concurrent.atomic.AtomicReference<IOException>();
+        var interruptRestored = new java.util.concurrent.atomic.AtomicBoolean();
+        var caller = Thread.ofVirtual().start(() -> {
+            try (var server = ServerInstance.start(new ServerOptions("Interrupted", 0, 0, directory))) {
+                fail("Interrupted startup must not return a ready server");
+            } catch (IOException e) {
+                failure.set(e);
+                interruptRestored.set(Thread.currentThread().isInterrupted());
+            }
+        });
+        try {
+            awaitFile("Interrupted.start-waiting");
+            caller.interrupt();
+            caller.join(5000);
+            assertFalse(caller.isAlive(), "Interrupted startup must finish resource cleanup");
+            assertNotNull(failure.get());
+            assertInstanceOf(InterruptedException.class, failure.get().getCause());
+            assertEquals(0, failure.get().getSuppressed().length, failure.get().toString());
+            assertTrue(interruptRestored.get());
+            assertEquals("worker stopped", Files.readString(temporary.resolve("Interrupted.worker-stopped")));
+            assertEquals("stop\n", Files.readString(temporary.resolve("Interrupted.stopped")));
+            String[] ports = Files.readString(temporary.resolve("Interrupted.started")).split(",");
+            assertPortsReleased(Integer.parseInt(ports[0]), Integer.parseInt(ports[1]));
+        } finally {
+            Files.writeString(temporary.resolve("Interrupted.start-release"), "release");
+            caller.join(5000);
+        }
+        Files.delete(jar);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"close", "admin"})
+    void throwingStopHookStillDrainsClosesListenersAndReleasesJar(String mode) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, true);
+        var server = ServerInstance.start(new ServerOptions("Throwing", 0, 0, directory));
+        try {
+            if (mode.equals("admin")) {
+                assertEquals("Shutting down server...", adminCommand(server, "shutdown"));
+                awaitFile("Throwing.stopped");
+            }
+            var failure = assertThrows(java.io.UncheckedIOException.class, server::close);
+            assertEquals("Stop hook failed", failure.getCause().getCause().getMessage());
+            assertEquals("worker stopped", Files.readString(temporary.resolve("Throwing.worker-stopped")));
+            assertEquals("stop\n", Files.readString(temporary.resolve("Throwing.stopped")));
+            assertDoesNotThrow(server::close);
+            assertPortsReleased(server.getPort(), server.getAdminPort());
+            Files.delete(jar);
+        } finally { server.close(); }
+    }
+
+    @Test
+    void closingOneInstanceLeavesAnotherInstancesPluginWorkerAndCommandsUsable() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, false);
+        try (var first = ServerInstance.start(new ServerOptions("First", 0, 0, directory));
+             var second = ServerInstance.start(new ServerOptions("Second", 0, 0, directory))) {
+            first.close();
+            assertTrue(Files.exists(temporary.resolve("First.worker-stopped")));
+            assertFalse(Files.exists(temporary.resolve("Second.worker-stopped")));
+            var reply = new TextMessageClient("localhost", second.getPort(), "Second").execute("test.lifecycle", Map.of());
+            assertEquals(Map.of("serverId", "Second", "stopped", false, "classByte", BigInteger.valueOf(202)), reply.result());
+        }
+        assertEquals("stop\n", Files.readString(temporary.resolve("First.stopped")));
+        assertEquals("stop\n", Files.readString(temporary.resolve("Second.stopped")));
+        Files.delete(jar);
+    }
+
+    @Test
+    void closeKeepsPluginLoaderAvailableUntilAcceptedHandlerFinishes() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, false);
+        var server = ServerInstance.start(new ServerOptions("Draining", 0, 0, directory));
+        try (var callers = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            try {
+                var request = callers.submit(() -> new TextMessageClient("localhost", server.getPort(), "Draining")
+                        .execute("test.lifecycle", Map.of("block", true)));
+                awaitFile("Draining.handler-entered");
+                var closing = callers.submit(server::close);
+                awaitFile("Draining.stopped");
+                assertFalse(closing.isDone(), "Close must wait for the accepted request");
+                Files.writeString(temporary.resolve("Draining.handler-release"), "release");
+                var reply = request.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals("OK", reply.status());
+                assertEquals(Map.of("serverId", "Draining", "stopped", true, "classByte", BigInteger.valueOf(202)), reply.result());
+                closing.get(5, java.util.concurrent.TimeUnit.SECONDS);
+            } finally {
+                Files.writeString(temporary.resolve("Draining.handler-release"), "release");
+                server.close();
+            }
+        }
+        Files.delete(jar);
+    }
+
+    @Test
+    void adminShutdownCanOverlapOwnerCloseWithoutJoiningItself() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, false);
+        Files.writeString(temporary.resolve("Racing.hold-stop"), "hold");
+        var server = ServerInstance.start(new ServerOptions("Racing", 0, 0, directory));
+        try (var callers = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            try {
+                var closing = callers.submit(server::close);
+                awaitFile("Racing.stop-entered"); // Owner close holds the stop lock while the hook waits.
+                assertEquals("Shutting down server...", adminCommand(server, "shutdown"));
+                Files.writeString(temporary.resolve("Racing.stop-release"), "release");
+                closing.get(5, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals("stop\n", Files.readString(temporary.resolve("Racing.stopped")));
+                assertPortsReleased(server.getPort(), server.getAdminPort());
+            } finally {
+                Files.writeString(temporary.resolve("Racing.stop-release"), "release");
+                server.close();
+            }
+        }
+        Files.delete(jar);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"quit\n", "", "shutdown\nquit\n"})
+    void consoleQuitEofAndShutdownStopPluginWorkers(String input) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = lifecycleJar(directory, false, false);
+        Path javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java.exe");
+        if (!Files.exists(javaExecutable)) { javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java"); }
+        var process = new ProcessBuilder(javaExecutable.toString(), "-cp",
+                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
+                "dev.mars.StartStop", "Console", "--port", "0", "--admin-port", "0", "--plugins-dir", directory.toString())
+                .redirectErrorStream(true).start();
+        try (var reader = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var output = reader.submit(() -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
+            try {
+                try (var stdin = process.getOutputStream()) { stdin.write(input.getBytes(StandardCharsets.UTF_8)); }
+                assertTrue(process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS), "Console did not exit");
+                assertEquals(0, process.exitValue(), output.get(2, java.util.concurrent.TimeUnit.SECONDS));
+                assertEquals("worker stopped", Files.readString(temporary.resolve("Console.worker-stopped")));
+                assertEquals("stop\n", Files.readString(temporary.resolve("Console.stopped")));
+                System.out.println("External plugin lifecycle CLI test PASSED | input=" + Json.write(input));
+            } finally {
+                if (process.isAlive()) {
+                    process.destroyForcibly();
+                    assertTrue(process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS));
+                }
+            }
+        }
+        Files.delete(jar);
+    }
+
+    private String adminCommand(ServerInstance server, String command) throws IOException {
+        try (var socket = new java.net.Socket("localhost", server.getAdminPort());
+             var writer = new java.io.PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8);
+             var reader = new java.io.BufferedReader(new java.io.InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))) {
+            socket.setSoTimeout(5000);
+            writer.println(command);
+            return reader.readLine();
+        }
+    }
+
+    private void awaitFile(String name) throws Exception {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+        while (!Files.exists(temporary.resolve(name)) && System.nanoTime() < deadline) { Thread.sleep(10); }
+        assertTrue(Files.exists(temporary.resolve(name)), "Timed out waiting for " + name);
+    }
+
+    private void assertPortsReleased(int main, int admin) throws IOException {
+        try (var a = new java.net.ServerSocket(main); var b = new java.net.ServerSocket(admin)) {
+            assertEquals(main, a.getLocalPort()); assertEquals(admin, b.getLocalPort());
+        }
+    }
+
+    private Path lifecycleJar(Path directory, boolean startFails, boolean stopFails) throws Exception {
+        return compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                import java.nio.file.*;
+                import java.net.*;
+                import java.util.*;
+                import java.util.concurrent.*;
+                public class ExamplePlugin implements CommandPlugin {
+                    private Path base;
+                    private String serverId;
+                    private volatile boolean stopped;
+                    private DatagramSocket receiver;
+                    private ExecutorService workers;
+                    private Future<?> worker;
+                    private Path marker(String suffix) { return Path.of(base.toString() + suffix); }
+                    private void awaitRelease(String suffix) throws Exception {
+                        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                        while (!Files.exists(marker(suffix))) {
+                            if (System.nanoTime() >= deadline) throw new java.io.IOException("Fixture release timed out");
+                            Thread.sleep(10);
+                        }
+                    }
+                    public String instruction() { return "test.lifecycle"; }
+                    public void start(PluginContext context) throws Exception {
+                        if (!Thread.currentThread().isVirtual()) throw new IllegalStateException("Startup must use a virtual thread");
+                        if (Thread.currentThread().getContextClassLoader() != getClass().getClassLoader())
+                            throw new IllegalStateException("Wrong startup context loader");
+                        serverId = context.serverId();
+                        base = Path.of(URI.create("%s")).resolve(serverId);
+                        Files.writeString(marker(".started"), context.port() + "," + context.adminPort());
+                        receiver = new DatagramSocket(0, InetAddress.getByName("127.0.0.1"));
+                        workers = Executors.newVirtualThreadPerTaskExecutor();
+                        worker = workers.submit(() -> {
+                            try { receiver.receive(new DatagramPacket(new byte[16], 16)); }
+                            catch (SocketException e) { if (!stopped) throw e; }
+                            finally { Files.writeString(marker(".worker-stopped"), "worker stopped"); }
+                            return null;
+                        });
+                        if (Files.exists(marker(".hold-start"))) {
+                            Files.writeString(marker(".start-waiting"), "waiting");
+                            awaitRelease(".start-release");
+                        }
+                        if (%s) throw new java.io.IOException("Startup failed after allocation");
+                    }
+                    public void stop() throws Exception {
+                        if (Thread.currentThread().getContextClassLoader() != getClass().getClassLoader())
+                            throw new IllegalStateException("Wrong stop context loader");
+                        Files.writeString(marker(".stop-entered"), "entered");
+                        if (Files.exists(marker(".hold-stop"))) awaitRelease(".stop-release");
+                        stopped = true;
+                        if (receiver != null) receiver.close();
+                        if (workers != null) workers.close();
+                        if (worker != null) worker.get(1, TimeUnit.SECONDS);
+                        Files.writeString(marker(".stopped"), "stop\\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+                        if (%s) throw new java.io.IOException("Stop hook failed");
+                    }
+                    public Object execute(Map<String,Object> parameters) throws Exception {
+                        if (Boolean.TRUE.equals(parameters.get("block"))) {
+                            Files.writeString(marker(".handler-entered"), "entered");
+                            awaitRelease(".handler-release");
+                        }
+                        try (var resource = getClass().getResourceAsStream("ExamplePlugin.class")) {
+                            if (resource == null) throw new java.io.IOException("Plugin loader closed before request drained");
+                            return Map.of("serverId", serverId, "stopped", stopped, "classByte", resource.read());
+                        }
+                    }
+                }
+                """.formatted(temporary.toUri(), startFails, stopFails), "dev.mars.plugin.CommandPlugin");
     }
 
     private void rewriteDescriptor(Path jar, String descriptor) throws IOException {

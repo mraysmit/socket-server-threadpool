@@ -19,7 +19,7 @@ import java.util.Map;
 
 /** Startup-discovered provider. Instances are shared: implementations must be thread-safe. */
 public interface CommandPlugin {
-    /** Optional initialization after both TCP ports bind. */
+    /** Optional initialization on a virtual thread after both ports bind; independent providers start concurrently. */
     default void start(PluginContext context) throws Exception { }
 
     /** Optional shutdown: stop background work, retaining state needed by accepted commands. */

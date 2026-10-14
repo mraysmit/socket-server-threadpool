@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Proposed plugin architecture and implementation plan |
-| Last updated | 2026-10-13 |
+| Last updated | 2026-10-14 |
 
 ## Purpose and scope
 
@@ -12,7 +12,7 @@ Implement a plugin that lets instances of this server discover one another and m
 
 The first implementation should gossip membership and small, owner-controlled metadata, such as a node's supported application instructions. It should expose the local membership view for inspection. Application event delivery can be added later, with its own retention and deduplication rules.
 
-This is an implementation proposal. The repository currently supplies the transport and plugin infrastructure, but has no gossip implementation. Most of the design fits inside an external plugin JAR. A small host lifecycle extension is necessary to manage periodic work during shutdown and failed startup.
+This is an implementation proposal. The repository currently supplies the transport and plugin infrastructure, but has no gossip implementation. Most of the design fits inside an external plugin JAR. The host lifecycle prerequisite is implemented: optional stop hooks now run during instance shutdown and failed startup, before accepted requests drain and the plugin loader closes.
 
 The intended first deployment is a small swarm on a trusted LAN, with mutually reachable TCP endpoints and unique configured server IDs. Membership is eventually consistent: nodes can temporarily disagree, and a timeout indicates suspected unreachability rather than proof that a process has stopped. Membership alone must not authorize exclusive ownership, elect a unique leader, or guarantee that a command executes once.
 
@@ -136,7 +136,7 @@ There are three reasons seeds remain necessary:
 - Plugin startup hooks run before TCP listener tasks begin. A discovered endpoint can be bound but not yet ready to answer; retry the handshake asynchronously.
 - Several server processes on one host cannot portably each bind UDP 9002 and receive every announcement. Socket reuse is not a portable fanout mechanism. Use seeds for this layout, or an optional single host discovery agent that forwards candidates to local plugins.
 
-The built-in broadcaster runs independently of this plugin and may announce before its receiver starts. Do not depend on class-name startup order to make discovery reliable. Optional receiver bind failures should disable that discovery path and leave seed-based startup working.
+The built-in broadcaster runs independently of this plugin and may announce before its receiver starts. Providers initialize concurrently on virtual threads, with no guaranteed hook execution or completion order. Do not depend on class-name startup order to make discovery reliable. Optional receiver bind failures should disable that discovery path and leave seed-based startup working.
 
 ## Exchange protocol
 
@@ -229,21 +229,20 @@ The existing client uses a 5-second connect timeout and a 10-second read timeout
 
 The host currently reads unbounded lines before plugin validation. Plugin batch limits constrain cooperative peers but cannot protect the host from an oversized incoming line. Before using this beyond a trusted environment, add a byte-counted limit to the main socket reader and to gossip response reading before JSON parsing. Likewise, cap HTTP header bytes if the listener is exposed. This is a transport hardening change, separate from the gossip merge algorithm.
 
-## Lifecycle extension required in the host
+## Host lifecycle prerequisite (implemented)
 
-The current SPI has `start()` and `execute()` but no stop hook. `PluginRegistry.close()` closes the external class loader only; that does not stop a scheduler, outbound socket, UDP receiver, or plugin-created thread. Daemon threads and a JVM shutdown hook do not solve instance shutdown in a process hosting multiple servers.
+The SPI now has optional `start()` and `stop()` hooks alongside `execute()`. `PluginRegistry.close()` invokes stop as a fallback before closing the external class loader. Plugins must implement their own resource shutdown; closing a loader does not stop a scheduler, outbound socket, UDP receiver, or plugin-created thread. Daemon threads and a JVM shutdown hook do not solve instance shutdown in a process hosting multiple servers.
 
-Add one backward-compatible default method:
+The backward-compatible default method is:
 
 ```java
-// Proposed addition to CommandPlugin, not present today.
 default void stop() throws Exception { }
 ```
 
-Implement the host contract as follows:
+The implemented host contract is:
 
-- `PluginRegistry` tracks providers whose startup has been entered, including a provider that throws after allocating resources. Its idempotent `stop()` invokes their hooks in reverse startup order, attempts every hook, and aggregates failures. Constructors should avoid acquiring resources.
-- Add an idempotent instance stop-request path that first quiesces plugins and then stops the admin and main listeners. Wire administrative `shutdown` through this path rather than directly calling only `ThreadPooledServer.stop()`.
+- `PluginRegistry` discovers and validates providers sequentially, then initializes them concurrently on virtual threads. It waits for all startup tasks before reporting success or failure and serializes lifecycle calls so startup and stop hooks never overlap. It tracks providers whose startup has been entered, including a provider that throws after allocating resources. Its idempotent `stop()` invokes their hooks in reverse recorded startup-entry order, continues after hook exceptions or nonfatal errors, and aggregates failures. Constructors should avoid acquiring resources.
+- `ServerInstance.requestStop()` is an idempotent instance stop-request path that first quiesces plugins and then stops the admin and main listeners. Administrative `shutdown` uses this path.
 - `ServerInstance.close()` invokes that stop-request path, joins listener tasks, waits for accepted request tasks, and only then closes the registry/class loader. Preserve cleanup through `finally` even when a hook fails.
 - Registry close also invokes its idempotent stop path as a fallback. Failed startup follows the same cleanup path, including hooks already entered. Every discovered provider still has its loader resources released.
 
@@ -253,7 +252,7 @@ The gossip stop hook prevents new rounds, cancels scheduled work, closes the opt
 
 Do not send a synchronous departure RPC from `stop()`: shutdown must still finish when the network is down. The explicit `leave` operation publishes a terminal local record, queues a bounded dissemination attempt, and then quiesces periodic work. Make it asynchronous and expose completion in `status`. Invoke it before shutdown when graceful departure is desired. Other nodes eventually time out a process that exits without delivering `LEFT`.
 
-With no host changes, an external plugin can demonstrate periodic exchanges, but the host cannot guarantee per-instance cleanup. Treat the stop-hook work as a prerequisite for a managed swarm plugin rather than hiding the missing contract in the plugin.
+Tests exercise normal close, administrative shutdown, console quit/end-of-input, partial initialization, concurrent startup failures, stop-hook failures, concurrent shutdown, instance isolation, and loader availability until accepted commands complete. A real external provider owns a worker blocked on UDP receive; its stop hook closes the socket and joins the worker, and its JAR can be deleted after host cleanup on Windows. Stop hooks run synchronously without a host-enforced deadline. The gossip plugin will still need to implement its own cancellation and bounded resource cleanup.
 
 ## Suggested plugin classes
 
@@ -288,7 +287,7 @@ example.gossip.GossipPlugin
 
 Use a dedicated plugin directory containing the gossip JAR and any dependencies it needs. Built-in providers are inherited through the host's parent class loader. Loading duplicate gossip providers fails startup because their instruction names conflict. Restart members to load a new plugin JAR; there is no hot reload.
 
-After implementing the plugin and lifecycle extension, build the host and plugin, then copy the plugin JAR into `plugins/gossip`. The following illustrates a proposed project at `plugins/gossip-plugin`:
+After implementing the plugin, build the host and plugin, then copy the plugin JAR into `plugins/gossip`. The host lifecycle prerequisite is already implemented. The following illustrates a proposed project at `plugins/gossip-plugin`:
 
 ```powershell
 mvn clean install
@@ -346,7 +345,7 @@ Expose round counts, exchange successes/failures, last successful exchange age, 
 
 ## Implementation sequence
 
-1. Add and test the host stop-hook contract, including administrative shutdown and partial startup rollback.
+1. **Complete:** Add and test the host stop-hook contract, including administrative shutdown and partial startup rollback.
 2. Create the separate plugin project and service registration. Implement configuration, immutable records, exact validation, and membership merges.
 3. Implement the `exchange`, `members`, and `status` operations using the existing socket protocol. Verify a real two-node round trip before adding scheduling.
 4. Add jittered rounds, fair batches, bounded fanout, seed retries, local failure assessments, and expiry. Verify three-node convergence and restart handling.

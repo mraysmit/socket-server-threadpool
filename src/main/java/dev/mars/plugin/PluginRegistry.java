@@ -34,6 +34,10 @@ import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.jar.JarFile;
+import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import static dev.mars.protocol.CommandError.Code.*;
 
@@ -42,7 +46,9 @@ public final class PluginRegistry implements AutoCloseable {
     private final Map<String, CommandPlugin> plugins;
     private final URLClassLoader loader;
     private final List<CommandPlugin> loadedPlugins;
+    private final ConcurrentLinkedDeque<CommandPlugin> enteredPlugins = new ConcurrentLinkedDeque<>();
     private boolean startupAttempted;
+    private boolean stopAttempted;
     private boolean closed;
 
     private PluginRegistry(Iterable<CommandPlugin> providers, URLClassLoader loader) {
@@ -60,8 +66,7 @@ public final class PluginRegistry implements AutoCloseable {
             }
         }
         plugins = Map.copyOf(selected);
-        loadedPlugins = discovered.stream()
-                .sorted(java.util.Comparator.comparing(plugin -> plugin.getClass().getName())).toList();
+        loadedPlugins = discovered.stream().sorted(java.util.Comparator.comparing(plugin -> plugin.getClass().getName())).toList();
         this.loader = loader;
     }
 
@@ -117,23 +122,91 @@ public final class PluginRegistry implements AutoCloseable {
 
     public Set<String> instructions() { return java.util.Collections.unmodifiableSet(new TreeSet<>(plugins.keySet())); }
 
-    /** Each registry belongs to one server instance; failed hooks are never retried automatically. */
+    /** Start independent providers concurrently, joining every task before returning or failing. */
     public synchronized void start(PluginContext context) throws IOException {
-        if (closed || startupAttempted) { throw new IOException("Plugin startup has already run or registry is closed"); }
+        if (closed || startupAttempted || stopAttempted) {
+            throw new IOException("Plugin startup has already run or registry is stopped or closed");
+        }
         java.util.Objects.requireNonNull(context, "context");
         startupAttempted = true;
+        IOException failure = null;
+        boolean interrupted = false;
+        // Lifecycle calls stay serialized; workers record entry without acquiring this monitor.
+        try (var starters = Executors.newVirtualThreadPerTaskExecutor()) {
+            var tasks = new java.util.ArrayList<Future<?>>();
+            for (var plugin : loadedPlugins) {
+                tasks.add(starters.submit(() -> { startProvider(plugin, context); return null; }));
+            }
+            for (var task : tasks) {
+                try { task.get(); }
+                catch (InterruptedException e) {
+                    interrupted = true;
+                    var error = new IOException("Plugin startup interrupted", e);
+                    if (failure == null) { failure = error; }
+                    else { failure.addSuppressed(error); }
+                    tasks.forEach(pending -> pending.cancel(true));
+                    break;
+                } catch (ExecutionException e) {
+                    if (e.getCause() instanceof Error fatal) { throw fatal; }
+                    var error = e.getCause() instanceof IOException io ? io
+                            : new IOException("Plugin startup failed", e.getCause());
+                    if (failure == null) { failure = error; }
+                    else { failure.addSuppressed(error); }
+                }
+            }
+            // Executor close waits for actual task exit, even after Future.cancel marks a task done.
+        } finally {
+            if (interrupted) { Thread.currentThread().interrupt(); }
+        }
+        if (failure != null) { throw failure; }
+    }
+
+    private void startProvider(CommandPlugin plugin, PluginContext context) throws IOException {
         Thread thread = Thread.currentThread();
         ClassLoader previous = thread.getContextClassLoader();
-        for (var plugin : loadedPlugins) {
-            try {
-                thread.setContextClassLoader(plugin.getClass().getClassLoader());
-                plugin.start(context);
-            } catch (Exception | LinkageError e) {
-                throw new IOException("Cannot start plugin " + plugin.getClass().getName() + ": " + e.getMessage(), e);
-            } finally {
-                thread.setContextClassLoader(previous);
-            }
+        try {
+            thread.setContextClassLoader(plugin.getClass().getClassLoader());
+            enteredPlugins.addLast(plugin);
+            plugin.start(context);
+        } catch (Throwable e) {
+            throw hookFailure("start", plugin, e);
+        } finally {
+            thread.setContextClassLoader(previous);
         }
+    }
+
+    /** Quiesce every entered provider once, including partially initialized providers. */
+    public synchronized void stop() throws IOException {
+        if (stopAttempted) { return; }
+        stopAttempted = true;
+        IOException failure = null;
+        Thread thread = Thread.currentThread();
+        ClassLoader previous = thread.getContextClassLoader();
+        boolean interrupted = false;
+        try {
+            for (var iterator = enteredPlugins.descendingIterator(); iterator.hasNext();) {
+                var plugin = iterator.next();
+                try {
+                    thread.setContextClassLoader(plugin.getClass().getClassLoader());
+                    plugin.stop();
+                } catch (Throwable e) {
+                    if (e instanceof InterruptedException) { interrupted = true; }
+                    var error = hookFailure("stop", plugin, e);
+                    if (failure == null) { failure = error; }
+                    else { failure.addSuppressed(error); }
+                } finally {
+                    thread.setContextClassLoader(previous);
+                }
+            }
+        } finally {
+            if (interrupted) { thread.interrupt(); }
+        }
+        if (failure != null) { throw failure; }
+    }
+
+    private static IOException hookFailure(String phase, CommandPlugin plugin, Throwable failure) {
+        if (failure instanceof VirtualMachineError fatal) { throw fatal; }
+        return new IOException("Cannot " + phase + " plugin " + plugin.getClass().getName() + ": " + failure.getMessage(), failure);
     }
 
     public CommandReply dispatch(CommandRequest request, String serverId, long connectionId) {
@@ -161,7 +234,18 @@ public final class PluginRegistry implements AutoCloseable {
     }
 
     @Override public synchronized void close() throws IOException {
+        if (closed) { return; }
         closed = true;
-        if (loader != null) { loader.close(); }
+        IOException failure = null;
+        try { stop(); }
+        catch (IOException e) { failure = e; }
+        finally {
+            try { if (loader != null) { loader.close(); } }
+            catch (IOException e) {
+                if (failure == null) { failure = e; }
+                else { failure.addSuppressed(e); }
+            }
+        }
+        if (failure != null) { throw failure; }
     }
 }

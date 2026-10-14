@@ -33,7 +33,7 @@ public class ThreadPooledServer implements Runnable{
     protected int          serverPort   = 8080;
     protected volatile ServerSocket serverSocket = null;
     protected final AtomicBoolean isStopped = new AtomicBoolean(false);
-    protected Thread       runningThread= null;
+    protected volatile Thread runningThread = null;
     protected final ExecutorService requestExecutor;
     final protected String SERVER_NAME = "ThreadPooledServer";
 

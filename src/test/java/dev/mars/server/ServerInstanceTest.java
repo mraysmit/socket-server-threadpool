@@ -51,6 +51,13 @@ class ServerInstanceTest {
             assertTrue(admin > 0);
             assertNotEquals(main, admin);
             assertHealthy(instance);
+            var mainListener = instance.server().runningThread;
+            var adminListener = instance.monitor().runningThread;
+            assertNotNull(mainListener);
+            assertNotNull(adminListener);
+            assertTrue(mainListener.isVirtual(), "Main listener must run on a virtual thread");
+            assertTrue(adminListener.isVirtual(), "Admin listener must run on a virtual thread");
+            assertNotSame(mainListener, adminListener);
         }
         instance.close();
         assertReleased(main, admin);

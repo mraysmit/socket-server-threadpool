@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Implemented plugin architecture and design |
-| Last updated | 2026-10-13 |
+| Last updated | 2026-10-14 |
 | Applies to | Socket Client Server 1.0-SNAPSHOT |
 
 See [README.md](../README.md) for startup and test commands.
@@ -42,6 +42,7 @@ A minimal plugin contract is:
 ```java
 public interface CommandPlugin {
     default void start(PluginContext context) throws Exception { }
+    default void stop() throws Exception { }
     default String instruction() { return null; }
     default Object execute(Map<String, Object> parameters) throws Exception {
         throw new UnsupportedOperationException("This plugin has no command handler");
@@ -64,11 +65,21 @@ inside the server process.
 - **Execution:** Dispatch on the existing per-connection virtual thread. Shared
   plugin instances must be thread-safe; begin with stateless implementations.
 - **Optional startup:** `CommandPlugin.start(PluginContext)` defaults to no-op and runs once after both
-  listeners bind and before requests are accepted. The context supplies the server
+  listeners bind and before requests are accepted. Independent providers initialize
+  concurrently on virtual threads with their own context class loaders. Discovery
+  and validation remain sequential; the server waits for all hooks before reporting
+  ready or rolling back failures. Startup and shutdown hooks never overlap. The context supplies the server
   ID and actual main/admin ports. All providers share the same interface and
   `CommandPlugin` service file. Startup-only providers inherit a null instruction;
   command handlers override `instruction()` and `execute()`. Existing command
   plugins require no changes. Hook failures abort startup with listener cleanup.
+- **Optional shutdown:** `stop()` defaults to no-op. Stop entered providers once
+  in reverse recorded startup-entry order, including a provider whose startup failed. Quiesce
+  background work before closing listeners; retain handler state while accepted
+  requests drain, then release the loader. Administrative shutdown requests this
+  stop without joining its own task; instance close completes joins and cleanup.
+  Continue cleanup after hook exceptions and aggregate failures. Hooks must close
+  their sockets and join their own workers; the host cannot force a hook deadline.
 - **Errors:** Return `status: "ERROR"` with an error code and message, using
   `INVALID_REQUEST`, `UNKNOWN_INSTRUCTION`, `INVALID_PARAMETERS`, or `PLUGIN_ERROR`.
   Preserve the request ID whenever valid, plus server and connection IDs. A plugin
