@@ -58,7 +58,7 @@ class ExternalPluginTest {
             var client = new TextMessageClient("localhost", server.getPort(), "Server-001");
             var result = client.execute("external.multiply", Map.of("a", 6, "b", 7));
             assertEquals(Map.of("product", BigInteger.valueOf(42), "plugin", "external"), result.result());
-            assertEquals(BigInteger.valueOf(30), client.execute("math.add", Map.of("a", 10, "b", 20)).result());
+            assertEquals("Received: healthy", client.send("healthy").text());
             System.out.println("External JAR test PASSED | instruction=external.multiply | " + result);
         }
         Files.delete(jar); // Windows prevents deletion if the loader still owns an open JAR handle.
@@ -105,7 +105,7 @@ class ExternalPluginTest {
                 output.closeEntry();
             }
         } else {
-            jar = providerJar(directory, scenario.equals("duplicate") ? "math.add" : "bad name", "return 42;");
+            jar = providerJar(directory, scenario.equals("duplicate") ? "echo" : "bad name", "return 42;");
         }
         var error = assertThrows(IOException.class,
                 () -> ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory)));
@@ -146,10 +146,18 @@ class ExternalPluginTest {
                     }
                 }
                 """, "dev.mars.plugin.CommandPlugin");
-        try (var server = ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory))) {
-            var reply = new TextMessageClient("localhost", server.getPort()).execute("external.startup", Map.of());
-            assertEquals(Map.of("serverId", "Server-001", "port", BigInteger.valueOf(server.getPort()),
-                    "adminPort", BigInteger.valueOf(server.getAdminPort())), reply.result());
+        try (var first = ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory));
+             var second = ServerInstance.start(new ServerOptions("Server-002", 0, 0, directory))) {
+            for (var server : List.of(first, second)) {
+                var reply = new TextMessageClient("localhost", server.getPort(), server.getServerId())
+                        .execute("external.startup", Map.of());
+                assertEquals(Map.of("serverId", server.getServerId(), "port", BigInteger.valueOf(server.getPort()),
+                        "adminPort", BigInteger.valueOf(server.getAdminPort())), reply.result());
+            }
+            first.close();
+            var reply = new TextMessageClient("localhost", second.getPort(), "Server-002")
+                    .execute("external.startup", Map.of());
+            assertEquals("Server-002", ((Map<?, ?>) reply.result()).get("serverId"));
         }
         Files.delete(jar);
     }
@@ -288,8 +296,148 @@ class ExternalPluginTest {
         return compileJar(directory, content, List.of(), services);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"constructor", "initializer", "private-constructor", "wrong-type", "abstract", "instruction"})
+    void invalidProviderLifecycleFailsCleanlyAndAllowsJarReplacement(String scenario) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        String declaration = scenario.equals("abstract") ? "public abstract class" : "public class";
+        String contract = scenario.equals("wrong-type") ? "" : "implements dev.mars.plugin.CommandPlugin";
+        String extra = switch (scenario) {
+            case "constructor" -> "public ExamplePlugin() { throw new IllegalStateException(\"Constructor failed\"); }";
+            case "initializer" -> "static { if (true) throw new IllegalStateException(\"Initializer failed\"); }";
+            case "private-constructor" -> "private ExamplePlugin() { }";
+            default -> "";
+        };
+        String instruction = scenario.equals("instruction")
+                ? "throw new IllegalStateException(\"Instruction failed\");" : "return \"external.invalid\";";
+        Path jar = compileJar(directory, """
+                package example;
+                %s ExamplePlugin %s {
+                    %s
+                    public String instruction() { %s }
+                }
+                """.formatted(declaration, contract, extra, instruction), "dev.mars.plugin.CommandPlugin");
+        assertThrows(IOException.class, () -> ServerInstance.start(new ServerOptions("Rejected", 0, 0, directory)));
+        Files.delete(jar);
+        Path corrected = providerJar(directory, "external.recovered", "return \"recovered\";");
+        try (var server = ServerInstance.start(new ServerOptions("Recovered", 0, 0, directory))) {
+            assertEquals("recovered", new TextMessageClient("localhost", server.getPort(), "Recovered")
+                    .execute("external.recovered", Map.of()).result());
+        }
+        Files.delete(corrected);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"instruction", "startup", "execute"})
+    void missingRuntimeDependenciesReturnControlledFailuresAndReleaseResources(String phase) throws Exception {
+        Path compileOnly = Files.createDirectory(temporary.resolve("compile-only"));
+        Path directory = Files.createDirectory(temporary.resolve("runtime"));
+        Path library = compileJar(compileOnly, """
+                package example;
+                public class MissingLibrary {
+                    public static String name() { return "external.missing"; }
+                    public static int value() { return 42; }
+                }
+                """);
+        Path jar = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.*;
+                import java.util.Map;
+                public class ExamplePlugin implements CommandPlugin {
+                    public String instruction() { %s }
+                    public void start(PluginContext context) { %s }
+                    public Object execute(Map<String,Object> parameters) { %s }
+                }
+                """.formatted(phase.equals("instruction") ? "return MissingLibrary.name();" : "return \"external.missing\";",
+                phase.equals("startup") ? "MissingLibrary.value();" : "",
+                phase.equals("execute") ? "return MissingLibrary.value();" : "return 1;"),
+                List.of(library), "dev.mars.plugin.CommandPlugin");
+        int main;
+        int admin;
+        try (var a = new java.net.ServerSocket(0); var b = new java.net.ServerSocket(0)) {
+            main = a.getLocalPort(); admin = b.getLocalPort();
+        }
+        var options = new ServerOptions("Server-001", main, admin, directory);
+        if (phase.equals("execute")) {
+            try (var server = ServerInstance.start(options)) {
+                var client = new TextMessageClient("localhost", server.getPort(), "Server-001");
+                var failure = assertThrows(CommandExecutionException.class, () -> client.execute("external.missing", Map.of()));
+                assertEquals(PLUGIN_ERROR, failure.reply().error().code());
+                assertTrue(failure.reply().error().message().contains("NoClassDefFoundError"));
+                assertEquals("Received: healthy", client.send("healthy").text());
+            }
+        } else {
+            var failure = assertThrows(IOException.class, () -> ServerInstance.start(options));
+            assertInstanceOf(NoClassDefFoundError.class, failure.getCause());
+        }
+        try (var a = new java.net.ServerSocket(main); var b = new java.net.ServerSocket(admin)) {
+            assertEquals(main, a.getLocalPort()); assertEquals(admin, b.getLocalPort());
+        }
+        Files.delete(jar);
+    }
+
+    @Test
+    void ignoresNonJarFilesAndNestedJarsButAcceptsUppercaseJarExtension() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Files.writeString(directory.resolve("notes.txt"), "Not an archive");
+        Files.createDirectory(directory.resolve("ignored.jar"));
+        Path nested = Files.createDirectory(directory.resolve("nested"));
+        Path nestedJar = providerJar(nested, "external.nested", "return 1;");
+        Path top = providerJar(directory, "external.top", "return 2;");
+        Path uppercase = Files.move(top, directory.resolve("PLUGIN.JAR"));
+        try (var registry = PluginRegistry.load(directory)) {
+            assertTrue(registry.instructions().contains("external.top"));
+            assertFalse(registry.instructions().contains("external.nested"));
+        }
+        Files.delete(uppercase); Files.delete(nestedJar);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"comments-and-duplicates", "empty", "invalid-class-name"})
+    void handlesServiceDescriptorEdgeCases(String scenario) throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = compileJar(directory, """
+                package example;
+                import dev.mars.plugin.CommandPlugin;
+                public class ExamplePlugin implements CommandPlugin {
+                    private static int instances;
+                    public ExamplePlugin() { if (++instances != 1) throw new IllegalStateException("Constructed twice"); }
+                    public String instruction() { return "external.descriptor"; }
+                }
+                """, "dev.mars.plugin.CommandPlugin");
+        String descriptor = switch (scenario) {
+            case "comments-and-duplicates" -> "# Providers\n example.ExamplePlugin # Plugin\n\nexample.ExamplePlugin\n";
+            case "empty" -> "# No external providers\n\n";
+            default -> "invalid provider name\n";
+        };
+        rewriteDescriptor(jar, descriptor);
+        if (scenario.equals("invalid-class-name")) {
+            assertThrows(IOException.class, () -> PluginRegistry.load(directory));
+        } else {
+            try (var registry = PluginRegistry.load(directory)) {
+                assertEquals(!scenario.equals("empty"), registry.instructions().contains("external.descriptor"));
+            }
+        }
+        Files.delete(jar);
+    }
+
+    private void rewriteDescriptor(Path jar, String descriptor) throws IOException {
+        var entries = new java.util.LinkedHashMap<String, byte[]>();
+        try (var input = new java.util.jar.JarFile(jar.toFile())) {
+            for (var entry : input.stream().toList()) {
+                try (var content = input.getInputStream(entry)) { entries.put(entry.getName(), content.readAllBytes()); }
+            }
+        }
+        entries.put("META-INF/services/dev.mars.plugin.CommandPlugin", descriptor.getBytes(StandardCharsets.UTF_8));
+        try (var output = new JarOutputStream(Files.newOutputStream(jar))) {
+            for (var entry : entries.entrySet()) {
+                output.putNextEntry(new JarEntry(entry.getKey())); output.write(entry.getValue()); output.closeEntry();
+            }
+        }
+    }
+
     private Path compileJar(Path directory, String content, List<Path> dependencies, String... services) throws Exception {
-        var match = java.util.regex.Pattern.compile("public class ([A-Za-z0-9_]+)").matcher(content);
+        var match = java.util.regex.Pattern.compile("public (?:abstract )?class ([A-Za-z0-9_]+)").matcher(content);
         assertTrue(match.find(), "Fixture must declare a public class");
         String name = match.group(1);
         Path source = temporary.resolve(name + ".java");

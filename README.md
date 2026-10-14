@@ -487,9 +487,14 @@ the server API dependency has Maven scope `provided` and is supplied by the host
 The example JAR contains its provider class and service registration, without
 bundling the server classes.
 
-The example's `mvn verify` runs a packaged-JAR integration test in a separate
-server JVM, verifies parameter errors and the result `42`, and prints
-`Standalone plugin JAR test PASSED`. Its reports are under
+The example's `mvn verify` checks the packaged plugin and server JARs, then uses
+separate server JVMs whose classpaths exclude the example classes. It verifies
+that `math.multiply` is unavailable without a runtime plugin folder and loads
+from either of two supplied folders, including paths with spaces. Real TCP
+requests check integer, decimal, large-number, negative, and zero results;
+invalid parameters return correlated errors, and valid commands still work
+afterward. Replies are checked for message ID, server ID, status, and connection
+ID. Verified results print `Standalone plugin JAR test PASSED`. Reports are under
 `plugins/multiply-plugin/target/failsafe-reports/`. Root `mvn test` runs the server
 tests; use the separate example command above to test this standalone artifact.
 Reinstall the server after API changes and rebuild the example after changes to
@@ -785,6 +790,17 @@ with instruction names and verified results. The test fixtures (`math.add`,
 `text.concat`) and production `echo` plugin print their inputs and result from both `Server-001` and
 `Server-002`. The concurrency test sends 100 `math.add` calls, so its request logs
 are more numerous. External plugin tests require a full JDK for Java compilation.
+
+Regression cases verify that production launches exclude test fixtures, and that
+fixture commands become available only when explicitly packaged and registered
+in an external JAR. They also cover malformed/empty/commented service descriptors,
+duplicate provider entries, constructor and initializer failures, invalid provider
+types, missing runtime dependencies during discovery/startup/execution, recovery
+after replacing a bad JAR, uppercase JAR extensions, ignored files and nested
+folders, concurrent startup attempts, independent plugin state across server
+instances, context-class-loader restoration, and usable parameter-error replies.
+The standalone plugin integration test also checks that the packaged host JAR
+contains neither test fixture classes nor the old math/text built-in classes.
 
 To see the two test fixtures and `echo` with their results from both servers:
 

@@ -38,7 +38,9 @@ class StartupPluginTest {
     void callsOptedInCommandInstanceOnceWithResolvedContextAndCorrectLoader() throws Exception {
         var plugin = new BothCapabilities();
         var context = new PluginContext("Server-001", 9010, 9011);
-        ClassLoader previous = Thread.currentThread().getContextClassLoader();
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        ClassLoader previous = new ClassLoader(original) { };
+        Thread.currentThread().setContextClassLoader(previous);
         try (var registry = PluginRegistry.of(List.of(plugin))) {
             registry.start(context);
             assertEquals(1, plugin.calls);
@@ -47,12 +49,41 @@ class StartupPluginTest {
             assertThrows(IOException.class, () -> registry.start(context));
             var reply = registry.dispatch(new CommandRequest(1, UUID.randomUUID(), "test.startup", Map.of()), "Server-001", 1);
             assertEquals("ready", reply.result());
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
+        }
+    }
+
+    @Test
+    void concurrentStartupAttemptsInvokeHookExactlyOnce() throws Exception {
+        var calls = new java.util.concurrent.atomic.AtomicInteger();
+        var go = new java.util.concurrent.CountDownLatch(1);
+        var plugin = new CommandPlugin() {
+            @Override public void start(PluginContext context) { calls.incrementAndGet(); }
+        };
+        try (var registry = PluginRegistry.of(List.of(plugin));
+             var starters = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            var tasks = new java.util.ArrayList<java.util.concurrent.Future<Boolean>>();
+            for (int i = 0; i < 2; i++) {
+                tasks.add(starters.submit(() -> {
+                    assertTrue(go.await(3, java.util.concurrent.TimeUnit.SECONDS));
+                    try { registry.start(new PluginContext("Server-001", 9010, 9011)); return true; }
+                    catch (IOException expected) { return false; }
+                }));
+            }
+            go.countDown();
+            int successes = 0;
+            for (var task : tasks) { if (task.get(3, java.util.concurrent.TimeUnit.SECONDS)) { successes++; } }
+            assertEquals(1, successes);
+            assertEquals(1, calls.get());
         }
     }
 
     @Test
     void failedHookRestoresLoaderAndIsNotRetried() throws Exception {
-        ClassLoader previous = Thread.currentThread().getContextClassLoader();
+        ClassLoader original = Thread.currentThread().getContextClassLoader();
+        ClassLoader previous = new ClassLoader(original) { };
+        Thread.currentThread().setContextClassLoader(previous);
         var plugin = new CommandPlugin() {
             @Override public void start(PluginContext context) throws IOException { throw new IOException("Failed hook"); }
         };
@@ -62,11 +93,13 @@ class StartupPluginTest {
             assertTrue(error.getMessage().contains("Failed hook"));
             assertSame(previous, Thread.currentThread().getContextClassLoader());
             assertThrows(IOException.class, () -> registry.start(context));
+        } finally {
+            Thread.currentThread().setContextClassLoader(original);
         }
     }
 
     @Test
-    void commandPluginsWithoutStartupCapabilityRemainUsable() throws Exception {
+    void commandPluginsInheritOptionalNoOpStartupAndRemainUsable() throws Exception {
         try (var registry = PluginRegistry.of(List.of(new dev.mars.plugin.fixtures.MathAddPlugin()))) {
             registry.start(new PluginContext("Server-001", 9010, 9011));
             var reply = registry.dispatch(new CommandRequest(1, UUID.randomUUID(), "math.add", Map.of("a", 10, "b", 20)),

@@ -30,6 +30,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -41,23 +42,67 @@ import static org.junit.jupiter.api.Assertions.*;
 class StartStopTest {
     @Test
     void productionClasspathExcludesMathAndTextTestFixtures() throws Exception {
+        String production = productionClasspath();
+        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
+                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
+                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\n"
+                + "send Still healthy\nquit\n", production);
+        assertEquals(0, result.exitCode(), result.output());
+        assertCommandReplies(result, "Server-001",
+                "error=UNKNOWN_INSTRUCTION: Unknown instruction: math.add",
+                "error=UNKNOWN_INSTRUCTION: Unknown instruction: text.concat",
+                "result=\"Received: Still healthy\"");
+        assertReleased(result);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void productionLoadsFixtureCommandsOnlyWhenExplicitlyRegisteredInExternalJar(
+            boolean registered, @TempDir Path directory) throws Exception {
+        Path jar = directory.resolve("test-commands.jar");
+        var fixtures = java.util.List.of(dev.mars.plugin.fixtures.MathAddPlugin.class,
+                dev.mars.plugin.fixtures.TextConcatPlugin.class);
+        try (var output = new java.util.jar.JarOutputStream(Files.newOutputStream(jar))) {
+            for (Class<?> fixture : fixtures) {
+                String resource = fixture.getName().replace('.', '/') + ".class";
+                output.putNextEntry(new java.util.jar.JarEntry(resource));
+                try (var content = fixture.getResourceAsStream("/" + resource)) {
+                    assertNotNull(content);
+                    content.transferTo(output);
+                }
+                output.closeEntry();
+            }
+            if (registered) {
+                output.putNextEntry(new java.util.jar.JarEntry("META-INF/services/dev.mars.plugin.CommandPlugin"));
+                for (Class<?> fixture : fixtures) { output.write((fixture.getName() + "\n").getBytes(StandardCharsets.UTF_8)); }
+                output.closeEntry();
+            }
+        }
+        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
+                        "--plugins-dir", directory.toString()},
+                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
+                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\nquit\n",
+                productionClasspath());
+        assertEquals(0, result.exitCode(), result.output());
+        if (registered) {
+            assertCommandReplies(result, "Server-001", "result=30", "result=\"Hello world\"");
+        } else {
+            assertCommandReplies(result, "Server-001",
+                    "error=UNKNOWN_INSTRUCTION: Unknown instruction: math.add",
+                    "error=UNKNOWN_INSTRUCTION: Unknown instruction: text.concat");
+        }
+        assertReleased(result);
+        Files.delete(jar);
+    }
+
+    private String productionClasspath() throws Exception {
         var types = java.util.List.of(StartStop.class, com.fasterxml.jackson.databind.ObjectMapper.class,
                 com.fasterxml.jackson.core.JsonFactory.class, com.fasterxml.jackson.annotation.JsonProperty.class);
         var paths = new java.util.ArrayList<String>();
         for (Class<?> type : types) {
             paths.add(Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toString());
         }
-        String production = String.join(java.io.File.pathSeparator, paths);
-        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
-                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
-                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\n"
-                + "send Still healthy\nquit\n", production);
-        assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("instructions=[echo]"), result.output());
-        assertTrue(result.output().contains("Unknown instruction: math.add"), result.output());
-        assertTrue(result.output().contains("Unknown instruction: text.concat"), result.output());
-        assertTrue(result.output().contains("result=\"Received: Still healthy\""), result.output());
-        assertReleased(result);
+        return String.join(java.io.File.pathSeparator, paths);
     }
 
     @Test
@@ -67,7 +112,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
                 "--plugins-dir", first.toString(), "--plugins-dir", second.toString()}, "send Hello\nquit\n");
         assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("result=\"Received: Hello\""), result.output());
+        assertCommandReplies(result, "Server-001", "result=\"Received: Hello\"");
         assertReleased(result);
     }
 
@@ -75,10 +120,11 @@ class StartStopTest {
     void consoleExecutesJsonCommandsAndContinuesAfterPluginError() throws Exception {
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
                 "send {\"instruction\":\"unknown\",\"parameters\":{}}\n"
-                + "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\nquit\n");
+                + "send {\"instruction\":\"echo\",\"parameters\":{\"text\":\"still healthy\"}}\nquit\n",
+                productionClasspath());
         assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("UNKNOWN_INSTRUCTION"), result.output());
-        assertTrue(result.output().contains("status=OK | result=30"), result.output());
+        assertCommandReplies(result, "Server-001", "error=UNKNOWN_INSTRUCTION: Unknown instruction: unknown",
+                "result=\"Received: still healthy\"");
         assertReleased(result);
     }
 
@@ -87,9 +133,10 @@ class StartStopTest {
         try (var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0))) {
             var result = run("dev.mars.client.TextMessageClient", new String[]{"--port", "" + instance.getPort(),
                     "--expected-server-id", "Server-001",
-                    "{\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"hello \",\"b\":\"world\"}}"}, "");
+                    "{\"instruction\":\"echo\",\"parameters\":{\"text\":\"hello world\"}}"}, "",
+                    productionClasspath());
             assertEquals(0, result.exitCode(), result.output());
-            assertTrue(result.output().contains("status=OK | result=\"hello world\""), result.output());
+            assertCommandReplies(result, "Server-001", "result=\"Received: hello world\"");
         }
     }
 
@@ -99,8 +146,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"CLI-001", "--port", "0", "--admin-port", "0"},
                 "send Hello CLI\nstatus\n" + exitCommands);
         assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("serverId=CLI-001"), result.output());
-        assertTrue(result.output().contains("result=\"Received: Hello CLI\""), result.output());
+        assertCommandReplies(result, "CLI-001", "result=\"Received: Hello CLI\"");
         assertTrue(result.output().contains("Server status: ALIVE"), result.output());
         assertFalse(result.output().contains("Error connecting"), result.output());
         assertReleased(result);
@@ -118,7 +164,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"CLI-001", "--port", "" + main,
                 "--admin-port", "" + admin}, "send Explicit ports\nstatus\nquit\n");
         assertEquals(0, result.exitCode(), result.output());
-        assertTrue(result.output().contains("result=\"Received: Explicit ports\""), result.output());
+        assertCommandReplies(result, "CLI-001", "result=\"Received: Explicit ports\"");
         assertTrue(result.output().contains("Server status: ALIVE"), result.output());
         int[] actual = ports(result);
         if (main != 0) { assertEquals(main, actual[0]); }
@@ -141,7 +187,7 @@ class StartStopTest {
         var match = Pattern.compile("Server ready \\| serverId=([^ ]+)").matcher(result.output());
         assertTrue(match.find(), result.output());
         assertDoesNotThrow(() -> UUID.fromString(match.group(1)));
-        assertTrue(result.output().contains("result=\"Received: Hello\""), result.output());
+        assertCommandReplies(result, match.group(1), "result=\"Received: Hello\"");
         assertReleased(result);
     }
 
@@ -185,8 +231,7 @@ class StartStopTest {
                     "" + instance.getPort(), "--expected-server-id", expected, "Hello from CLI"}, "");
             if (expected.equals("Target-001")) {
                 assertEquals(0, result.exitCode(), result.output());
-                assertTrue(result.output().contains("serverId=Target-001"), result.output());
-                assertTrue(result.output().contains("result=\"Received: Hello from CLI\""), result.output());
+                assertCommandReplies(result, "Target-001", "result=\"Received: Hello from CLI\"");
             } else {
                 assertNotEquals(0, result.exitCode(), result.output());
                 assertTrue(result.output().contains("Server ID mismatch"), result.output());
@@ -227,6 +272,29 @@ class StartStopTest {
         var match = Pattern.compile("main=localhost:(\\d+) \\| admin=localhost:(\\d+)").matcher(result.output());
         assertTrue(match.find(), result.output());
         return new int[]{Integer.parseInt(match.group(1)), Integer.parseInt(match.group(2))};
+    }
+
+    private void assertCommandReplies(Result result, String serverId, String... outcomes) {
+        var sending = Pattern.compile("Sending: messageId=([^ ]+) \\| text=").matcher(result.output());
+        var ids = new ArrayList<UUID>();
+        while (sending.find()) { ids.add(UUID.fromString(sending.group(1))); }
+        assertEquals(outcomes.length, ids.size(), result.output());
+        assertEquals(ids.size(), new HashSet<>(ids).size(), "Each command must use a unique message ID");
+        var reply = Pattern.compile("(?:Server response: |Error sending message: Server rejected message: )"
+                + "messageId=([^ ]+) \\| serverId=([^ ]+) \\| connectionId=(\\d+) \\| status=(OK|ERROR) \\| ([^\\r\\n]+)")
+                .matcher(result.output());
+        var connections = new HashSet<Long>();
+        for (int i = 0; i < outcomes.length; i++) {
+            assertTrue(reply.find(), result.output());
+            assertEquals(ids.get(i), UUID.fromString(reply.group(1)), result.output());
+            assertEquals(serverId, reply.group(2), result.output());
+            long connection = Long.parseLong(reply.group(3));
+            assertTrue(connection > 0, result.output());
+            assertTrue(connections.add(connection), "Each connection must have its own ID");
+            assertEquals(outcomes[i].startsWith("result=") ? "OK" : "ERROR", reply.group(4), result.output());
+            assertEquals(outcomes[i], reply.group(5), result.output());
+        }
+        assertFalse(reply.find(), "Unexpected extra command reply:\n" + result.output());
     }
 
     private void assertReleased(Result result) throws IOException {

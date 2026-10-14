@@ -44,7 +44,7 @@ import static org.junit.jupiter.api.Assertions.*;
 @Timeout(30)
 class PluginExecutionTest {
     @ParameterizedTest(name = "{0} returns correlated results from two servers")
-    @MethodSource("builtinCommands")
+    @MethodSource("testCommands")
     void commandsReturnResultsAndCorrelatedIdsFromEachServer(String instruction,
             Map<String, Object> parameters, Object expectedResult) throws Exception {
         try (var first = ServerInstance.start(new ServerOptions("Server-001", 0, 0));
@@ -53,6 +53,8 @@ class PluginExecutionTest {
             for (var server : new ServerInstance[]{first, second}) {
                 var client = new TextMessageClient("localhost", server.getPort(), server.getServerId());
                 var reply = client.execute(id, instruction, parameters);
+                assertEquals("OK", reply.status());
+                assertNull(reply.error());
                 assertEquals(expectedResult, reply.result());
                 assertEquals(id, reply.messageId());
                 assertEquals(server.getServerId(), reply.serverId());
@@ -63,7 +65,7 @@ class PluginExecutionTest {
         }
     }
 
-    static Stream<Arguments> builtinCommands() {
+    static Stream<Arguments> testCommands() {
         return Stream.of(
                 Arguments.of("math.add", Map.of("a", 10, "b", 20), BigInteger.valueOf(30)),
                 Arguments.of("text.concat", Map.of("a", "你好\n", "b", "world 🌍"), "你好\nworld 🌍"),

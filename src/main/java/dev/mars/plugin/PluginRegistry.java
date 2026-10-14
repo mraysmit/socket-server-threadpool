@@ -107,7 +107,7 @@ public final class PluginRegistry implements AutoCloseable {
             var registry = new PluginRegistry(ServiceLoader.load(CommandPlugin.class, discovery), loader);
             if (registry.loadedPlugins.isEmpty()) { throw new IllegalArgumentException("No plugins discovered"); }
             return registry;
-        } catch (IOException | RuntimeException | ServiceConfigurationError e) {
+        } catch (IOException | RuntimeException | ServiceConfigurationError | LinkageError e) {
             if (loader != null) {
                 try { loader.close(); } catch (IOException cleanup) { e.addSuppressed(cleanup); }
             }
@@ -128,7 +128,7 @@ public final class PluginRegistry implements AutoCloseable {
             try {
                 thread.setContextClassLoader(plugin.getClass().getClassLoader());
                 plugin.start(context);
-            } catch (Exception e) {
+            } catch (Exception | LinkageError e) {
                 throw new IOException("Cannot start plugin " + plugin.getClass().getName() + ": " + e.getMessage(), e);
             } finally {
                 thread.setContextClassLoader(previous);
@@ -149,8 +149,10 @@ public final class PluginRegistry implements AutoCloseable {
             Object result = Json.normalizeResult(plugin.execute(request.parameters()));
             return CommandReply.success(request, serverId, connectionId, result);
         } catch (InvalidParametersException e) {
-            return CommandReply.failure(request.messageId(), serverId, connectionId, INVALID_PARAMETERS, e.getMessage());
-        } catch (Exception e) {
+            String message = e.getMessage();
+            if (message == null || message.isBlank()) { message = "Invalid parameters for instruction: " + request.instruction(); }
+            return CommandReply.failure(request.messageId(), serverId, connectionId, INVALID_PARAMETERS, message);
+        } catch (Exception | LinkageError e) {
             return CommandReply.failure(request.messageId(), serverId, connectionId, PLUGIN_ERROR,
                     "Plugin '" + request.instruction() + "' failed: " + e.getClass().getSimpleName());
         } finally {
