@@ -22,6 +22,9 @@ public interface CommandPlugin {
     /** Optional initialization after both TCP ports bind. */
     default void start(PluginContext context) throws Exception { }
 
+    /** Optional shutdown: stop background work, retaining state needed by accepted commands. */
+    default void stop() throws Exception { }
+
     /** A null instruction identifies a startup-only provider. */
     default String instruction() { return null; }
 
