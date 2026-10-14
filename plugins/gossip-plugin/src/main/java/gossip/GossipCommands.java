@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.plugin.InvalidParametersException;
 import dev.mars.plugin.PluginParameters;
@@ -26,26 +26,29 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Socket command handlers only validate, merge, and build local bounded replies. Never dial peers here. */
+/** Handlers validate, merge, inspect, or request asynchronous departure. Never dial peers here. */
 final class GossipCommands {
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
     private final GossipMetrics metrics;
     private final GossipTransport transport;
+    private final GossipRuntime runtime;
     private final GossipBatchSelector responses = new GossipBatchSelector();
 
-    GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport) {
+    GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport, GossipRuntime runtime) {
         this.config = config;
         this.table = table;
         this.metrics = metrics;
         this.transport = transport;
+        this.runtime = runtime;
         wire = new GossipWire(config);
         var snapshot = table.snapshot();
+        wire.requireForwardable(snapshot.self(), List.of(snapshot.self()));
         wire.requireReplyFits(snapshot.self().key().serverId(), wire.result(snapshot.self(), List.of()));
         wire.requireReplyFits(snapshot.self().key().serverId(), status(false));
         wire.requireReplyFits(snapshot.self().key().serverId(), pageResult(snapshot,
-                List.of(memberView(snapshot.members().getFirst())), null));
+                List.of(GossipWire.memberView(snapshot.members().getFirst())), null));
     }
 
     Object execute(Map<String, Object> parameters, boolean stopped) throws InvalidParametersException {
@@ -54,13 +57,19 @@ final class GossipCommands {
             return switch (operation) {
                 case "exchange" -> exchange(parameters);
                 case "members" -> members(parameters);
+                case "leave" -> {
+                    PluginParameters.requireKeys(parameters, "operation");
+                    var result = Map.of("departure", runtime.leave());
+                    wire.requireReplyFits(table.snapshot().self().key().serverId(), result);
+                    yield result;
+                }
                 case "status" -> {
                     PluginParameters.requireKeys(parameters, "operation");
                     var result = status(stopped);
                     wire.requireReplyFits(table.snapshot().self().key().serverId(), result);
                     yield result;
                 }
-                default -> throw new InvalidParametersException("Supported operations: exchange, members, status; leave is not implemented");
+                default -> throw new InvalidParametersException("Supported operations: exchange, members, status, leave");
             };
         } catch (MembershipException e) {
             if (operation.equals("exchange")) { metrics.rejectedExchanges.incrementAndGet(); }
@@ -70,7 +79,11 @@ final class GossipCommands {
 
     private Object exchange(Map<String, Object> parameters) {
         var incoming = wire.decode(parameters, true);
-        wire.requireForwardable(table.snapshot().self(), incoming.records());
+        var self = table.snapshot().self();
+        if (incoming.sender().key().equals(self.key())) {
+            throw new MembershipException(MembershipException.Reason.CONFLICT, "Exchange sender must not be the local process");
+        }
+        wire.requireForwardable(self, incoming.records());
         table.merge(incoming.records());
         var snapshot = table.snapshot();
         var batch = responses.select(snapshot, config.maxBatchMembers(), members ->
@@ -90,7 +103,7 @@ final class GossipCommands {
         int position = parameters.containsKey("cursor") ? decodeCursor(parameters.get("cursor"), snapshot.self().key()) : 0;
         var selected = new ArrayList<Map<String, Object>>();
         while (position < snapshot.members().size() && selected.size() < limit) {
-            selected.add(memberView(snapshot.members().get(position)));
+            selected.add(GossipWire.memberView(snapshot.members().get(position)));
             int next = position + 1;
             String cursor = next < snapshot.members().size() ? encodeCursor(snapshot.self().key(), next) : null;
             if (!wire.replyFits(snapshot.self().key().serverId(), pageResult(snapshot, selected, cursor))) {
@@ -107,13 +120,7 @@ final class GossipCommands {
     }
 
     private Map<String, Object> pageResult(MembershipTable.Snapshot snapshot, List<Map<String, Object>> selected, String cursor) {
-        var result = new LinkedHashMap<String, Object>();
-        result.put("swarmId", config.swarmId());
-        result.put("self", snapshot.self().toWire());
-        result.put("members", List.copyOf(selected));
-        result.put("nextCursor", cursor);
-        result.put("capacity", capacity(snapshot));
-        return result;
+        return wire.page(snapshot.self(), selected, cursor, capacity(snapshot));
     }
 
     private Map<String, Object> status(boolean stopped) {
@@ -125,31 +132,23 @@ final class GossipCommands {
         result.put("gossipVersion", 1);
         result.put("swarmId", config.swarmId());
         result.put("self", snapshot.self().toWire());
-        result.put("workerState", stopped ? "STOPPED" : "NOT_SCHEDULED");
+        result.put("workerState", stopped ? metrics.workerState.equals("CLEANUP_FAILED") ? "CLEANUP_FAILED" : "STOPPED" : metrics.workerState);
         result.put("isolated", metrics.isolated());
-        result.put("implementationStage", "command-transport");
-        result.put("supportedOperations", List.of("exchange", "members", "status"));
+        result.put("implementationStage", "departure-runtime");
+        result.put("supportedOperations", List.of("exchange", "members", "status", "leave"));
+        result.put("departure", runtime.departure());
         result.put("exchanges", metrics.counts(transport.inflight()));
         result.put("lastSuccessfulExchangeAgeMillis", metrics.lastSuccessAgeMillis());
         result.put("capacity", capacity(snapshot));
         result.put("assessments", assessments);
         result.put("identityConflictCount", snapshot.identityConflicts().size());
+        result.put("runtime", metrics.runtime());
         return result;
     }
 
     private static Map<String, Object> capacity(MembershipTable.Snapshot snapshot) {
         return Map.of("activeMembers", snapshot.activeMembers(), "retainedIdentities", snapshot.retainedIdentities(),
                 "tombstones", snapshot.tombstones());
-    }
-
-    private static Map<String, Object> memberView(MembershipTable.MemberView member) {
-        var result = new LinkedHashMap<>(member.record().toWire());
-        result.put("assessment", member.assessment().name());
-        result.put("advanceAgeMillis", member.advanceAgeNanos() / 1_000_000);
-        result.put("directSuccessAgeMillis", member.directSuccessAgeNanos() == null ? null : member.directSuccessAgeNanos() / 1_000_000);
-        result.put("endpointVerified", member.endpointVerified());
-        result.put("identityConflict", member.identityConflict());
-        return result;
     }
 
     private static String encodeCursor(MemberKey self, int next) {

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.client.CommandExecutionException;
 import dev.mars.protocol.CommandProtocol;
@@ -41,7 +41,10 @@ import java.util.UUID;
 import java.util.concurrent.Semaphore;
 
 /** One bounded UTF-8 JSON exchange per owned connection, with no transport-created threads. */
-public final class GossipTransport implements AutoCloseable {
+public final class GossipTransport implements GossipRuntime.ExchangeClient {
+    static final class BusyException extends IOException {
+        BusyException() { super("Gossip outbound capacity is full"); }
+    }
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -81,7 +84,7 @@ public final class GossipTransport implements AutoCloseable {
 
     public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
         synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed"); } }
-        if (!permits.tryAcquire()) { throw new IOException("Gossip outbound capacity is full"); }
+        if (!permits.tryAcquire()) { throw new BusyException(); }
         try {
             var snapshot = table.snapshot();
             if (peer.serverId().equals(snapshot.self().key().serverId())
@@ -205,7 +208,7 @@ public final class GossipTransport implements AutoCloseable {
         return nanos;
     }
 
-    public synchronized int inflight() { return active.size(); }
+    public int inflight() { return config.maxInflight() - permits.availablePermits(); }
 
     /** Close owned I/O resources synchronously; callers own their threads, and DNS may still be running. */
     @Override public void close() throws IOException {

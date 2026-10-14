@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.plugin.InvalidParametersException;
 import dev.mars.plugin.PluginContext;
@@ -28,8 +28,8 @@ import static org.junit.jupiter.api.Assertions.*;
 class GossipPluginTest {
     @Test void isolatesBootIdentitiesAndRetainsStatusAfterIdempotentStop() throws Exception {
         var config = GossipConfig.fromProperties(GossipConfigTest.minimal(), "Self");
-        var first = new GossipPlugin(config);
-        var second = new GossipPlugin(config);
+        var first = new GossipPlugin(config, false);
+        var second = new GossipPlugin(config, false);
         var context = new PluginContext("Self", 9000, 9001);
         first.start(context);
         second.start(context);
@@ -40,30 +40,30 @@ class GossipPluginTest {
         assertEquals(9000, firstSelf.get("port"));
         UUID.fromString((String) firstSelf.get("bootId"));
         assertNotEquals(firstSelf.get("bootId"), ((Map<?, ?>) status(second).get("self")).get("bootId"));
-        assertEquals(List.of("exchange", "members", "status"), firstStatus.get("supportedOperations"));
-        assertEquals("command-transport", firstStatus.get("implementationStage"));
+        assertEquals(List.of("exchange", "members", "status", "leave"), firstStatus.get("supportedOperations"));
+        assertEquals("departure-runtime", firstStatus.get("implementationStage"));
         first.stop();
         first.stop();
         assertEquals(firstSelf, status(first).get("self"));
         assertEquals("STOPPED", status(first).get("workerState"));
-        assertEquals("NOT_SCHEDULED", status(second).get("workerState"));
+        assertEquals("MANUAL", status(second).get("workerState"));
         assertThrows(IllegalStateException.class, () -> first.start(context));
         second.stop();
     }
 
     @Test void rejectsUnavailableOperationsAndMalformedParametersWithoutBreakingStatus() throws Exception {
-        var plugin = new GossipPlugin(GossipConfig.fromProperties(GossipConfigTest.minimal(), "Self"));
+        var plugin = new GossipPlugin(GossipConfig.fromProperties(GossipConfigTest.minimal(), "Self"), false);
         assertThrows(IllegalStateException.class, () -> status(plugin));
         plugin.start(new PluginContext("Self", 9000, 9001));
         try {
-            for (String operation : List.of("exchange", "leave", "unknown")) {
+            for (String operation : List.of("exchange", "unknown")) {
                 assertThrows(InvalidParametersException.class, () -> plugin.execute(Map.of("operation", operation)));
             }
             assertThrows(InvalidParametersException.class, () -> plugin.execute(Map.of()));
             assertThrows(InvalidParametersException.class, () -> plugin.execute(Map.of("operation", 1)));
             assertThrows(InvalidParametersException.class,
                     () -> plugin.execute(Map.of("operation", "status", "extra", true)));
-            assertEquals("NOT_SCHEDULED", status(plugin).get("workerState"));
+            assertEquals("MANUAL", status(plugin).get("workerState"));
         } finally { plugin.stop(); }
     }
 

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.protocol.Json;
 
@@ -32,7 +32,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 
-import static example.gossip.MembershipException.Reason.INVALID_RECORD;
+import static gossip.MembershipException.Reason.INVALID_RECORD;
 
 /** Owner-published data, with deeply immutable JSON metadata and exact integral fields. */
 public record MemberRecord(MemberKey key, String host, int port, long heartbeat, State state,

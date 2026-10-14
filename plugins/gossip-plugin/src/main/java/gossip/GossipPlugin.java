@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.plugin.CommandPlugin;
 import dev.mars.plugin.InvalidParametersException;
@@ -24,18 +24,25 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Local command handlers and explicitly initiated peer exchanges; scheduling is not implemented yet. */
+/** One membership table, bounded peer transport, and scheduled seed-based runtime per provider instance. */
 public final class GossipPlugin implements CommandPlugin {
     private final GossipConfig suppliedConfig;
+    private final boolean schedule;
     private volatile Started started;
     private boolean startupAttempted;
     private volatile boolean stopped;
 
     /** ServiceLoader constructor; configuration is read when this instance starts. */
-    public GossipPlugin() { suppliedConfig = null; }
+    public GossipPlugin() { suppliedConfig = null; schedule = true; }
 
     /** Explicit per-instance configuration for embedded applications and tests. */
-    public GossipPlugin(GossipConfig config) { suppliedConfig = Objects.requireNonNull(config, "config"); }
+    public GossipPlugin(GossipConfig config) { this(config, true); }
+
+    /** Command/transport tests can control exchanges without introducing timer races. */
+    GossipPlugin(GossipConfig config, boolean schedule) {
+        suppliedConfig = Objects.requireNonNull(config, "config");
+        this.schedule = schedule;
+    }
 
     @Override public String instruction() { return "gossip"; }
 
@@ -50,20 +57,31 @@ public final class GossipPlugin implements CommandPlugin {
         var table = new MembershipTable(config, self);
         var metrics = new GossipMetrics();
         var transport = new GossipTransport(config, table, metrics);
-        try { started = new Started(transport, new GossipCommands(config, table, metrics, transport)); }
-        catch (RuntimeException e) { transport.close(); throw e; }
+        GossipRuntime runtime = null;
+        try {
+            runtime = new GossipRuntime(config, table, transport, metrics);
+            var commands = new GossipCommands(config, table, metrics, transport, runtime);
+            started = new Started(transport, commands, runtime);
+            if (schedule) { runtime.start(); }
+            else { metrics.workerState = "MANUAL"; }
+        } catch (IOException | RuntimeException | Error e) {
+            try { if (runtime == null) { transport.close(); } else { runtime.close(); } }
+            catch (IOException cleanup) { e.addSuppressed(cleanup); }
+            throw e;
+        }
     }
 
-    /** Cancel outbound I/O and retain the membership table for accepted handlers. */
+    /** Cancel owned rounds, departure, DNS/TCP work, and retain the table for accepted handlers. */
     @Override public synchronized void stop() throws IOException {
         stopped = true;
-        if (started != null) { started.transport().close(); }
+        if (started != null) { started.runtime().close(); }
     }
 
-    /** For embedded callers and the future scheduler. Never invoked by an incoming command handler. */
+    /** For embedded callers. Never invoked by an incoming command handler. */
     public GossipWire.Exchange exchangeWith(GossipConfig.Seed peer) throws IOException {
         Started local = started;
         if (local == null) { throw new IOException("Gossip plugin has not started successfully"); }
+        local.runtime().requireActiveExchange();
         return local.transport().exchange(peer);
     }
 
@@ -73,5 +91,5 @@ public final class GossipPlugin implements CommandPlugin {
         return local.commands().execute(parameters, stopped);
     }
 
-    private record Started(GossipTransport transport, GossipCommands commands) { }
+    private record Started(GossipTransport transport, GossipCommands commands, GossipRuntime runtime) { }
 }

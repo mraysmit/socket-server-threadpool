@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -134,5 +134,13 @@ class GossipConfigTest {
 
     @Test void rejectsMissingFile() {
         assertThrows(java.io.IOException.class, () -> GossipConfig.load(temporary.resolve("missing"), "Self"));
+    }
+
+    @Test void seedConfigurationCannotExceedTheCandidateCapacity() {
+        var properties = minimal();
+        properties.setProperty("max.members", "2");
+        properties.setProperty("seeds", "A@localhost:9000,B@localhost:9010,C@localhost:9020");
+        assertTrue(assertThrows(IllegalArgumentException.class,
+                () -> GossipConfig.fromProperties(properties, "Self")).getMessage().contains("seeds"));
     }
 }

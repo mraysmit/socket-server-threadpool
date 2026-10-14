@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -32,8 +32,8 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
 
-import static example.gossip.MembershipException.Reason.*;
-import static example.gossip.MembershipTable.Assessment.*;
+import static gossip.MembershipException.Reason.*;
+import static gossip.MembershipTable.Assessment.*;
 import static org.junit.jupiter.api.Assertions.*;
 
 class MembershipTableTest {

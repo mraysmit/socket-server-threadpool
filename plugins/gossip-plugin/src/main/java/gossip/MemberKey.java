@@ -13,11 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import java.util.UUID;
 
-import static example.gossip.MembershipException.Reason.INVALID_RECORD;
+import static gossip.MembershipException.Reason.INVALID_RECORD;
 
 /** A process identity. UUID ordering carries no restart ordering semantics. */
 public record MemberKey(String serverId, UUID bootId) {

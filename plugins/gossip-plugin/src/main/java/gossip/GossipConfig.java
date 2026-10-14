@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import java.io.IOException;
 import java.net.URI;
@@ -59,6 +59,7 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
         if (maxMembers < 1 || maxRecords < maxMembers) {
             throw invalid("capacity", "requires 1 <= max.members <= max.records");
         }
+        if (seeds.size() > maxMembers) { throw invalid("seeds", "must not exceed max.members"); }
         if (maxBatchMembers < 1 || maxBatchMembers > maxRecords) {
             throw invalid("max.batch.members", "must be between 1 and max.records (including sender)");
         }

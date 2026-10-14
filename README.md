@@ -502,8 +502,11 @@ Reinstall the server after API changes and rebuild the example after changes to
 its source. The example's `clean` removes its previous JAR before rebuilding it.
 
 The separate [`plugins/gossip-plugin`](plugins/gossip-plugin/pom.xml) project provides
-the gossip provider, validated configuration, and membership model. It currently
-exposes local `status` only; peer exchange commands and scheduling remain pending. See the
+the gossip provider, validated membership model, `exchange`, paginated `members`,
+diagnostic `status`, and asynchronous `leave`, with bounded peer transport. Jittered rounds automatically
+contact seeds, publish heartbeats, maintain membership, and retry unavailable peers.
+Departure publishes terminal `LEFT` and reports its bounded attempts through status.
+Shutdown cancels owned DNS/TCP work and joins runtime workers. See the
 [gossip plugin document](docs/GOSSIP_PLUGIN.md) for configuration, build/run commands,
 packaged-JAR tests, and the implementation checklist.
 

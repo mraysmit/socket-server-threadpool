@@ -13,18 +13,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip.fixture;
 
-/** Distinguishes malformed records, version conflicts, and bounded-table admission failures. */
-public final class MembershipException extends IllegalArgumentException {
-    public enum Reason { INVALID_RECORD, CONFLICT, CAPACITY }
-
-    private final Reason reason;
-
-    public MembershipException(Reason reason, String message) {
-        super(message);
-        this.reason = reason;
+/** Process-level fixture for malformed and nonresponsive resolver replies. */
+public final class DnsProcessFixture {
+    public static void main(String[] args) throws Exception {
+        if (args[0].startsWith("stall")) { Thread.sleep(300_000); }
+        else if (args[0].startsWith("bad")) { System.out.println("GOSSIP_DNS_V1\nnot-an-address"); }
+        else if (args[0].startsWith("fail")) { System.exit(1); }
+        else { System.out.println("GOSSIP_DNS_V1\n127.0.0.1\n::1"); }
     }
-
-    public Reason reason() { return reason; }
 }

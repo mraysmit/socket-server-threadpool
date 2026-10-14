@@ -3,7 +3,7 @@
 | Document metadata | Details |
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
-| Status | Provider, configuration, and membership model implemented; peer transport/runtime pending |
+| Status | Seed-based runtime, package migration, and asynchronous departure complete; capacity/partition validation next |
 | Last updated | 2026-10-14 |
 
 ## Purpose and scope
@@ -12,7 +12,7 @@ Implement a plugin that lets instances of this server discover one another and m
 
 The first implementation should gossip membership and small, owner-controlled metadata, such as a node's supported application instructions. It should expose the local membership view for inspection. Application event delivery can be added later, with its own retention and deduplication rules.
 
-The external provider, configuration, and membership model now exist in [`plugins/gossip-plugin`](../plugins/gossip-plugin/pom.xml). It loads through `ServiceLoader`, resolves per-instance settings, creates a fresh boot ID, and answers `status` from its own membership table. Immutable records, validation, atomic merges, local assessments, and bounded retention are implemented and tested in-process. Peer exchange commands, scheduling, departure dissemination, and UDP discovery remain proposed. The host lifecycle prerequisite and baseline request hardening are implemented: shutdown closes the main listener before invoking optional plugin stop hooks, accepted requests have a bounded drain, and request/header lines and concurrently serviced connections have limits. Plugin stop hooks also run during failed startup, before loader cleanup.
+The external provider in [`plugins/gossip-plugin`](../plugins/gossip-plugin/pom.xml) loads through `ServiceLoader`, resolves per-instance settings, creates a fresh boot ID, and supports `exchange`, paginated `members`, `status`, and asynchronous `leave`. It automatically contacts seeds through jittered rounds, publishes owner heartbeats, maintains local assessments and retention, and retries unavailable peers with bounded backoff. Immutable records, atomic merges, complete canonical-envelope budgets, fair bounded batches, and bounded outbound TCP work are implemented. Three-node convergence, terminal departure dissemination, and background-work cleanup are verified with real sockets and packaged providers. Larger-swarm/partition validation and UDP discovery remain pending. The host lifecycle prerequisite and baseline request hardening are implemented: shutdown closes the main listener before invoking plugin stop hooks, accepted requests have a bounded drain, and request/header lines and concurrently serviced connections have limits. Plugin stop hooks also run during failed startup, before loader cleanup.
 
 The intended first deployment is a small swarm on a trusted LAN, with mutually reachable TCP endpoints and unique configured server IDs. Membership is eventually consistent: nodes can temporarily disagree, and a timeout indicates suspected unreachability rather than proof that a process has stopped. Membership alone must not authorize exclusive ownership, elect a unique leader, or guarantee that a command executes once.
 
@@ -24,7 +24,7 @@ The intended first deployment is a small swarm on a trusted LAN, with mutually r
 | [`PluginContext`](../src/main/java/dev/mars/plugin/PluginContext.java) | Supplies the local server ID and actual main/admin ports, including ports allocated with `0`. |
 | [`PluginRegistry`](../src/main/java/dev/mars/plugin/PluginRegistry.java) | Discovers the external provider through `ServiceLoader`, checks instruction uniqueness, and normalizes results to JSON. |
 | [`WorkerRunnable`](../src/main/java/dev/mars/worker/WorkerRunnable.java) | Runs incoming gossip commands on the existing virtual thread for each connection. |
-| [`TextMessageClient`](../src/main/java/dev/mars/client/TextMessageClient.java) | Sends one JSON command per connection and validates response IDs and the expected server ID. |
+| [`TextMessageClient`](../src/main/java/dev/mars/client/TextMessageClient.java) | Sends manual inspection commands. The plugin transport reuses the same host envelopes and reply validation with bounded response reading. |
 | [`CommandProtocol`](../src/main/java/dev/mars/protocol/CommandProtocol.java) | Provides versioned envelopes, UUID correlation, parameter objects, and typed errors. |
 | [`AddressBroadcastPlugin`](../src/main/java/dev/mars/plugin/builtin/AddressBroadcastPlugin.java) | Offers optional LAN bootstrap hints through its existing UDP announcements on port 9002. |
 | [`ServerInstance`](../src/main/java/dev/mars/server/ServerInstance.java) | Binds both ports before plugin startup and owns shutdown and plugin loader cleanup. |
@@ -37,16 +37,16 @@ The protocol follows periodic peer exchanges and bounded information propagation
 
 ## One provider and one instruction
 
-Register one public provider class, `example.gossip.GossipPlugin`, with instruction name `gossip`. Use an `operation` parameter to select behavior:
+Register one public provider class, `gossip.GossipPlugin`, with instruction name `gossip`. Use an `operation` parameter to select behavior:
 
 | Operation | Purpose | Network activity inside the handler |
 |---|---|---|
 | `exchange` | Merge a peer's records and return a bounded selection of local records. | None. |
 | `members` | Return a bounded, paginated local membership snapshot and diagnostics. | None. |
 | `status` | Report local identity, worker state, last round, and counters. | None. |
-| `leave` | Schedule a bounded departure announcement and stop initiating exchanges. | Queue work only; return immediately. |
+| `leave` | Publish terminal `LEFT`, schedule bounded departure attempts, and stop ordinary outbound work. | Wake owned work only; return immediately. |
 
-Currently only `status` is exposed as a command. Its result reports `implementationStage="membership-model"`, `supportedOperations=["status"]`, `isolated=true`, and `workerState="NOT_SCHEDULED"`. The local record has heartbeat zero; no background work or network exchanges run. Unsupported operations return `INVALID_PARAMETERS`. The other operations and full runtime diagnostics in this document are acceptance targets for later increments.
+All four operations are implemented. Status reports `implementationStage="departure-runtime"`, `supportedOperations=["exchange","members","status","leave"]`, and normally `workerState="RUNNING"`. Departure changes it to `LEAVING` and then `QUIESCED`; shutdown changes it through `STOPPING` to `STOPPED`. A scheduler exit or cleanup failure reports `FAILED` or `CLEANUP_FAILED`. Status includes capacity and assessment counts, reachable identity-conflict count, inbound/outbound success counts, outbound failures, rejected exchanges, in-flight calls, and last-success age. Its `runtime` object includes `rounds`, `roundFailures`, `skipped`, `workers`, `dnsHelpers`, `retryingPeers`, `lastRoundAgeMillis`, and failure counts classified as `DNS`, `NETWORK`, `TIMEOUT`, `PROTOCOL`, `IDENTITY`, `CAPACITY`, `VERSION`, or `SWARM`. Its `departure` object reports the attempt state and counters described below. Worker/helper gauges are observational rather than a transactional snapshot. `isolated` remains true until a valid exchange is processed or an outbound exchange succeeds. Inbound success means the handler accepted and returned the result; the SPI cannot observe whether the host delivered it to the client. Owner heartbeats advance even while isolated, and stop permanently on `leave`.
 
 Each discovered provider instance is shared by concurrent requests. Keep its runtime state in instance fields. Do not use a static singleton: tests and Java applications can start several `ServerInstance` objects in one JVM.
 
@@ -78,9 +78,9 @@ terminal.retention.millis=1800000
 discovery.enabled=false
 ```
 
-These values are parsed defaults for the future small-LAN runtime, not measured convergence or failure-detection guarantees. Only `swarm.id` and `advertise.host` are required; omitted seeds default to an empty list. Tune runtime values using the tests below. A seed entry contains an expected server ID, a host, and a main TCP port. The parser supports hostnames, IPv4, and bracketed IPv6 seed endpoints, such as `Server-001@[::1]:9000`, without resolving DNS during startup. Use an unbracketed IPv6 address for `advertise.host`.
+These values are defaults for the small-LAN runtime, not measured convergence or failure-detection guarantees. Only `swarm.id` and `advertise.host` are required; omitted seeds default to an empty list. Tune runtime values using the tests below. A seed entry contains an expected server ID, a host, and a main TCP port. The parser supports hostnames, IPv4, and bracketed IPv6 seed endpoints, such as `Server-001@[::1]:9000`, without resolving DNS during startup. Use an unbracketed IPv6 address for `advertise.host`.
 
-The parser rejects unknown keys, malformed or duplicate seed entries, non-integer/overflowing limits, and inconsistent timing or capacity settings. IDs use 1-128 letters, digits, dots, underscores, or hyphens. Intervals must be positive and convertible to nanoseconds; require `heartbeat < suspect < dead <= terminal retention`. Capacities require `1 <= max.members <= max.records`, batch count between 1 and `max.records`, and fanout/in-flight limits between 1 and `max.members`. The exchange budget must be 1024-65,536 bytes. `discovery.enabled=true` fails startup until discovery is implemented.
+The parser rejects unknown keys, malformed or duplicate seed entries, more than `max.members` configured seeds, non-integer/overflowing limits, and inconsistent timing or capacity settings. IDs use 1-128 letters, digits, dots, underscores, or hyphens. Intervals must be positive and convertible to nanoseconds; require `heartbeat < suspect < dead <= terminal retention`. Capacities require `1 <= max.members <= max.records`, batch count between 1 and `max.records`, and fanout/in-flight limits between 1 and `max.members`. The exchange budget must be 1024-65,536 bytes. `discovery.enabled=true` fails startup until discovery is implemented.
 
 Use `PluginContext.port()` for the advertised main port. A configured `advertise.host` supplies the reachable address because `PluginContext` has no host/interface field. Loopback works only for processes on the same machine; on separate machines configure a LAN address or resolvable hostname reachable by all members. The existing listeners bind to wildcard addresses, but firewall and routing rules must still allow access.
 
@@ -93,7 +93,7 @@ server.Server-001.advertise.host=192.168.1.10
 server.Server-002.advertise.host=192.168.1.11
 ```
 
-Embedded applications and tests can instead supply an immutable [`GossipConfig`](../plugins/gossip-plugin/src/main/java/example/gossip/GossipConfig.java) to the explicit `GossipPlugin(config)` constructor. No process-wide mutable configuration or plugin runtime is cached.
+Embedded applications and tests can instead supply an immutable [`GossipConfig`](../plugins/gossip-plugin/src/main/java/gossip/GossipConfig.java) to the explicit `GossipPlugin(config)` constructor. No process-wide mutable configuration or plugin runtime is cached.
 
 Give every concurrently running server a distinct `serverId`. Generate a fresh random `bootId` UUID when the plugin starts. The membership key is `(serverId, bootId)`: a restart creates a new member record even when the logical server ID stays the same. UUIDs distinguish processes; do not sort them to infer which restart is newer. Two reachable processes advertising the same server ID are a configuration conflict. Report both and require an operator to resolve the conflict rather than silently choosing a winner.
 
@@ -113,7 +113,7 @@ An owner record contains:
 
 Only the owner advances its heartbeat or publishes `LEFT`. A metadata or endpoint change also advances the heartbeat. Validate integer fields exactly; decoded JSON integers use `BigInteger` in this project, so do not cast them directly to `Integer` or `Long` or accept fractional values through `Number.longValue()`.
 
-The implemented [`MemberRecord`](../plugins/gossip-plugin/src/main/java/example/gossip/MemberRecord.java) accepts only the seven owner fields shown above, canonical lowercase UUID strings, integral port values in 1-65,535, and heartbeats in 0-`Long.MAX_VALUE`. Owner state is exactly `ALIVE` or `LEFT`; local `SUSPECT`/`DEAD` assessments are never decoded as owner state. Metadata is deeply immutable, supports JSON nulls, and is limited to 4,096 serialized UTF-8 bytes and depth 16. It rejects cycles, arbitrary Java objects, nonfinite numbers, unpaired Unicode surrogates, and values the host JSON codec cannot read back. Numeric wrapper types and object key order are normalized so equivalent metadata does not create false version conflicts. Decimal precision and absolute scale are additionally bounded at 4,096.
+The implemented [`MemberRecord`](../plugins/gossip-plugin/src/main/java/gossip/MemberRecord.java) accepts only the seven owner fields shown above, canonical lowercase UUID strings, integral port values in 1-65,535, and heartbeats in 0-`Long.MAX_VALUE`. Owner state is exactly `ALIVE` or `LEFT`; local `SUSPECT`/`DEAD` assessments are never decoded as owner state. Metadata is deeply immutable, supports JSON nulls, and is limited to 4,096 serialized UTF-8 bytes and depth 16. It rejects cycles, arbitrary Java objects, nonfinite numbers, unpaired Unicode surrogates, and values the host JSON codec cannot read back. Numeric wrapper types and object key order are normalized so equivalent metadata does not create false version conflicts. Decimal precision and absolute scale are additionally bounded at 4,096.
 
 Each receiver additionally stores `lastAdvanceNanos`, `lastDirectSuccessNanos`, a local reachability assessment, and retry/backoff information. Use a monotonic clock for elapsed time. These observations are local and are not copied from another machine's timestamps.
 
@@ -135,22 +135,22 @@ Finite retention cannot prevent every stale resurrection after arbitrarily long 
 
 ### Implemented table behavior
 
-[`MembershipTable`](../plugins/gossip-plugin/src/main/java/example/gossip/MembershipTable.java) owns one local [`MemberKey`](../plugins/gossip-plugin/src/main/java/example/gossip/MemberKey.java) and receives a monotonic `LongSupplier` clock, defaulting to `System.nanoTime`. Its methods perform no network I/O:
+[`MembershipTable`](../plugins/gossip-plugin/src/main/java/gossip/MembershipTable.java) owns one local [`MemberKey`](../plugins/gossip-plugin/src/main/java/gossip/MemberKey.java) and receives a monotonic `LongSupplier` clock, defaulting to `System.nanoTime`. Its methods perform no network I/O:
 
 - `mergeEncoded` validates and decodes a complete record batch before applying it. `merge` accepts immutable records. Both treat forwarded endpoints as candidates. `mergeDirect` additionally records success for one responder after the caller validates its outer reply and identity; it does not refresh members carried in the batch. A newer advertised endpoint needs its own direct verification.
 - Merge planning occurs under a lock and commits only after all conflict and capacity checks succeed. Rejection leaves owner data and observation times unchanged. Capacity is checked against the final batch state, so a departure can free a member slot for a new identity in the same batch regardless of order. Existing-only updates work at capacity; a mixed batch that cannot admit its new identities is rejected atomically. `MembershipException.reason()` distinguishes invalid records, version conflicts, and capacity errors.
 - `snapshot` returns immutable records, local observation ages, endpoint-verification flags, and capacity counts. Fresh forwarded members are `CANDIDATE` until directly verified; both candidates and verified members become `SUSPECT`/`DEAD` on elapsed-time thresholds. Reachable duplicate logical IDs are reported on every retained record for that ID, without choosing a boot-ID winner. Unverified candidates remain visible but do not yet establish a reachable identity conflict.
 - `maintain` explicitly expires retained state; merge rejection cannot prune as a side effect. Nonlocal `LEFT` full records are compacted after one retention interval from departure acceptance. Inactive `ALIVE` records are compacted after one interval without an advance or direct success. Compact entries retain identity, state, heartbeat, an owner-record fingerprint, and local timing; they expire after one additional retention interval. Repeated stale copies do not extend either interval.
 - Compact `LEFT` entries suppress every `ALIVE` version for their boot ID. Compact inactive entries suppress stale forwarded versions; a newer heartbeat or a directly confirmed matching version can restore a full record if capacity permits. Direct recovery preserves the old advance time and updates only direct-success time. Older versions cannot restore retired owner data. A compact entry still detects conflicting contents at its retained version.
-- Full nonterminal records, including locally dead ones awaiting compaction, count toward `max.members`. Full records and compact entries together count toward `max.records`; terminal full records release their active slot. Local owner state is retained for the lifetime of the table. `advanceLocal` and `updateLocal` advance only the owner heartbeat, reject overflow, and stop after `leaveLocal` publishes terminal `LEFT` at its current heartbeat. Network departure dissemination is still pending.
+- Full nonterminal records, including locally dead ones awaiting compaction, count toward `max.members`. Full records and compact entries together count toward `max.records`; terminal full records release their active slot. Local owner state is retained for the lifetime of the table. `advanceLocal` and `updateLocal` advance only the owner heartbeat, reject overflow, and stop after `leaveLocal` publishes terminal `LEFT` at its current heartbeat. The runtime disseminates that record through bounded departure attempts.
 
-The model enforces batch count (including a direct responder) and rejects a single record larger than `max.exchange.bytes`. Complete request/reply envelope budgets, swarm/version checks, pagination, and transport identity validation remain part of the next command/transport task. Scheduling must call heartbeat publication and `maintain`; the current status-only provider starts neither task.
+The model enforces batch count (including a direct responder) and rejects a single record larger than `max.exchange.bytes`. The command/transport layer adds complete canonical-envelope budgets, swarm/version checks, pagination, and reply identity validation before merges. Every scheduled round checks owner heartbeat publication and calls `maintain`, including rounds where all exchange workers are busy.
 
 ## Bootstrap and discovery
 
 Configured seeds are the baseline bootstrap mechanism. On startup, add the local record and seed candidates. Exclude the current local endpoint, retry unavailable seeds with jitter and bounded exponential backoff, and keep the local server usable if no seed is reachable. Advertise `isolated=true` until an exchange succeeds. Each connected component needs at least one reachable seed or another explicit introduction to join the others.
 
-Use `TextMessageClient(host, port, expectedServerId)` when contacting a configured seed. On first contact with an unverified discovery candidate, validate the returned outer server ID against its claimed identity and validate that the result's sender has the same identity. Thereafter pin the expected server ID. Also validate boot ID and swarm ID in the result. Identity checks prevent accidental cross-connection mistakes; without authentication they do not establish trust.
+Use `GossipTransport.exchange(GossipConfig.Seed)` when contacting a configured seed. It pins the expected server ID, validates the correlated host reply, and checks agreement with the result's sender, canonical boot identity, supported gossip version, and swarm ID before merging. A future discovery path must supply the announcement's claimed server ID for the same checks. Identity checks prevent accidental cross-connection mistakes; without authentication they do not establish trust. A request claiming the receiving process's own compound identity is rejected, so contacting a local hostname alias cannot create false bootstrap success.
 
 The existing address broadcaster is an optional source of candidate endpoints:
 
@@ -222,46 +222,74 @@ The result's sender is always the responding process's current record. Merge it 
 
 Do not echo arbitrary input fields into the result. Validate required keys, string lengths, endpoint ranges, canonical UUIDs, integer bounds, allowed states, metadata size, and duplicate member keys. Count the sender toward the maximum batch count and enforce the serialized byte budget on the complete envelope, including the outer reply. Reserve room for envelope overhead before selecting records. A single oversized record is a validation error, not an excuse to exceed the budget.
 
-For Java callers, the existing client can initiate an exchange with:
+[`GossipWire`](../plugins/gossip-plugin/src/main/java/gossip/GossipWire.java) implements this accounting. Outgoing requests and raw incoming reply lines count complete UTF-8 JSON envelope bytes, excluding line terminators. Reply selection reserves a full UUID and the largest legal positive connection ID (`Long.MAX_VALUE`) because the SPI does not expose the actual reply connection ID. Incoming requests are validated and measured as complete canonical envelopes reconstructed from decoded owner records. The SPI does not expose original whitespace, escape spelling, or raw byte counts, so this server-side check is after host parsing; it is not a pre-parse raw request byte limit.
+
+Before admission, records must also fit individually beside the local sender and in a one-row inspection page, with space reserved for cursor, ages, capacity diagnostics, and the owner's maximum heartbeat width. This prevents admitting a record that makes subsequent bounded responses or inspection impossible as its heartbeat grows. Request and response batch selection have independent rotating cursors; progress advances only for records included. Handler validation, budget checks, and table conflict/capacity checks precede mutation. Membership failures map to `INVALID_PARAMETERS` with an `INVALID_RECORD:`, `CONFLICT:`, or `CAPACITY:` prefix. No implemented handler initiates outbound work.
+
+Embedded callers holding a running plugin instance can initiate an explicit exchange:
 
 ```java
-var client = new TextMessageClient(peer.host(), peer.port(), peer.serverId());
-CommandReply reply = client.execute("gossip", Map.of(
-        "operation", "exchange",
-        "gossipVersion", 1,
-        "swarmId", config.swarmId(),
-        "sender", encode(localRecord),
-        "members", encodeBatch(selectedRecords)));
-// Validate and merge reply.result() as the exchange result described above.
+GossipWire.Exchange reply = plugin.exchangeWith(
+        new GossipConfig.Seed("Server-002", "127.0.0.1", 9010));
+// The validated reply is already merged into this plugin's own membership table.
 ```
 
-`peer`, `config`, and encoding helpers above are proposed plugin classes and methods. The client itself already exists. Always open a fresh connection for an exchange; the host closes each connection after one reply. Retries may use new message IDs because host UUIDs provide correlation, not deduplication. Record-version merging makes exchange retries idempotent.
+Callers that own a standalone `MembershipTable` can instead own a `GossipTransport(config, table)` and call `exchange(seed)`. Close the transport when finished. These are Java APIs, not additional console operations. The scheduler uses this transport after bounded hostname resolution. Every exchange opens a fresh connection; the host closes each connection after one reply. Retries use new message IDs because host UUIDs provide correlation, not deduplication. Record-version merging makes exchange retries idempotent.
+
+`members` accepts optional `limit` (an exact integer from 1 through `max.batch.members`, defaulting to the smaller of 32 and that cap) and `cursor`. Its bounded result contains `swarmId`, `self`, rows with owner data and local diagnostics, capacity counts, and nullable `nextCursor`. Row diagnostics are assessment, advance/direct-success ages in milliseconds, endpoint verification, and identity conflict. Cursors are opaque, tied to the local boot ID, and rejected by another instance. Paging is a best-effort view of changing state; it is not a transactional snapshot. Byte budgets can produce fewer rows than the requested limit.
 
 ## Periodic work and bounded propagation
 
-Start one lightweight scheduling task per plugin instance. Add random jitter to the initial delay and each round so processes do not all contact peers at the same instant. Startup initializes local state and schedules work; it must not wait for seeds or exchange with itself before returning from `start()`.
+The runtime starts one virtual scheduling thread per plugin instance, with an initial delay greater than zero and at most `round.millis`. Subsequent round delays have jitter from approximately 0.8 to 1.2 times that interval. Startup initializes local state and schedules work without waiting for seeds. It owns at most `max.inflight` virtual exchange workers and has no work queue. Known local endpoints are excluded before selection, local hostname aliases are filtered after resolution, and resolved destinations already in flight are skipped.
 
 Each round performs the following work:
 
-1. Advance the owner's heartbeat when its interval has elapsed, even if the node is isolated.
+1. Advance the owner's heartbeat when its interval has elapsed, even if the node is isolated. Missed intervals coalesce into one advance rather than a burst of catch-up work.
 2. Update local reachability assessments and prune expired retained state.
-3. Select up to two distinct reachable peers at random, excluding self and endpoints already in flight. Reserve periodic selection slots for seeds, new candidates, and recovery probes.
-4. Snapshot a bounded record batch and submit exchanges only while a permit is available. Release each permit in `finally`.
+3. Select up to `fanout` distinct peers within available worker slots. Ordinary `ALIVE` peers are randomized. Seeds, unverified candidates, suspects, and locally dead peers receive rotating recovery opportunities, with a reserved slot every third selection and additional opportunities when ordinary peers leave slots free. Multiple boot IDs sharing the same expected server ID and endpoint do not cause duplicate calls.
+4. Snapshot a bounded record batch and start exchanges only while capacity is available. Release each transport permit and worker assignment in `finally`. Local saturation skips work without penalizing a peer.
 5. Merge each validated result and record metrics. Classify network errors, incompatible versions, capacity errors, and identity conflicts separately.
+
+Failures use exponential retry backoff beginning at the round interval, with approximately 0.75-1.25 jitter and an absolute 30-second cap. Success resets the peer's backoff. Candidate selection includes self in the `max.members` cap; seed candidates fill remaining capacity after table members. Retry state is bounded and removed when an endpoint ceases to be a candidate or active worker. `LEFT` records are excluded from member-derived targets, while configured seeds remain bootstrap targets across restarts.
 
 Never hold the membership lock across socket I/O. Never make an outbound request from `execute(exchange)`: the handler only validates, merges, snapshots, and returns. Otherwise two members can create chains of nested requests and shutdown dependencies.
 
 Use immutable records and a short lock around table changes and snapshots. `ConcurrentHashMap` by itself does not make compound version comparisons and updates atomic. Deep-copy mutable metadata on input and when producing snapshots; `CommandRequest` only makes its outer parameter map unmodifiable.
 
-For batch selection, include the local record, prioritize recently changed records and departures, and reserve part of every batch for a rotating scan of the entire retained table. Track progress separately for outgoing exchanges and incoming responses so a busy peer cannot starve others. Advance a cursor by the records actually included, wrapping fairly; do not always return the first 32 sorted members. Continued fair exchanges repair missed updates even after the initial priority queue drains. Repeated sending is intentional; the receiver ignores duplicate versions.
+Batch selection includes the local record and alternates recently changed records with a rotating scan of the entire retained table. Terminal departures lead the changed-record selection. Even a batch with one additional record alternates priority and scan opportunities, so continuous changes cannot starve the scan. Progress is separate for outgoing exchanges and incoming responses and advances only through records actually included. Continued fair exchanges repair missed updates even after the priority set drains. Repeated sending is intentional; the receiver ignores duplicate versions. Larger-swarm convergence and partition measurements remain a separate validation task.
 
 The initial scheme sends record batches directly rather than full digests followed by fetches. Each message remains bounded, while a complete sweep takes more exchanges as the swarm grows. Memory grows with the capped membership table. This design has no proven fixed convergence deadline. For substantially larger swarms, measure saturation and consider a digest/delta protocol or SWIM-style probes with piggybacked membership changes.
 
-The existing client uses a 5-second connect timeout and a 10-second read timeout. With two permits, two stalled requests can occupy the outbound budget for several rounds. Skip overlapping work rather than queueing unbounded tasks. The first version can retain these defaults and use conservative failure thresholds. Shorter configurable timeouts require extending the client or implementing the same envelope and validation behavior in a bounded plugin transport. Account for DNS lookup and cancellation as well as socket timeouts when promising an overall deadline.
+The implemented [`GossipTransport`](../plugins/gossip-plugin/src/main/java/gossip/GossipTransport.java) owns nonblocking channels and selectors, with defaults of a 5-second connect deadline, 10-second read-idle deadline, and 15-second total connect/write/read deadline after DNS resolution. The total deadline bounds trickling responses as well as idle ones. Constructor overloads accept shorter durations for tests or embedded callers; no new CLI flags or timeout properties have been added. A fixed permit cap rejects overlapping work immediately instead of queueing it. With two permits, two stalled exchanges can still occupy the budget for several rounds; the scheduler continues heartbeat/maintenance work and skips outbound work until capacity is available.
+
+Transport close rejects new calls, closes active channels/selectors synchronously, wakes blocked I/O, and prevents uncommitted replies from merging after close. Caller interruption also ends selector waits and releases the permit. The transport creates no threads; callers own and join theirs. Transport tests observe stalled-I/O cancellation and caller completion within a two-second deadline. Explicit Java API calls with hostnames still use platform DNS outside socket deadlines; their caller-owned threads have no promised overall lookup/join bound.
+
+Scheduled hostname lookups instead run in an owned, short-lived helper JVM using the same Java installation and the plugin's classes/JAR. The runtime supplies only numeric addresses to the transport. Lookup wait time is two seconds; timeout, interruption, and stop forcibly terminate and wait for the helper. Numeric endpoints bypass helpers. Successful answers are cached for 60 seconds in a cache capped at `max.members` hostnames, with at most 16 addresses per answer rotated across attempts. Helpers count toward the worker budget and cannot exceed `max.inflight`. Cold lookups incur JVM startup cost and require permission to launch the local Java executable; numeric endpoints avoid that cost. DNS timeout/cache settings are fixed implementation defaults. Capacity and performance measurements remain pending.
 
 The host now bounds each request and HTTP header line at `WorkerRunnable.MAX_LINE_LENGTH`, currently 65,536 Java UTF-16 code units, excluding the line terminator. An overlong first line receives `INVALID_REQUEST`; an overlong HTTP header closes the connection. This is a decoded-character limit, not a UTF-8 byte budget, and it does not cap the total HTTP header section. Keep the proposed 32,768-byte exchange budget on complete serialized envelopes independently of this host limit.
 
-`TextMessageClient` still reads replies with an unbounded `BufferedReader.readLine()` before JSON parsing. Plugin validation can reject an oversized result only after that allocation. Before deployment beyond a trusted environment, add byte-counted limits before JSON parsing to both request and gossip response readers, and cap aggregate HTTP header bytes. Response limits can be added to the existing client or a plugin transport that preserves its correlation and server-identity checks. These remaining transport tasks are separate from the gossip merge algorithm.
+Gossip responses now have a raw byte-counted limit before JSON parsing and strict UTF-8 decoding in the plugin transport. The general-purpose `TextMessageClient` still has an unbounded reply reader and is used for manual inspection, not the plugin's outbound exchanges. Before deployment beyond a trusted environment, add a raw request byte limit before host JSON parsing and cap aggregate HTTP header bytes; harden the general-purpose client too if it will contact untrusted servers. These remaining host/client transport tasks are separate from the gossip merge algorithm.
+
+## Asynchronous departure (implemented)
+
+`leave` accepts only the `operation` parameter. Under the runtime lock it publishes local terminal `LEFT` once, stops heartbeats and ordinary peer selection, interrupts existing ordinary workers, and wakes the scheduler. The handler performs no DNS, outbound socket work, or joining. Concurrent/repeated requests share this transition and return the current `departure` snapshot; they never create a second dissemination attempt. A stopped instance that never requested departure rejects `leave` with `INVALID_PARAMETERS`.
+
+The runtime snapshots at most `max.members - 1` distinct expected-server/host/port targets, taking nonlocal, non-`LEFT` table members first and filling remaining slots with configured seeds. It excludes known self endpoints and filters resolved local aliases. Newly discovered endpoints do not expand this fixed snapshot. Each selected target receives at most one attempt, ignoring ordinary retry backoff. Attempts use existing serialization, byte/record limits, DNS isolation, and transport identity checks. Each scheduler pass starts at most `fanout` workers within `max.inflight`; there is no unbounded task queue.
+
+The dissemination budget is five seconds of monotonic elapsed time from acceptance. A departure pass checks progress about every 25 ms. When all selected attempts finish, or the budget expires, the scheduler closes outbound resources, cancels remaining work, and joins its exchange workers using the existing cleanup procedure. The five seconds bound dissemination; process/socket cleanup can add the cleanup waits documented below. Shutdown cancels departure immediately through the same cleanup path. No departure RPC runs synchronously in `stop()`.
+
+Both the `leave` reply and `status` contain a `departure` object with `state`, `budgetMillis` (5000), `targets`, `attempts`, `successes`, `failures`, `skipped`, and `cancelled`. Attempts count workers started, including DNS work; skipped attempts cover local aliases, duplicate resolved endpoints, or local saturation. Cancelled attempts had not completed when cleanup interrupted them. Targets never attempted before the deadline remain visible through `targets - attempts`.
+
+| Departure state | Meaning |
+|---|---|
+| `NOT_REQUESTED` | No departure transition has occurred. |
+| `DISSEMINATING` | Terminal state is published; attempts or cleanup are in progress. |
+| `COMPLETED` | All selected targets were processed and cleanup finished. Individual attempts may have failed or been skipped; an isolated node completes with zero attempts. |
+| `EXHAUSTED` | The dissemination deadline expired; outstanding work was cancelled and cleanup finished. |
+| `CANCELLED` | Instance shutdown interrupted the departure attempt and cleanup finished. |
+| `FAILED` | The scheduler failed during departure or cleanup failed; cleanup errors remain available to subsequent stop calls. |
+
+Success counts validated peer replies, and completion describes the local attempt. Neither guarantees receipt by the whole swarm. The scheduler publishes final departure state after worker cleanup and then exits. `QUIESCED` retains the local table and command handler: inspection, incoming exchanges, and other host commands remain usable. New explicit `exchangeWith` calls are rejected once leaving begins. Rejoining requires a new plugin instance and boot ID; stale `ALIVE` versions cannot revive the departed boot ID. Invoke `leave` before shutdown and inspect its outcome when voluntary departure is desired.
 
 ## Host lifecycle prerequisite (implemented)
 
@@ -282,13 +310,15 @@ The implemented host contract is:
 
 The admin command runs inside the monitor task. Its stop-request path must not join that same task or call `listeners.close()` from inside it. Preserve the current console behavior: `shutdown` requests a stop; `quit` or end-of-input reaches instance close and completes joins and loader cleanup.
 
-The gossip stop hook prevents new rounds, cancels scheduled work, closes the optional UDP receiver, and cancels active outbound work. If using the current client, account for its finite socket waits and test the shutdown bound. For prompt cancellation, extend the transport to own and close its active sockets rather than assuming interrupting any arbitrary networking call is sufficient. Join plugin background tasks before returning so no background thread retains the plugin loader. Keep the in-memory table available to already accepted handlers during draining, and keep handlers short and responsive to cancellation. The host's request drain timeout does not bound synchronous plugin stop hooks or their outbound work.
+The gossip stop hook prevents new rounds, interrupts its scheduler and exchange workers, closes active transport channels/selectors, kills DNS helpers, and joins every owned runtime thread. Joining uses a shared three-second deadline measured from the beginning of cleanup; helper termination additionally has a one-second wait per process after all helpers are forcibly destroyed. This is a bounded cleanup attempt, not a hard real-time guarantee for local process launch or operating-system calls. Failure propagates through the host's aggregated cleanup errors and reports `CLEANUP_FAILED`. Repeated close is serialized and preserves any cleanup failure. The membership table remains available to already accepted handlers. Optional UDP discovery must later join this same resource lifecycle. Keep handlers short and responsive to cancellation.
 
-Do not send a synchronous departure RPC from `stop()`: shutdown must still finish when the network is down. The explicit `leave` operation publishes a terminal local record, queues a bounded dissemination attempt, and then quiesces periodic work. Make it asynchronous and expose completion in `status`. Invoke it before shutdown when graceful departure is desired. Other nodes eventually time out a process that exits without delivering `LEFT`.
+The explicit `leave` operation publishes a terminal local record and schedules the bounded asynchronous attempt described above. `stop()` cancels that attempt, closes resources, and joins owned threads. Other nodes eventually time out a process that exits without delivering `LEFT`.
 
-Tests exercise normal close, administrative shutdown, console quit/end-of-input, partial initialization, concurrent startup failures, stop-hook failures, concurrent shutdown, instance isolation, and loader availability for accepted commands that complete during draining. They also cover idle/trickling clients and main-listener closure before plugin quiescing. A real external provider owns a worker blocked on UDP receive; its stop hook closes the socket and joins the worker, and its JAR can be deleted after host cleanup on Windows. Stop hooks run synchronously without a host-enforced deadline. The gossip plugin will still need to implement its own cancellation and bounded resource cleanup.
+Host tests exercise normal close, administrative shutdown, console quit/end-of-input, partial initialization, concurrent startup failures, stop-hook failures, concurrent shutdown, instance isolation, and loader availability for accepted commands that complete during draining. They also cover idle/trickling clients and main-listener closure before plugin quiescing. A real external provider owns a worker blocked on UDP receive; its stop hook closes the socket and joins the worker, and its JAR can be deleted after host cleanup on Windows. Stop hooks run synchronously without a host-enforced deadline. Gossip tests additionally stop scheduled/departure work during stalled TCP and DNS calls, roll back after another provider fails while an exchange is active, and verify real console quit, end-of-input, and admin-shutdown cleanup. Packaged tests delete the gossip JAR after hostname-seeded convergence/departure and after console cleanup while each child JVM remains alive. Optional discovery receiver cleanup remains pending.
 
 ## Suggested plugin classes
+
+The implementation uses package `gossip`, with production sources under `plugins/gossip-plugin/src/main/java/gossip` and tests under `plugins/gossip-plugin/src/test/java/gossip`. Child-JVM fixtures use `gossip.fixture`; the host test bridge stays in `dev.mars.server` to access package-private host startup. Service registration names `gossip.GossipPlugin`. Embedded Java callers must update their imports and rebuild against the renamed classes. The command instruction remains `gossip`.
 
 | Class | Responsibility |
 |---|---|
@@ -298,7 +328,9 @@ Tests exercise normal close, administrative shutdown, console quit/end-of-input,
 | `MembershipTable` | Validates merges, versions, observations, expiry, and snapshots. |
 | `MemberRecord` and `MemberKey` | Immutable owner data and compound identity. |
 | `PeerSelector` | Random fanout, fair recovery opportunities, and retry backoff. |
-| `GossipTransport` | Adapts `TextMessageClient` and validates exchange results. |
+| `GossipTransport` | Owns bounded TCP I/O, deadlines, cancellation, reply validation, and direct-success merges. |
+| `GossipDnsResolver`, `GossipDnsLookup` | Bound scheduled hostname resolution through a cached, cancellable helper process. |
+| `GossipWire`, `GossipCommands`, `GossipBatchSelector` | Encode/validate gossip data and envelopes, dispatch local operations, and rotate bounded batches. |
 | `DiscoveryReceiver` | Optional UDP candidate ingestion; never a source of authoritative membership. |
 
 Inject a monotonic clock, random source, and transport boundary into the runtime to make timing and selection tests repeatable. Supply real defaults in the public no-argument constructor required for service discovery. Avoid depending on startup hooks of other plugins: `PluginContext` does not expose their instances or the registry.
@@ -316,7 +348,7 @@ src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin
 Its contents are:
 
 ```text
-example.gossip.GossipPlugin
+gossip.GossipPlugin
 ```
 
 Use a dedicated plugin directory containing the gossip JAR and any dependencies it needs. Built-in providers are inherited through the host's parent class loader. Loading duplicate gossip providers fails startup because their instruction names conflict. Restart members to load a new plugin JAR; there is no hot reload.
@@ -339,21 +371,16 @@ java "-Ddev.mars.announce=false" "-Dgossip.config=config/gossip-003.properties" 
 
 All three advertise `127.0.0.1` for this local demonstration. On different machines use reachable addresses and update the seeds. Automatic TCP allocation also works because the startup context supplies bound ports, but static seed files need a stable entry point or an independent discovery mechanism.
 
-At each console, inspect the implemented scaffold using the existing `send` command:
+At each console, inspect the plugin using the existing `send` command:
 
 ```text
 send {"instruction":"gossip","parameters":{"operation":"status"}}
-```
-
-Each process currently reports only its own identity and remains isolated. The following commands and convergence/recovery checks apply after membership and runtime tasks are implemented:
-
-```text
 send {"instruction":"gossip","parameters":{"operation":"members","limit":32}}
 ```
 
-`members` should return `swarmId`, `self`, a bounded list of records with their local assessments and observation ages, and an opaque `nextCursor` when more records remain. Document that paging is a best-effort view of changing state, not a transactional snapshot. A duplicate logical ID appears as a conflict rather than a single healthy entry.
+Each process initially reports itself, then automatically contacts the configured seeds and discovers the others. Heartbeats advance even before bootstrap succeeds. `members` returns a bounded page with local assessments and observation ages; pass a returned `nextCursor` as `cursor` to continue. Reachable duplicate logical IDs appear as conflicts rather than one healthy entry. Use `status` to inspect isolation, rounds, retry failures, and active work.
 
-Stop Server-002, observe local suspicion/dead assessments, then restart it with the same server ID. Verify that the new boot ID becomes reachable and the old boot ID ages out. Disconnect and reconnect a member to observe recovery. To leave voluntarily, issue the proposed `leave` command, allow its bounded attempt to complete, and then use the existing `quit` command:
+Stop Server-002, observe local suspicion/dead assessments, then restart it with the same server ID. Verify that the new boot ID becomes reachable and the old boot ID ages out. Disconnect and reconnect a member to observe recovery. To depart voluntarily, send `leave` and inspect `status` until `departure.state` is final and `workerState` is `QUIESCED` (or reports cleanup failure), then use `quit`. Repeat the status command as needed before quitting:
 
 ```text
 send {"instruction":"gossip","parameters":{"operation":"leave"}}
@@ -381,24 +408,39 @@ Use JUnit and the existing real-socket/external-JAR approach. Mockito and replac
 
 Use fake elapsed time for precise expiry tests and eventual assertions with bounded deadlines for live convergence. Record observed convergence times rather than promising logarithmic timing from the general gossip model. Verify startup rollback after a later provider fails, so cleanup covers gossip workers that were already scheduled.
 
-The plugin currently has 87 unit tests covering configuration, provider lifecycle/status, JSON record compatibility, and deterministic-clock membership behavior, plus three packaged-JAR integration tests. Model tests cover stale duplicate freshness, direct recovery, endpoint changes, atomic conflict/capacity rejection, owner protection, terminal/inactive suppression and expiry, restart identity, reachable ID conflicts, local publication, signed clock wraparound, and concurrent merges. The integration fixture excludes plugin implementation classes from its parent classpath, starts two real servers in one JVM, verifies distinct configurations and boot IDs through TCP, closes one while the other remains usable, and deletes the JAR after both instances close while the JVM is still alive. It also verifies rejection of invalid configuration and invalid/unimplemented command operations. Root `mvn test` does not run this separate project; use its `mvn verify` command above.
+The plugin currently has 150 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-14 ran `mvn -o -f plugins/gossip-plugin/pom.xml clean verify` for departure/lifecycle completion. All 327 host tests also pass with `mvn -o test`. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
+
+In addition to configuration and deterministic-clock model coverage, command/transport tests verify real two-node exchanges, Unicode/null metadata, exact envelope byte boundaries, oversized UTF-8 replies, strict paging/cursors, independent rotating batches, identity/version/swarm failures, remote capacity errors, self-contact aliases, concurrency caps, read-idle and trickle deadlines, interruption, and close cancellation. Runtime tests cover jitter/backoff, fair priority/scan batches, heartbeat/maintenance while saturated, late seeds, three-node convergence, restart recovery, unchanged echo/HTTP/admin behavior, incompatible swarms, active-exchange startup rollback, and stalled TCP/DNS cleanup. Real helper processes exercise lookup caching, timeout, invalid output, and cancellation.
+
+Departure tests verify concurrent/idempotent requests, terminal publication, replacement of an active ordinary exchange, successful and failed attempts, deadline cancellation of actual stalled TCP and DNS work, cleanup-failure reporting, retained handlers after quiescing, stale-`ALIVE` suppression, admin cancellation during departure, and repeated close. The packaged fixture excludes provider implementation classes from its parent classpath and verifies actual ServiceLoader handling, automatic three-node hostname bootstrap and departure propagation, paginated inspection, instance isolation, startup rollback, and real console quit/end-of-input/admin-shutdown cleanup. JAR deletion is checked while the Windows JVM remains alive after cleanup.
 
 Expose round counts, exchange successes/failures, last successful exchange age, in-flight count, rejected records, identity conflicts, capacity usage, and membership counts by local assessment. Avoid logging every member on every round. These measurements distinguish isolation, transport failure, invalid peers, and an overloaded batch budget.
 
 ## Implementation sequence and task status
 
-The checked tasks below are implemented in the current repository. The next action is the command and transport path. The provider uses its membership model for local `status`, while peer exchanges, pagination, and scheduling remain pending. Complete the trusted-LAN path in order, adding lifecycle verification as soon as background work exists.
+The checked tasks below are implemented in the current repository. The next action is capacity, fairness, and partition validation: exercise multiple batches at the membership cap, measure propagation, and verify recovery through a controllable TCP relay. Complete the remaining trusted-LAN validation in order.
 
 - [x] **Host lifecycle prerequisite:** Optional stop hooks, concurrent startup rollback, administrative stop requests, cleanup after hook failures, and loader cleanup are implemented and covered by host tests.
 - [x] **Baseline host request hardening:** Main-listener closure before plugin quiescing, bounded drain with worker interruption, per-line character limits, a concurrent connection cap, transient accept retries, and test announcement suppression are implemented. Byte-counted transport limits remain pending below.
 - [x] **Plugin scaffold and configuration:** The separate Maven project, `GossipPlugin` provider, service registration, per-instance configuration, and local demo configuration files are implemented. Tests and spawned JVMs disable real announcements. Acceptance verified: real external-JAR loading, isolated instances, correlated local status, invalid-configuration cleanup, and JAR deletion after instance cleanup while the Windows JVM remains alive.
-- [x] **Membership model:** Immutable records, exact numeric/identity/metadata validation, atomic merges, local observations, capacity rules, compact suppression, and owner publication are implemented. Acceptance verified with deterministic-clock and concurrent tests: duplicate freshness, direct recovery, version conflicts, terminal `LEFT`, distinct restart identities, bounded retention/capacity, and rejection without partial mutation. The provider's local status now uses its own table; wire exchanges remain pending below.
-- [ ] **Command and transport path:** Implement `exchange`, paginated `members`, and `status`; enforce complete-envelope budgets and reply identity checks. Acceptance: real two-node TCP exchanges cover serialization, malformed replies, incompatible versions/swarm IDs, and capacity failures before scheduling is introduced. Choose the transport's timeout and cancellation approach here and document its cleanup bound; the current client has unbounded response reading.
-- [ ] **Scheduled seed-based runtime:** Add jittered rounds, owner heartbeats, bounded fanout/in-flight work, fair batches, seed backoff, recovery probes, local assessments, expiry, and metrics. Implement cancellation and joining in `stop()` with the first background task. Acceptance: three real nodes converge, late/down seeds recover, restarts are distinct, closing one instance leaves others working, and stalled exchanges or startup rollback leave no plugin workers behind.
-- [ ] **Departure and lifecycle completion:** Implement asynchronous bounded `leave`, terminal dissemination, and completion reporting. Acceptance: departures stay terminal; failed startup, admin shutdown, console quit/end-of-input, and repeated close clean up promptly while accepted handlers retain their table during draining. Run the host suite and packaged-plugin integration tests.
+- [x] **Package structure:** Production and test sources use `gossip` and `gossip.fixture`, with matching directories, imports, documentation links, helper launches, and `gossip.GossipPlugin` service registration. Acceptance verified: a clean build passes the standalone suite and the rebuilt JAR contains no `example` package.
+- [x] **Membership model:** Immutable records, exact numeric/identity/metadata validation, atomic merges, local observations, capacity rules, compact suppression, and owner publication are implemented. Acceptance verified with deterministic-clock and concurrent tests: duplicate freshness, direct recovery, version conflicts, terminal `LEFT`, distinct restart identities, bounded retention/capacity, and rejection without partial mutation.
+- [x] **Command and transport path:** `exchange`, paginated `members`, and diagnostic `status` are implemented with complete canonical-envelope accounting, bounded raw response reading, reply identity checks, and independent batch cursors. Real two-node and packaged-JAR tests verify serialization, malformed replies, version/swarm mismatches, capacity errors, paging, deadlines, and cancellation. The no-thread transport owns its channels/selectors; DNS is explicitly outside socket cancellation/deadlines. Raw pre-parse host request bytes remain a separate deployment prerequisite below.
+- [x] **Scheduled seed-based runtime:** Jittered rounds, owner heartbeats, bounded fanout/in-flight workers, priority/fair batches, seed backoff, recovery probes, local assessments, expiry, and metrics are implemented. Scheduled hostname lookups use bounded helper processes; stop cancels DNS/TCP work and joins owned threads. Acceptance verified: three real nodes and a packaged hostname-seeded swarm converge, late/down seeds recover, restarts are distinct, closing one instance leaves others working, and stalled exchanges or startup rollback leave no plugin workers behind.
+- [x] **Departure and lifecycle completion:** Idempotent asynchronous `leave` publishes terminal `LEFT`, stops heartbeats/ordinary rounds, attempts a bounded target snapshot within five seconds, and exposes completion/cancellation/failure counters. Acceptance verified: terminal propagation and stale-record suppression, retained handlers after quiescing, active DNS/TCP deadline cancellation, admin cancellation during departure, startup rollback, real console quit/end-of-input/admin-shutdown cleanup, repeated close, and packaged JAR release before JVM exit. All 158 plugin test cases and 327 host tests pass.
 - [ ] **Capacity, fairness, and partition validation:** Exercise the configured membership cap with multiple batches and a controllable TCP fixture/relay. Measure convergence and prove fair record transmission, bounded outbound concurrency, capacity-safe updates, and recovery after partitions. Tune the proposed limits and intervals from these results before calling the trusted-LAN baseline ready.
 - [ ] **Optional UDP discovery:** Add only after seed-based operation passes the preceding checks. Acceptance: controlled datagrams only queue validated TCP handshakes; unavailable UDP, lost announcements, and same-host port contention leave seeds working. Include receiver cancellation in the existing lifecycle tests.
-- [ ] **Beyond-trusted-LAN prerequisites:** Add byte-counted request and response limits before parsing, aggregate HTTP header limits, authenticated membership/transport, and an advertised-destination policy before dialing forwarded candidates. Test oversized/slow input, identity failures, and denied destinations. These are deployment prerequisites for that environment, not completed by the existing character limit or `swarmId` validation.
+- [ ] **Beyond-trusted-LAN prerequisites:** Add raw host request byte limits before parsing, aggregate HTTP header limits, authenticated membership/transport, and an advertised-destination policy before dialing forwarded candidates. Harden the general-purpose client's response reader if used with untrusted servers. Gossip transport response bytes are already bounded before parsing. Test oversized/slow input, identity failures, and denied destinations. These prerequisites remain separate from canonical plugin request budgets and `swarmId` validation.
+
+### Next task: capacity, fairness, and partition validation
+
+Small-swarm and deterministic fairness checks are complete. The following work is still planned before declaring the trusted-LAN baseline ready:
+
+1. Exercise a configured membership cap with batches smaller than the retained table, including updates while admission capacity is full. Verify atomic rejection of excess identities and continued updates for existing members.
+2. Track actual wire batches during continuous heartbeat/metadata changes and terminal departures. Verify that the rotating scan gives every eligible retained record transmission opportunities within the byte and record budgets.
+3. Add a controlled TCP relay/fixture that drops, delays, or reorders complete exchanges, then heals a partition. Use bounded eventual assertions to verify recovery of current owner records and preservation of terminal suppression during retention.
+4. Observe peak exchange workers, helper processes, in-flight calls, and retained identities during saturation/recovery. Verify configured caps and prompt cleanup, including stalled relay connections.
+5. Record swarm size, configuration, workload, and observed convergence/recovery times. Measure numeric and hostname endpoint costs, tune defaults only from evidence, and document remaining limits. Run standalone verification and any host checks required by host changes before checking off this task.
 
 A `swarmId` separates accidental configurations but is not an authentication credential. The host currently supplies neither TLS nor authenticated peer identity, and the plugin cannot infer the socket's remote address from `execute(Map)` alone. Keep administrative ports restricted because the existing shutdown command is unauthenticated.
 

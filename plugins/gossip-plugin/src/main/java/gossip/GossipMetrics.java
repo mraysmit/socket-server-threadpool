@@ -13,9 +13,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import java.util.Map;
+import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class GossipMetrics {
@@ -23,7 +24,34 @@ final class GossipMetrics {
     final AtomicLong outbound = new AtomicLong();
     final AtomicLong outboundFailures = new AtomicLong();
     final AtomicLong rejectedExchanges = new AtomicLong();
+    final AtomicLong rounds = new AtomicLong();
+    final AtomicLong roundFailures = new AtomicLong();
+    final AtomicLong skipped = new AtomicLong();
+    enum Failure { DNS, NETWORK, TIMEOUT, PROTOCOL, IDENTITY, CAPACITY, VERSION, SWARM }
+    private final Map<Failure, AtomicLong> failures = new java.util.EnumMap<>(Failure.class);
+    volatile String workerState = "INITIALIZING";
+    volatile int workers;
+    volatile int dnsHelpers;
+    volatile int retryingPeers;
+    volatile Long lastRound;
     private volatile Long lastSuccess;
+
+    GossipMetrics() { for (var kind : Failure.values()) { failures.put(kind, new AtomicLong()); } }
+    void failure(Failure kind) { failures.get(kind).incrementAndGet(); }
+    Map<String, Object> runtime() {
+        var kinds = new LinkedHashMap<String, Long>();
+        failures.forEach((kind, count) -> kinds.put(kind.name(), count.get()));
+        var result = new LinkedHashMap<String, Object>();
+        result.put("rounds", rounds.get());
+        result.put("roundFailures", roundFailures.get());
+        result.put("skipped", skipped.get());
+        result.put("workers", workers);
+        result.put("dnsHelpers", dnsHelpers);
+        result.put("retryingPeers", retryingPeers);
+        result.put("lastRoundAgeMillis", lastRound == null ? null : Math.max(0, System.nanoTime() - lastRound) / 1_000_000);
+        result.put("failures", kinds);
+        return result;
+    }
 
     void success(boolean outgoing) {
         (outgoing ? outbound : inbound).incrementAndGet();

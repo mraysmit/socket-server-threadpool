@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.CommandRequest;
@@ -30,7 +30,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
-import static example.gossip.MembershipException.Reason.INVALID_RECORD;
+import static gossip.MembershipException.Reason.INVALID_RECORD;
 
 /** Gossip versioning and complete canonical-envelope accounting, independent of host version 1. */
 public final class GossipWire {
@@ -102,16 +102,45 @@ public final class GossipWire {
 
     /** Check new records before merging, so a single unforwardable record cannot break later replies. */
     public void requireForwardable(MemberRecord self, List<MemberRecord> records) {
-        requireReplyFits(self.key().serverId(), result(self, List.of()));
+        var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
+        requireReplyFits(self.key().serverId(), result(budgetSelf, List.of()));
         for (MemberRecord record : records) {
-            if (record.key().equals(self.key())) { continue; }
-            if (requestBytes(parameters(record, List.of())).length > config.maxExchangeBytes()) {
-                throw invalid("Single sender exceeds the complete request budget");
+            if (!record.key().equals(self.key())) {
+                if (requestBytes(parameters(record, List.of())).length > config.maxExchangeBytes()) {
+                    throw invalid("Single sender exceeds the complete request budget");
+                }
+                if (config.maxBatchMembers() > 1) {
+                    requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(record)));
+                }
             }
-            if (config.maxBatchMembers() > 1) {
-                requireReplyFits(self.key().serverId(), result(self, List.of(record)));
-            }
+            var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record, MembershipTable.Assessment.CANDIDATE,
+                    Long.MAX_VALUE, Long.MAX_VALUE, false, false);
+            String cursor = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
+            requireReplyFits(self.key().serverId(), page(budgetSelf, List.of(memberView(worst)), cursor,
+                    Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
+                            "tombstones", config.maxRecords())));
         }
+    }
+
+    Map<String, Object> page(MemberRecord self, List<Map<String, Object>> members, String cursor, Map<String, Object> capacity) {
+        var result = new LinkedHashMap<String, Object>();
+        result.put("swarmId", config.swarmId());
+        result.put("self", self.toWire());
+        result.put("members", List.copyOf(members));
+        result.put("nextCursor", cursor);
+        result.put("capacity", capacity);
+        return result;
+    }
+
+    static Map<String, Object> memberView(MembershipTable.MemberView member) {
+        var result = new LinkedHashMap<>(member.record().toWire());
+        result.put("assessment", member.assessment().name());
+        result.put("advanceAgeMillis", member.advanceAgeNanos() / 1_000_000);
+        result.put("directSuccessAgeMillis", member.directSuccessAgeNanos() == null ? null : member.directSuccessAgeNanos() / 1_000_000);
+        result.put("endpointVerified", member.endpointVerified());
+        result.put("identityConflict", member.identityConflict());
+        return result;
     }
 
     static int exactInteger(Object value, String field, int min, int max) {

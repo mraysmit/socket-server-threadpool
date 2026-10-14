@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -25,9 +25,9 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.LongSupplier;
 
-import static example.gossip.MemberRecord.State.ALIVE;
-import static example.gossip.MemberRecord.State.LEFT;
-import static example.gossip.MembershipException.Reason.*;
+import static gossip.MemberRecord.State.ALIVE;
+import static gossip.MemberRecord.State.LEFT;
+import static gossip.MembershipException.Reason.*;
 
 /** Per-instance owner state and local observations. No method performs network I/O. */
 public final class MembershipTable {

@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package example.gossip;
+package gossip;
 
 import dev.mars.protocol.Json;
 import org.junit.jupiter.api.Test;
@@ -31,8 +31,8 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
-import static example.gossip.MemberRecord.State.ALIVE;
-import static example.gossip.MembershipException.Reason.INVALID_RECORD;
+import static gossip.MemberRecord.State.ALIVE;
+import static gossip.MembershipException.Reason.INVALID_RECORD;
 import static org.junit.jupiter.api.Assertions.*;
 
 class MemberRecordTest {
