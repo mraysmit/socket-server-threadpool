@@ -159,25 +159,14 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
     }
 
     private static void requireId(String value, String key) {
-        if (value == null || !value.matches("[A-Za-z0-9._-]{1,128}")) {
+        if (!GossipValidation.validId(value)) {
             throw invalid(key, "must contain 1-128 letters, digits, dots, underscores, or hyphens");
         }
     }
 
     private static void requireHost(String host, String key) {
-        if (host == null || host.isBlank() || host.length() > 253 || host.contains("[") || host.contains("]")) {
+        if (!GossipValidation.validHost(host)) {
             throw invalid(key, "must be a hostname, IPv4 address, or unbracketed IPv6 address");
-        }
-        try {
-            String authority = host.contains(":") ? "[" + host + "]" : host;
-            URI endpoint = new URI("tcp://" + authority + ":1");
-            if (endpoint.getHost() == null || endpoint.getRawUserInfo() != null || endpoint.getPort() != 1
-                    || !endpoint.getRawPath().isEmpty() || endpoint.getRawQuery() != null
-                    || endpoint.getRawFragment() != null) {
-                throw invalid(key, "must contain only a host, without a scheme, port, or path");
-            }
-        } catch (URISyntaxException e) {
-            throw invalid(key, "is not a valid host");
         }
     }
 

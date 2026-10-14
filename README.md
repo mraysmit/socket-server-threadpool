@@ -502,8 +502,8 @@ Reinstall the server after API changes and rebuild the example after changes to
 its source. The example's `clean` removes its previous JAR before rebuilding it.
 
 The separate [`plugins/gossip-plugin`](plugins/gossip-plugin/pom.xml) project provides
-the initial gossip provider and configuration scaffold. It currently supports local
-`status` only; membership exchange and scheduling remain pending. See the
+the gossip provider, validated configuration, and membership model. It currently
+exposes local `status` only; peer exchange commands and scheduling remain pending. See the
 [gossip plugin document](docs/GOSSIP_PLUGIN.md) for configuration, build/run commands,
 packaged-JAR tests, and the implementation checklist.
 

@@ -40,8 +40,8 @@ class GossipPluginTest {
         assertEquals(9000, firstSelf.get("port"));
         UUID.fromString((String) firstSelf.get("bootId"));
         assertNotEquals(firstSelf.get("bootId"), ((Map<?, ?>) status(second).get("self")).get("bootId"));
-        assertEquals(List.of("status"), firstStatus.get("supportedOperations"));
-        assertEquals("scaffold", firstStatus.get("implementationStage"));
+        assertEquals(List.of("exchange", "members", "status"), firstStatus.get("supportedOperations"));
+        assertEquals("command-transport", firstStatus.get("implementationStage"));
         first.stop();
         first.stop();
         assertEquals(firstSelf, status(first).get("self"));
@@ -56,7 +56,7 @@ class GossipPluginTest {
         assertThrows(IllegalStateException.class, () -> status(plugin));
         plugin.start(new PluginContext("Self", 9000, 9001));
         try {
-            for (String operation : List.of("exchange", "members", "leave", "unknown")) {
+            for (String operation : List.of("exchange", "leave", "unknown")) {
                 assertThrows(InvalidParametersException.class, () -> plugin.execute(Map.of("operation", operation)));
             }
             assertThrows(InvalidParametersException.class, () -> plugin.execute(Map.of()));
@@ -67,7 +67,7 @@ class GossipPluginTest {
         } finally { plugin.stop(); }
     }
 
-    @Test void stopBeforeStartPreventsAcquiringState() {
+    @Test void stopBeforeStartPreventsAcquiringState() throws Exception {
         var plugin = new GossipPlugin();
         plugin.stop();
         assertThrows(IllegalStateException.class, () -> plugin.start(new PluginContext("Self", 9000, 9001)));

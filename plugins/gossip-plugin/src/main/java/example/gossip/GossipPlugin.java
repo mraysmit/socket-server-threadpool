@@ -18,14 +18,13 @@ package example.gossip;
 import dev.mars.plugin.CommandPlugin;
 import dev.mars.plugin.InvalidParametersException;
 import dev.mars.plugin.PluginContext;
-import dev.mars.plugin.PluginParameters;
 
-import java.util.List;
+import java.io.IOException;
 import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 
-/** Initial provider scaffold: local identity and status; no background work or peer exchanges yet. */
+/** Local command handlers and explicitly initiated peer exchanges; scheduling is not implemented yet. */
 public final class GossipPlugin implements CommandPlugin {
     private final GossipConfig suppliedConfig;
     private volatile Started started;
@@ -46,28 +45,33 @@ public final class GossipPlugin implements CommandPlugin {
         Objects.requireNonNull(context, "context");
         GossipConfig config = suppliedConfig == null
                 ? GossipConfig.fromSystemProperty(context.serverId()) : suppliedConfig;
-        started = new Started(config, context, UUID.randomUUID());
+        var self = new MemberRecord(new MemberKey(context.serverId(), UUID.randomUUID()),
+                config.advertiseHost(), context.port(), 0, MemberRecord.State.ALIVE, Map.of());
+        var table = new MembershipTable(config, self);
+        var metrics = new GossipMetrics();
+        var transport = new GossipTransport(config, table, metrics);
+        try { started = new Started(transport, new GossipCommands(config, table, metrics, transport)); }
+        catch (RuntimeException e) { transport.close(); throw e; }
     }
 
-    /** Retain local identity for accepted handlers; this stage owns no sockets, executors, or workers. */
-    @Override public synchronized void stop() { stopped = true; }
+    /** Cancel outbound I/O and retain the membership table for accepted handlers. */
+    @Override public synchronized void stop() throws IOException {
+        stopped = true;
+        if (started != null) { started.transport().close(); }
+    }
+
+    /** For embedded callers and the future scheduler. Never invoked by an incoming command handler. */
+    public GossipWire.Exchange exchangeWith(GossipConfig.Seed peer) throws IOException {
+        Started local = started;
+        if (local == null) { throw new IOException("Gossip plugin has not started successfully"); }
+        return local.transport().exchange(peer);
+    }
 
     @Override public Object execute(Map<String, Object> parameters) throws InvalidParametersException {
-        PluginParameters.requireKeys(parameters, "operation");
-        String operation = PluginParameters.string(parameters, "operation");
-        if (!operation.equals("status")) {
-            throw new InvalidParametersException("Gossip scaffold supports only operation 'status'; "
-                    + "exchange, members, and leave are not implemented");
-        }
         Started local = started;
         if (local == null) { throw new IllegalStateException("Gossip plugin has not started successfully"); }
-        return Map.of("gossipVersion", 1, "swarmId", local.config().swarmId(),
-                "self", Map.of("serverId", local.context().serverId(), "bootId", local.bootId().toString(),
-                        "host", local.config().advertiseHost(), "port", local.context().port(),
-                        "heartbeat", 0, "state", "ALIVE", "metadata", Map.of()),
-                "workerState", stopped ? "STOPPED" : "NOT_SCHEDULED", "isolated", true,
-                "implementationStage", "scaffold", "supportedOperations", List.of("status"));
+        return local.commands().execute(parameters, stopped);
     }
 
-    private record Started(GossipConfig config, PluginContext context, UUID bootId) { }
+    private record Started(GossipTransport transport, GossipCommands commands) { }
 }

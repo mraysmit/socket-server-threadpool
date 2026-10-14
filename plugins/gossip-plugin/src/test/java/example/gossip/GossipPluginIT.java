@@ -102,13 +102,13 @@ class GossipPluginIT {
             UUID.fromString((String) firstSelf.get("bootId"));
             UUID.fromString((String) secondSelf.get("bootId"));
             assertNotEquals(firstSelf.get("bootId"), secondSelf.get("bootId"));
-            assertEquals("scaffold", first.get("implementationStage"));
-            assertEquals(List.of("status"), first.get("supportedOperations"));
+            assertEquals("command-transport", first.get("implementationStage"));
+            assertEquals(List.of("exchange", "members", "status"), first.get("supportedOperations"));
             assertEquals(true, first.get("isolated"));
             assertEquals(firstSelf, self(status(firstClient)));
 
             for (var parameters : List.<Map<String, Object>>of(Map.of(), Map.of("operation", 1),
-                    Map.of("operation", "exchange"), Map.of("operation", "members"), Map.of("operation", "leave"),
+                    Map.of("operation", "exchange"), Map.of("operation", "leave"),
                     Map.of("operation", "status", "unexpected", true))) {
                 UUID id = UUID.randomUUID();
                 var failure = assertThrows(CommandExecutionException.class,
