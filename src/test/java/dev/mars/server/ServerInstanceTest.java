@@ -16,6 +16,8 @@
 package dev.mars.server;
 
 import dev.mars.client.TextMessageClient;
+import dev.mars.plugin.CommandPlugin;
+import dev.mars.plugin.PluginRegistry;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -27,10 +29,13 @@ import java.io.InputStreamReader;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -227,6 +232,76 @@ class ServerInstanceTest {
             assertTimeoutPreemptively(Duration.ofSeconds(2), instance::close);
         }
         assertReleased(instance.getPort(), instance.getAdminPort());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"idle", "trickling"})
+    void stalledMainConnectionCannotHoldCloseBeyondDrainTimeout(String behaviour) throws Exception {
+        var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0));
+        instance.server().drainTimeout(Duration.ofMillis(500));
+        try (instance; var stalled = new Socket("localhost", instance.getPort())) {
+            stalled.setSoTimeout(5000);
+            if (behaviour.equals("trickling")) {
+                // Each byte arrives inside the read timeout, but a line never completes.
+                var out = stalled.getOutputStream();
+                Thread.ofVirtual().start(() -> {
+                    try { while (true) { out.write('x'); out.flush(); Thread.sleep(100); } }
+                    catch (IOException | InterruptedException closed) { }
+                });
+            }
+            Thread.sleep(200); // Let the worker reach its blocking read.
+            long started = System.nanoTime();
+            instance.close();
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            assertTrue(millis < 3000, "close() took " + millis + " ms despite a 500 ms drain timeout");
+            assertTrue(instance.server().requestExecutor.isTerminated(), "Stalled worker must be interrupted");
+            try { assertEquals(-1, stalled.getInputStream().read(), "Server must close the stalled connection"); }
+            catch (IOException resetWithUnreadInput) { }
+        }
+        assertReleased(instance.getPort(), instance.getAdminPort());
+    }
+
+    @Test
+    void mainListenerClosesBeforePluginsQuiesce() throws Exception {
+        var quiescing = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        var plugin = new CommandPlugin() {
+            @Override public void stop() throws Exception {
+                quiescing.countDown();
+                assertTrue(release.await(5, TimeUnit.SECONDS));
+            }
+        };
+        var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0), PluginRegistry.of(List.of(plugin)));
+        try (instance; var closers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var closing = closers.submit(instance::close);
+            try {
+                assertTrue(quiescing.await(5, TimeUnit.SECONDS));
+                assertNotServed(instance.getPort());
+            } finally {
+                release.countDown();
+            }
+            closing.get(5, TimeUnit.SECONDS);
+        }
+        assertReleased(instance.getPort(), instance.getAdminPort());
+    }
+
+    /**
+     * Until the parked acceptor observes the close, the OS may still queue a connection on Windows;
+     * it is reset once the descriptor closes. What matters is that no request is ever served.
+     */
+    private static void assertNotServed(int port) throws IOException {
+        try (var socket = new Socket("localhost", port)) {
+            socket.setSoTimeout(5000);
+            new PrintWriter(socket.getOutputStream(), true, StandardCharsets.UTF_8)
+                    .println("message " + UUID.randomUUID() + " late");
+            String reply = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8))
+                    .readLine();
+            assertNull(reply, "Request was served while plugins were quiescing: " + reply);
+        } catch (SocketTimeoutException e) {
+            fail("Late request was neither refused, reset nor closed", e);
+        } catch (IOException refusedOrReset) {
+            // Connection refused, or accepted by the OS and reset when the listener's descriptor closed.
+        }
     }
 
     private static void assertHealthy(ServerInstance instance) throws IOException {

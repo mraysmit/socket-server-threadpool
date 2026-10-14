@@ -46,7 +46,11 @@ public final class ServerInstance implements AutoCloseable {
     }
 
     public static ServerInstance start(ServerOptions options) throws IOException {
-        var plugins = PluginRegistry.loadDirectories(options.pluginDirectories());
+        return start(options, PluginRegistry.loadDirectories(options.pluginDirectories()));
+    }
+
+    /** Starts with a caller-supplied registry, which the instance then owns and closes. */
+    static ServerInstance start(ServerOptions options, PluginRegistry plugins) throws IOException {
         ServerInstance instance;
         try {
             instance = new ServerInstance(options, plugins);
@@ -110,12 +114,16 @@ public final class ServerInstance implements AutoCloseable {
         }
         stopRequested = true;
         RuntimeException failure = null;
-        try { plugins.stop(); }
-        catch (IOException e) { failure = new UncheckedIOException("Cannot stop plugins", e); }
+        // Close the main listener first so no new request reaches a quiescing plugin; accepted ones still drain.
+        try { failure = attempt(failure, server::stop); }
         finally {
-            try { failure = attempt(failure, monitor::stop); }
-            finally {
-                failure = attempt(failure, server::stop);
+            try {
+                try { plugins.stop(); }
+                catch (IOException e) {
+                    failure = attempt(failure, () -> { throw new UncheckedIOException("Cannot stop plugins", e); });
+                }
+            } finally {
+                failure = attempt(failure, monitor::stop);
                 stopFailure = failure;
             }
         }
@@ -133,7 +141,7 @@ public final class ServerInstance implements AutoCloseable {
             finally {
                 try { failure = attempt(failure, listeners::close); }
                 finally {
-                    try { failure = attempt(failure, server.requestExecutor::close); }
+                    try { failure = attempt(failure, server::drain); }
                     finally {
                         failure = attempt(failure, () -> {
                             try { plugins.close(); }

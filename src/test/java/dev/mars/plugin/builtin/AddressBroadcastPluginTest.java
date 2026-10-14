@@ -23,10 +23,13 @@ import dev.mars.server.ServerOptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
 import java.net.InetAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.ServiceLoader;
@@ -90,6 +93,25 @@ class AddressBroadcastPluginTest {
         var plugin = new AddressBroadcastPlugin(List::of,
                 (target, port, payload) -> fail("Nothing should be sent"));
         assertDoesNotThrow(() -> plugin.start(new PluginContext("Server-001", 9010, 9011)));
+    }
+
+    @Test
+    void defaultProviderSendsNothingWhenAnnouncementsAreDisabled() throws Exception {
+        String property = AddressBroadcastPlugin.ANNOUNCE_PROPERTY;
+        String previous = System.setProperty(property, "false");
+        var captured = new ByteArrayOutputStream();
+        var originalOut = System.out;
+        System.setOut(new PrintStream(captured, true, StandardCharsets.UTF_8));
+        try {
+            new AddressBroadcastPlugin().start(new PluginContext("Server-001", 9010, 9011));
+        } finally {
+            System.setOut(originalOut);
+            if (previous == null) { System.clearProperty(property); }
+            else { System.setProperty(property, previous); }
+        }
+        String log = captured.toString(StandardCharsets.UTF_8);
+        assertFalse(log.contains("Server announcement sent"), log);
+        assertTrue(log.contains("Server announcement skipped") && log.contains("disabled"), log);
     }
 
     private static AddressBroadcastPlugin.Endpoint endpoint(String ip, String broadcast) throws Exception {

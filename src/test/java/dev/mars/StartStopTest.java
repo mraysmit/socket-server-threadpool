@@ -228,7 +228,8 @@ class StartStopTest {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
         var command = new ArrayList<String>();
-        command.add(java.toString()); command.add("-cp"); command.add(classes); command.add(mainClass);
+        command.add(java.toString()); command.add("-Ddev.mars.announce=false");
+        command.add("-cp"); command.add(classes); command.add(mainClass);
         // Preserve embedded JSON quotes through Windows' native command-line parser.
         boolean windows = System.getProperty("os.name").startsWith("Windows");
         command.addAll(Arrays.stream(args).map(arg -> windows ? arg.replace("\"", "\\\"") : arg).toList());

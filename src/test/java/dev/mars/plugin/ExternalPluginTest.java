@@ -711,7 +711,7 @@ class ExternalPluginTest {
         Path jar = lifecycleJar(directory, false, false);
         Path javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         if (!Files.exists(javaExecutable)) { javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java"); }
-        var process = new ProcessBuilder(javaExecutable.toString(), "-cp",
+        var process = new ProcessBuilder(javaExecutable.toString(), "-Ddev.mars.announce=false", "-cp",
                 System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
                 "dev.mars.StartStop", "Console", "--port", "0", "--admin-port", "0", "--plugins-dir", directory.toString())
                 .redirectErrorStream(true).start();
@@ -854,8 +854,11 @@ class ExternalPluginTest {
                 .collect(java.util.stream.Collectors.joining());
         var compiler = ToolProvider.getSystemJavaCompiler();
         assertNotNull(compiler, "External plugin tests require a JDK");
-        assertEquals(0, compiler.run(null, null, null, "-encoding", "UTF-8", "-classpath", classpath,
-                "-d", classes.toString(), source.toString()));
+        var diagnostics = new java.io.ByteArrayOutputStream();
+        int status = compiler.run(null, null, diagnostics, "-encoding", "UTF-8", "-classpath", classpath,
+                "-d", classes.toString(), source.toString());
+        assertEquals(0, status, () -> "Fixture " + name + " failed to compile:\n"
+                + diagnostics.toString(StandardCharsets.UTF_8));
         Path jar = directory.resolve(name + ".jar");
         try (var output = new JarOutputStream(Files.newOutputStream(jar))) {
             output.putNextEntry(new JarEntry("example/" + name + ".class"));

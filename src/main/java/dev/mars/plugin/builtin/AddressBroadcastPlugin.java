@@ -33,28 +33,40 @@ import java.util.List;
 /** One best-effort IPv4 UDP announcement per active broadcast-capable interface. */
 public final class AddressBroadcastPlugin implements CommandPlugin {
     public static final int BROADCAST_PORT = 9002;
+    /** System property; "false" silences the discovered provider, e.g. on shared networks or in tests. */
+    public static final String ANNOUNCE_PROPERTY = "dev.mars.announce";
     private final Endpoints endpoints;
     private final Sender sender;
     private final int broadcastPort;
+    private final boolean enabled;
 
-    public AddressBroadcastPlugin() { this(AddressBroadcastPlugin::networkEndpoints, AddressBroadcastPlugin::send); }
+    public AddressBroadcastPlugin() {
+        this(AddressBroadcastPlugin::networkEndpoints, AddressBroadcastPlugin::send, BROADCAST_PORT,
+                !"false".equalsIgnoreCase(System.getProperty(ANNOUNCE_PROPERTY)));
+    }
 
     AddressBroadcastPlugin(Endpoints endpoints, Sender sender) {
-        this(endpoints, sender, BROADCAST_PORT);
+        this(endpoints, sender, BROADCAST_PORT, true);
     }
 
     AddressBroadcastPlugin(Endpoints endpoints, int broadcastPort) {
-        this(endpoints, AddressBroadcastPlugin::send, broadcastPort);
+        this(endpoints, AddressBroadcastPlugin::send, broadcastPort, true);
     }
 
-    private AddressBroadcastPlugin(Endpoints endpoints, Sender sender, int broadcastPort) {
+    private AddressBroadcastPlugin(Endpoints endpoints, Sender sender, int broadcastPort, boolean enabled) {
         this.endpoints = endpoints;
         this.sender = sender;
         this.broadcastPort = broadcastPort;
+        this.enabled = enabled;
     }
 
     @Override
     public void start(PluginContext context) {
+        if (!enabled) {
+            System.out.println("Server announcement skipped | serverId=" + context.serverId()
+                    + " | port=" + context.port() + " | reason=announcements disabled (" + ANNOUNCE_PROPERTY + "=false)");
+            return;
+        }
         List<Endpoint> available;
         try { available = endpoints.get(); }
         catch (IOException e) {

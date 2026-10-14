@@ -17,6 +17,8 @@ package dev.mars.server;
 
 import dev.mars.client.TextMessageClient;
 import dev.mars.client.MessageReply;
+import dev.mars.protocol.Json;
+import dev.mars.worker.WorkerRunnable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,6 +36,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Locale;
 import java.util.UUID;
 import java.util.HashSet;
@@ -117,7 +120,7 @@ class ServerLifecycleTest {
         assertTrue(server.isStopped());
         assertTrue(server.requestExecutor.awaitTermination(5, TimeUnit.SECONDS));
         assertThrows(ConnectException.class, () -> {
-            try (var ignored = connect(serverPort)) {
+            try (var _ = connect(serverPort)) {
                 fail("Main listener still accepts connections");
             }
         });
@@ -270,6 +273,32 @@ class ServerLifecycleTest {
                         "Each sent message must have a unique ID");
             }
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {0, 1})
+    void requestLineLongerThanTheLimitIsRejectedWithoutBufferingIt(int excess) throws Exception {
+        int limit = WorkerRunnable.MAX_LINE_LENGTH;
+        var line = new byte[limit + excess];
+        Arrays.fill(line, (byte) 'a');
+        try (var client = connect(serverPort)) {
+            var out = client.getOutputStream();
+            out.write(line);
+            if (excess == 0) { out.write('\n'); }
+            out.flush();
+            var reader = new BufferedReader(new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
+            var reply = Json.read(reader.readLine());
+            assertEquals("ERROR", reply.path("status").asText());
+            assertEquals("INVALID_REQUEST", reply.path("error").path("code").asText());
+            String message = reply.path("error").path("message").asText();
+            if (excess == 0) {
+                assertEquals("Malformed JSON request", message, "A line at the limit is parsed normally");
+            } else {
+                assertTrue(message.contains(String.valueOf(limit)), message);
+            }
+            assertNull(reader.readLine(), "Connection closes after the reply");
+        }
+        assertEquals("Server status: ALIVE", command("status"));
     }
 
     @Test

@@ -43,6 +43,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * to specialized classes, adhering to the Single Responsibility Principle.
  */
 public class WorkerRunnable implements Runnable {
+    /** Longest request or header line read before the connection is rejected. */
+    public static final int MAX_LINE_LENGTH = 64 * 1024;
     private static final AtomicLong NEXT_CONNECTION_ID = new AtomicLong();
     private static final DateTimeFormatter LOG_TIMESTAMP = DateTimeFormatter
             .ofPattern("uuuu-MM-dd HH:mm:ss.SSS XXX", Locale.ROOT)
@@ -80,7 +82,15 @@ public class WorkerRunnable implements Runnable {
 
             logEvent("Client connected", Instant.now());
             clientSocket.setSoTimeout(10000);
-            String request = reader.readLine();
+            var lines = new BoundedLineReader(reader);
+            String request;
+            try {
+                request = lines.readLine();
+            } catch (LineTooLongException e) {
+                writer.println(Json.write(CommandReply.failure(null, serverId, connectionId,
+                        CommandError.Code.INVALID_REQUEST, e.getMessage())));
+                return;
+            }
             if (request == null) {
                 return;
             }
@@ -122,12 +132,17 @@ public class WorkerRunnable implements Runnable {
             }
             // Consume the request headers before closing the socket to avoid a TCP reset.
             String line;
-            do {
-                line = reader.readLine();
-                if (line == null) {
-                    return;
-                }
-            } while (!line.isEmpty());
+            try {
+                do {
+                    line = lines.readLine();
+                    if (line == null) {
+                        return;
+                    }
+                } while (!line.isEmpty());
+            } catch (LineTooLongException e) {
+                logEvent("Rejected request: " + e.getMessage(), Instant.now());
+                return;
+            }
 
             long time = System.currentTimeMillis();
 
@@ -147,16 +162,9 @@ public class WorkerRunnable implements Runnable {
             responseWriter.writeResponse(response, writer);
 
         } catch (IOException e) {
-            // Log the exception with more context
-            System.err.println("Error processing client request: " + e.getMessage());
-            e.printStackTrace();
-
-            // Try to send an error response
-            try (PrintWriter errorWriter = new PrintWriter(clientSocket.getOutputStream(), true, StandardCharsets.UTF_8)) {
-                responseWriter.writeInternalServerErrorResponse(errorWriter);
-            } catch (IOException errorResponseException) {
-                System.err.println("Failed to send error response: " + errorResponseException.getMessage());
-            }
+            // Timeouts, resets and interrupted reads are client-side aborts; the socket is already unusable.
+            System.err.println("Request aborted: " + e.getMessage() + " | connectionId=" + connectionId
+                    + " | serverId=" + serverId);
         } finally {
             try {
                 if (clientSocket != null) {
@@ -182,6 +190,33 @@ public class WorkerRunnable implements Runnable {
         writer.println(Json.write(reply));
         if (writer.checkError()) { throw new IOException("Could not send command reply"); }
         logEvent("Command reply sent: " + reply.status(), Instant.now());
+    }
+
+    private static final class LineTooLongException extends IOException {
+        LineTooLongException() { super("Request line exceeds " + MAX_LINE_LENGTH + " characters"); }
+    }
+
+    /** Line reader that stops as soon as a line exceeds the limit instead of growing with the input. */
+    private static final class BoundedLineReader {
+        private final Reader in;
+        private boolean skipLineFeed;
+
+        BoundedLineReader(Reader in) { this.in = in; }
+
+        /** Terminators are \n, \r or \r\n, as for BufferedReader; returns null at end of stream. */
+        String readLine() throws IOException {
+            var line = new StringBuilder();
+            int c;
+            while ((c = in.read()) != -1) {
+                if (c == '\n' && skipLineFeed) { skipLineFeed = false; continue; }
+                skipLineFeed = false;
+                if (c == '\n') { return line.toString(); }
+                if (c == '\r') { skipLineFeed = true; return line.toString(); }
+                if (line.length() == MAX_LINE_LENGTH) { throw new LineTooLongException(); }
+                line.append((char) c);
+            }
+            return line.isEmpty() ? null : line.toString();
+        }
     }
 
     private void logEvent(String event, Instant timestamp) {
