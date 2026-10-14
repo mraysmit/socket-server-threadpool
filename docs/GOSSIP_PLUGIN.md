@@ -3,7 +3,7 @@
 | Document metadata | Details |
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
-| Status | Proposed plugin architecture and implementation plan |
+| Status | Architecture proposal; provider and configuration scaffold implemented |
 | Last updated | 2026-10-14 |
 
 ## Purpose and scope
@@ -12,7 +12,7 @@ Implement a plugin that lets instances of this server discover one another and m
 
 The first implementation should gossip membership and small, owner-controlled metadata, such as a node's supported application instructions. It should expose the local membership view for inspection. Application event delivery can be added later, with its own retention and deduplication rules.
 
-This is an implementation proposal. The repository currently supplies the transport and plugin infrastructure, but has no gossip implementation. Most of the design fits inside an external plugin JAR. The host lifecycle prerequisite is implemented: optional stop hooks now run during instance shutdown and failed startup, before accepted requests drain and the plugin loader closes.
+The external provider and configuration scaffold now exist in [`plugins/gossip-plugin`](../plugins/gossip-plugin/pom.xml). It loads through `ServiceLoader`, resolves per-instance settings, creates a fresh boot ID, and answers `status`. Membership merges, peer exchanges, scheduling, departure, and UDP discovery remain proposed. The host lifecycle prerequisite and baseline request hardening are implemented: shutdown closes the main listener before invoking optional plugin stop hooks, accepted requests have a bounded drain, and request/header lines and concurrently serviced connections have limits. Plugin stop hooks also run during failed startup, before loader cleanup.
 
 The intended first deployment is a small swarm on a trusted LAN, with mutually reachable TCP endpoints and unique configured server IDs. Membership is eventually consistent: nodes can temporarily disagree, and a timeout indicates suspected unreachability rather than proof that a process has stopped. Membership alone must not authorize exclusive ownership, elect a unique leader, or guarantee that a command executes once.
 
@@ -31,6 +31,8 @@ The intended first deployment is a small swarm on a trusted LAN, with mutually r
 
 No additional TCP listener is needed. Send gossip to the main command port; the administrative port remains for the existing status and shutdown commands. The HTTP and legacy text paths retain their current roles.
 
+The main listener currently services at most 1024 connections concurrently; excess connections wait in the kernel backlog. Transient `accept()` failures retry after 100 ms. These are host protections shared by gossip and application commands, not a substitute for the plugin's smaller outbound concurrency and message budgets. The connection cap and drain timeout have package-private setters for tests; neither is a CLI option.
+
 The protocol follows periodic peer exchanges and bounded information propagation described in [Wikipedia's gossip protocol overview](https://en.wikipedia.org/wiki/Gossip_protocol). Failure detection and dissemination should remain separate responsibilities, following the useful distinction in the [SWIM paper](https://www.cs.cornell.edu/projects/Quicksilver/public_pdfs/SWIM.pdf). The simpler heartbeat design below is not an implementation of SWIM and does not inherit its performance guarantees.
 
 ## One provider and one instruction
@@ -44,6 +46,8 @@ Register one public provider class, `example.gossip.GossipPlugin`, with instruct
 | `status` | Report local identity, worker state, last round, and counters. | None. |
 | `leave` | Schedule a bounded departure announcement and stop initiating exchanges. | Queue work only; return immediately. |
 
+Currently only `status` is implemented. Its result reports `implementationStage="scaffold"`, `supportedOperations=["status"]`, `isolated=true`, and `workerState="NOT_SCHEDULED"`. The local record has heartbeat zero; no background work or network exchanges run. Unsupported operations return `INVALID_PARAMETERS`. The other operations and full runtime diagnostics in this document are acceptance targets for later increments.
+
 Each discovered provider instance is shared by concurrent requests. Keep its runtime state in instance fields. Do not use a static singleton: tests and Java applications can start several `ServerInstance` objects in one JVM.
 
 Using one instruction avoids registering multiple providers that accidentally create separate membership tables. The current SPI assigns one instruction to each provider. Extra public commands would require a deliberate shared-runtime design; the operation field avoids that requirement.
@@ -52,7 +56,7 @@ Use `InvalidParametersException` for invalid operations, incompatible gossip ver
 
 ## Plugin configuration and identity
 
-Read a plugin-specific properties file from a JVM property such as `-Dgossip.config=...`. The host currently has no plugin configuration object or arbitrary plugin command-line flags. Do not add imaginary `--gossip-*` options to `ServerOptions`.
+The ServiceLoader provider requires a UTF-8 properties file selected by `-Dgossip.config=...`. Missing files or invalid settings fail plugin startup and trigger host cleanup. The host currently has no plugin configuration object or arbitrary plugin command-line flags. Do not add imaginary `--gossip-*` options to `ServerOptions`.
 
 Example configuration for one process:
 
@@ -74,11 +78,22 @@ terminal.retention.millis=1800000
 discovery.enabled=false
 ```
 
-These are proposed starting values for a small LAN swarm, not measured convergence or failure-detection guarantees. Tune them using the tests below. A seed entry contains an expected server ID, a host, and a main TCP port. Use a proper endpoint parser if IPv6 is supported.
+These values are parsed defaults for the future small-LAN runtime, not measured convergence or failure-detection guarantees. Only `swarm.id` and `advertise.host` are required; omitted seeds default to an empty list. Tune runtime values using the tests below. A seed entry contains an expected server ID, a host, and a main TCP port. The parser supports hostnames, IPv4, and bracketed IPv6 seed endpoints, such as `Server-001@[::1]:9000`, without resolving DNS during startup. Use an unbracketed IPv6 address for `advertise.host`.
+
+The parser rejects unknown keys, malformed or duplicate seed entries, non-integer/overflowing limits, and inconsistent timing or capacity settings. IDs use 1-128 letters, digits, dots, underscores, or hyphens. Intervals must be positive and convertible to nanoseconds; require `heartbeat < suspect < dead <= terminal retention`. Capacities require `1 <= max.members <= max.records`, batch count between 1 and `max.records`, and fanout/in-flight limits between 1 and `max.members`. The exchange budget must be 1024-65,536 bytes. `discovery.enabled=true` fails startup until discovery is implemented.
 
 Use `PluginContext.port()` for the advertised main port. A configured `advertise.host` supplies the reachable address because `PluginContext` has no host/interface field. Loopback works only for processes on the same machine; on separate machines configure a LAN address or resolvable hostname reachable by all members. The existing listeners bind to wildcard addresses, but firewall and routing rules must still allow access.
 
-Configuration is per plugin instance. A single JVM property can select a file for a normal one-server process. For multiple instances in one JVM, let the file contain sections keyed by `context.serverId()`, or supply configuration through an explicit constructor in the test harness. Do not cache the first process-wide configuration as shared mutable state.
+Configuration is per plugin instance. A single JVM property selects a file for a normal one-server process. For multiple instances in one JVM, global properties act as defaults and `server.<serverId>.<key>` overrides are resolved separately at each start:
+
+```properties
+swarm.id=demo-swarm
+advertise.host=127.0.0.1
+server.Server-001.advertise.host=192.168.1.10
+server.Server-002.advertise.host=192.168.1.11
+```
+
+Embedded applications and tests can instead supply an immutable [`GossipConfig`](../plugins/gossip-plugin/src/main/java/example/gossip/GossipConfig.java) to the explicit `GossipPlugin(config)` constructor. No process-wide mutable configuration or plugin runtime is cached.
 
 Give every concurrently running server a distinct `serverId`. Generate a fresh random `bootId` UUID when the plugin starts. The membership key is `(serverId, bootId)`: a restart creates a new member record even when the logical server ID stays the same. UUIDs distinguish processes; do not sort them to infer which restart is newer. Two reachable processes advertising the same server ID are a configuration conflict. Report both and require an operator to resolve the conflict rather than silently choosing a winner.
 
@@ -137,6 +152,8 @@ There are three reasons seeds remain necessary:
 - Several server processes on one host cannot portably each bind UDP 9002 and receive every announcement. Socket reuse is not a portable fanout mechanism. Use seeds for this layout, or an optional single host discovery agent that forwards candidates to local plugins.
 
 The built-in broadcaster runs independently of this plugin and may announce before its receiver starts. Providers initialize concurrently on virtual threads, with no guaranteed hook execution or completion order. Do not depend on class-name startup order to make discovery reliable. Optional receiver bind failures should disable that discovery path and leave seed-based startup working.
+
+Set `-Ddev.mars.announce=false` to disable announcements from the ServiceLoader-constructed broadcaster. This property is independent of the proposed `discovery.enabled` receiver setting. Host Surefire tests and existing child-JVM tests disable real announcements. Apply the same setting to the new plugin test suite and every child JVM it starts; exercise discovery through controlled UDP fixtures rather than broadcasting onto the LAN.
 
 ## Exchange protocol
 
@@ -227,7 +244,9 @@ The initial scheme sends record batches directly rather than full digests follow
 
 The existing client uses a 5-second connect timeout and a 10-second read timeout. With two permits, two stalled requests can occupy the outbound budget for several rounds. Skip overlapping work rather than queueing unbounded tasks. The first version can retain these defaults and use conservative failure thresholds. Shorter configurable timeouts require extending the client or implementing the same envelope and validation behavior in a bounded plugin transport. Account for DNS lookup and cancellation as well as socket timeouts when promising an overall deadline.
 
-The host currently reads unbounded lines before plugin validation. Plugin batch limits constrain cooperative peers but cannot protect the host from an oversized incoming line. Before using this beyond a trusted environment, add a byte-counted limit to the main socket reader and to gossip response reading before JSON parsing. Likewise, cap HTTP header bytes if the listener is exposed. This is a transport hardening change, separate from the gossip merge algorithm.
+The host now bounds each request and HTTP header line at `WorkerRunnable.MAX_LINE_LENGTH`, currently 65,536 Java UTF-16 code units, excluding the line terminator. An overlong first line receives `INVALID_REQUEST`; an overlong HTTP header closes the connection. This is a decoded-character limit, not a UTF-8 byte budget, and it does not cap the total HTTP header section. Keep the proposed 32,768-byte exchange budget on complete serialized envelopes independently of this host limit.
+
+`TextMessageClient` still reads replies with an unbounded `BufferedReader.readLine()` before JSON parsing. Plugin validation can reject an oversized result only after that allocation. Before deployment beyond a trusted environment, add byte-counted limits before JSON parsing to both request and gossip response readers, and cap aggregate HTTP header bytes. Response limits can be added to the existing client or a plugin transport that preserves its correlation and server-identity checks. These remaining transport tasks are separate from the gossip merge algorithm.
 
 ## Host lifecycle prerequisite (implemented)
 
@@ -242,17 +261,17 @@ default void stop() throws Exception { }
 The implemented host contract is:
 
 - `PluginRegistry` discovers and validates providers sequentially, then initializes them concurrently on virtual threads. It waits for all startup tasks before reporting success or failure and serializes lifecycle calls so startup and stop hooks never overlap. It tracks providers whose startup has been entered, including a provider that throws after allocating resources. Its idempotent `stop()` invokes their hooks in reverse recorded startup-entry order, continues after hook exceptions or nonfatal errors, and aggregates failures. Constructors should avoid acquiring resources.
-- `ServerInstance.requestStop()` is an idempotent instance stop-request path that first quiesces plugins and then stops the admin and main listeners. Administrative `shutdown` uses this path.
-- `ServerInstance.close()` invokes that stop-request path, joins listener tasks, waits for accepted request tasks, and only then closes the registry/class loader. Preserve cleanup through `finally` even when a hook fails.
+- `ServerInstance.requestStop()` is an idempotent instance stop-request path that first closes the main listener, then quiesces plugins, then stops the admin monitor. Administrative `shutdown` uses this path. Already accepted handlers retain access to plugin state while draining. On Windows, the OS can briefly queue a connection while the listener descriptor closes; tests assert that no request is served during quiescing rather than requiring immediate connection refusal.
+- `ServerInstance.close()` invokes that stop-request path, joins listener tasks, invokes request draining, and then closes the registry/class loader. The main listener task also drains in its `finally` block. Each `ThreadPooledServer.drain()` call waits up to the configured timeout (default 5 seconds), interrupts remaining workers with `shutdownNow()`, and waits up to that timeout again. Interrupting virtual threads blocked on socket I/O closes their sockets. A handler that ignores interruption can outlive these waits, so this is not a guarantee that arbitrary plugin execution has finished before loader close. Preserve cleanup through `finally` even when a hook fails.
 - Registry close also invokes its idempotent stop path as a fallback. Failed startup follows the same cleanup path, including hooks already entered. Every discovered provider still has its loader resources released.
 
 The admin command runs inside the monitor task. Its stop-request path must not join that same task or call `listeners.close()` from inside it. Preserve the current console behavior: `shutdown` requests a stop; `quit` or end-of-input reaches instance close and completes joins and loader cleanup.
 
-The gossip stop hook prevents new rounds, cancels scheduled work, closes the optional UDP receiver, and cancels active outbound work. If using the current client, account for its finite socket waits and test the shutdown bound. For prompt cancellation, extend the transport to own and close its active sockets rather than assuming interrupting any arbitrary networking call is sufficient. Join plugin background tasks before returning so no background thread retains the plugin loader. Keep the in-memory table available to already accepted handlers until the host drains them.
+The gossip stop hook prevents new rounds, cancels scheduled work, closes the optional UDP receiver, and cancels active outbound work. If using the current client, account for its finite socket waits and test the shutdown bound. For prompt cancellation, extend the transport to own and close its active sockets rather than assuming interrupting any arbitrary networking call is sufficient. Join plugin background tasks before returning so no background thread retains the plugin loader. Keep the in-memory table available to already accepted handlers during draining, and keep handlers short and responsive to cancellation. The host's request drain timeout does not bound synchronous plugin stop hooks or their outbound work.
 
 Do not send a synchronous departure RPC from `stop()`: shutdown must still finish when the network is down. The explicit `leave` operation publishes a terminal local record, queues a bounded dissemination attempt, and then quiesces periodic work. Make it asynchronous and expose completion in `status`. Invoke it before shutdown when graceful departure is desired. Other nodes eventually time out a process that exits without delivering `LEFT`.
 
-Tests exercise normal close, administrative shutdown, console quit/end-of-input, partial initialization, concurrent startup failures, stop-hook failures, concurrent shutdown, instance isolation, and loader availability until accepted commands complete. A real external provider owns a worker blocked on UDP receive; its stop hook closes the socket and joins the worker, and its JAR can be deleted after host cleanup on Windows. Stop hooks run synchronously without a host-enforced deadline. The gossip plugin will still need to implement its own cancellation and bounded resource cleanup.
+Tests exercise normal close, administrative shutdown, console quit/end-of-input, partial initialization, concurrent startup failures, stop-hook failures, concurrent shutdown, instance isolation, and loader availability for accepted commands that complete during draining. They also cover idle/trickling clients and main-listener closure before plugin quiescing. A real external provider owns a worker blocked on UDP receive; its stop hook closes the socket and joins the worker, and its JAR can be deleted after host cleanup on Windows. Stop hooks run synchronously without a host-enforced deadline. The gossip plugin will still need to implement its own cancellation and bounded resource cleanup.
 
 ## Suggested plugin classes
 
@@ -271,9 +290,9 @@ Inject a monotonic clock, random source, and transport boundary into the runtime
 
 ## Packaging and running a local swarm
 
-Follow the existing [multiply plugin example](../plugins/multiply-plugin/pom.xml): create a separate Java 27 Maven project, depend on `dev.mars:socket-client-server:1.0-SNAPSHOT` with scope `provided`, and package only the plugin implementation and its own resources. Do not include copies of host SPI classes.
+The [gossip project](../plugins/gossip-plugin/pom.xml) follows the existing [multiply plugin example](../plugins/multiply-plugin/pom.xml): a separate Java 27 Maven project depends on `dev.mars:socket-client-server:1.0-SNAPSHOT` with scope `provided` and packages only the plugin implementation and its own resources. Host SPI classes are supplied by the host.
 
-Create this service file inside the plugin project:
+The project includes this service file:
 
 ```text
 src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin
@@ -287,7 +306,7 @@ example.gossip.GossipPlugin
 
 Use a dedicated plugin directory containing the gossip JAR and any dependencies it needs. Built-in providers are inherited through the host's parent class loader. Loading duplicate gossip providers fails startup because their instruction names conflict. Restart members to load a new plugin JAR; there is no hot reload.
 
-After implementing the plugin, build the host and plugin, then copy the plugin JAR into `plugins/gossip`. The host lifecycle prerequisite is already implemented. The following illustrates a proposed project at `plugins/gossip-plugin`:
+Use Java 27 for Maven and the server processes. Build and install the host API, verify the standalone plugin, and copy the host's runtime dependencies:
 
 ```powershell
 mvn clean install
@@ -295,20 +314,25 @@ mvn -f plugins/gossip-plugin/pom.xml clean verify
 mvn dependency:copy-dependencies "-DincludeScope=runtime"
 ```
 
-The gossip project, configuration files, and plugin directory in this section must be created during implementation; they do not exist yet. Use separate config files with the same swarm ID and seed list. Start each process from the repository root in its own PowerShell terminal:
+The project builds `plugins/gossip-plugin/target/gossip-plugin-1.0-SNAPSHOT.jar`. The local demo files [`gossip-001.properties`](../config/gossip-001.properties), [`gossip-002.properties`](../config/gossip-002.properties), and [`gossip-003.properties`](../config/gossip-003.properties) share a swarm ID and seed list. Load the JAR directly from its target directory, or copy it to a dedicated runtime folder. Start each process from the repository root in its own PowerShell terminal; these seed-only demo commands disable LAN announcements:
 
 ```powershell
-java "-Dgossip.config=config/gossip-001.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-001 --port 9000 --admin-port 9001 --plugins-dir plugins/gossip
-java "-Dgossip.config=config/gossip-002.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-002 --port 9010 --admin-port 9011 --plugins-dir plugins/gossip
-java "-Dgossip.config=config/gossip-003.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-003 --port 9020 --admin-port 9021 --plugins-dir plugins/gossip
+java "-Ddev.mars.announce=false" "-Dgossip.config=config/gossip-001.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-001 --port 9000 --admin-port 9001 --plugins-dir plugins/gossip-plugin/target
+java "-Ddev.mars.announce=false" "-Dgossip.config=config/gossip-002.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-002 --port 9010 --admin-port 9011 --plugins-dir plugins/gossip-plugin/target
+java "-Ddev.mars.announce=false" "-Dgossip.config=config/gossip-003.properties" -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-003 --port 9020 --admin-port 9021 --plugins-dir plugins/gossip-plugin/target
 ```
 
 All three advertise `127.0.0.1` for this local demonstration. On different machines use reachable addresses and update the seeds. Automatic TCP allocation also works because the startup context supplies bound ports, but static seed files need a stable entry point or an independent discovery mechanism.
 
-At each console, inspect the proposed plugin using the existing `send` command:
+At each console, inspect the implemented scaffold using the existing `send` command:
 
 ```text
 send {"instruction":"gossip","parameters":{"operation":"status"}}
+```
+
+Each process currently reports only its own identity and remains isolated. The following commands and convergence/recovery checks apply after membership and runtime tasks are implemented:
+
+```text
 send {"instruction":"gossip","parameters":{"operation":"members","limit":32}}
 ```
 
@@ -330,28 +354,37 @@ Use JUnit and the existing real-socket/external-JAR approach. Mockito and replac
 |---|---|
 | Merge behavior | Higher heartbeats win; duplicates do not refresh freshness; conflicts are rejected; `LEFT` dominates its boot ID; a restart creates a distinct identity. |
 | Failure assessment | Monotonic elapsed time drives suspicion; one failed request does not declare failure; stale forwarded data cannot keep a peer alive; successful probes restore local reachability. |
-| Wire behavior | Actual JSON requests and replies preserve UUIDs, numeric types, Unicode, null handling, byte limits, and server/swarm identity checks. Invalid input leaves the table unchanged. |
+| Wire behavior | Actual JSON requests and replies preserve UUIDs, numeric types, Unicode, null handling, complete-envelope byte limits, and server/swarm identity checks. Distinguish UTF-8 byte budgets from the host's decoded-character line limit. Invalid input leaves the table unchanged. |
 | Three-member swarm | Real servers converge from seeds; built-in `echo`, HTTP, and admin status continue working during exchanges. |
 | Larger swarm | Test at the configured membership cap with multiple batches. Every record receives fair transmission opportunities and outbound concurrency stays bounded. |
 | Loss and partitions | A protocol fixture or controllable TCP relay drops, delays, or reorders complete exchanges. After reconnection and fair exchanges, current owner records converge. |
 | Bootstrap edge cases | Seeds start late, some are down, UDP is unavailable, same-host instances share a seed list, and gossip versions or swarm IDs disagree. |
-| Lifecycle | Failed startup, `quit`, end-of-input, and admin `shutdown` stop plugin work. Idle UDP receive and stalled outbound requests terminate within the documented bound. |
+| Lifecycle | Failed startup, `quit`, end-of-input, and admin `shutdown` stop plugin work. Idle UDP receive and stalled outbound requests terminate within the plugin's documented bound, independently of the host request drain timeout. Accepted handlers can still use retained state during draining. |
 | Packaging | Load a real external JAR, execute gossip on virtual threads, close instances, and delete the JAR on Windows after cleanup. |
 | Isolation | Multiple instances in one JVM have distinct tables, boot IDs, configuration, and worker lifecycles. Closing one leaves the others working. |
+| Test network hygiene | Plugin tests and spawned JVMs disable built-in LAN announcements. Discovery fixtures use controlled UDP endpoints and do not broadcast onto real interfaces. |
 
 Use fake elapsed time for precise expiry tests and eventual assertions with bounded deadlines for live convergence. Record observed convergence times rather than promising logarithmic timing from the general gossip model. Verify startup rollback after a later provider fails, so cleanup covers gossip workers that were already scheduled.
 
+The scaffold currently has 56 unit tests covering configuration parsing and provider lifecycle/status, plus three packaged-JAR integration tests. The integration fixture excludes plugin implementation classes from its parent classpath, starts two real servers in one JVM, verifies distinct configurations and boot IDs through TCP, closes one while the other remains usable, and deletes the JAR after both instances close while the JVM is still alive. It also verifies rejection of invalid configuration and invalid/unimplemented command operations. Root `mvn test` does not run this separate project; use its `mvn verify` command above.
+
 Expose round counts, exchange successes/failures, last successful exchange age, in-flight count, rejected records, identity conflicts, capacity usage, and membership counts by local assessment. Avoid logging every member on every round. These measurements distinguish isolation, transport failure, invalid peers, and an overloaded batch budget.
 
-## Implementation sequence
+## Implementation sequence and task status
 
-1. **Complete:** Add and test the host stop-hook contract, including administrative shutdown and partial startup rollback.
-2. Create the separate plugin project and service registration. Implement configuration, immutable records, exact validation, and membership merges.
-3. Implement the `exchange`, `members`, and `status` operations using the existing socket protocol. Verify a real two-node round trip before adding scheduling.
-4. Add jittered rounds, fair batches, bounded fanout, seed retries, local failure assessments, and expiry. Verify three-node convergence and restart handling.
-5. Add bounded departure behavior and lifecycle cleanup tests. Run the existing host suite and packaged-plugin integration tests.
-6. Add optional UDP discovery after seed-based operation is reliable. Measure the configured maximum swarm size and tune batch and timing settings.
+The checked tasks below are implemented in the current repository. The next action is the membership model. The provider/configuration scaffold answers only `status`; the command/transport task remains pending for peer exchanges and pagination. Complete the trusted-LAN path in order, adding lifecycle verification as soon as background work exists.
 
-For deployment beyond a trusted LAN, also implement transport limits and authenticated membership. A `swarmId` separates accidental configurations but is not an authentication credential. The host currently supplies neither TLS nor authenticated peer identity, and the plugin cannot infer the socket's remote address from `execute(Map)` alone. Restrict advertised endpoint destinations before dialing forwarded candidates. Keep administrative ports restricted because the existing shutdown command is unauthenticated.
+- [x] **Host lifecycle prerequisite:** Optional stop hooks, concurrent startup rollback, administrative stop requests, cleanup after hook failures, and loader cleanup are implemented and covered by host tests.
+- [x] **Baseline host request hardening:** Main-listener closure before plugin quiescing, bounded drain with worker interruption, per-line character limits, a concurrent connection cap, transient accept retries, and test announcement suppression are implemented. Byte-counted transport limits remain pending below.
+- [x] **Plugin scaffold and configuration:** The separate Maven project, `GossipPlugin` provider, service registration, per-instance configuration, and local demo configuration files are implemented. Tests and spawned JVMs disable real announcements. Acceptance verified: real external-JAR loading, isolated instances, correlated local status, invalid-configuration cleanup, and JAR deletion after instance cleanup while the Windows JVM remains alive.
+- [ ] **Membership model:** Implement immutable records, exact numeric/identity/metadata validation, atomic merges, local observations, capacity rules, and tombstones. Acceptance: deterministic clock-based tests prove duplicate freshness, conflict handling, terminal `LEFT`, restart identity, and rejection without partial mutation.
+- [ ] **Command and transport path:** Implement `exchange`, paginated `members`, and `status`; enforce complete-envelope budgets and reply identity checks. Acceptance: real two-node TCP exchanges cover serialization, malformed replies, incompatible versions/swarm IDs, and capacity failures before scheduling is introduced. Choose the transport's timeout and cancellation approach here and document its cleanup bound; the current client has unbounded response reading.
+- [ ] **Scheduled seed-based runtime:** Add jittered rounds, owner heartbeats, bounded fanout/in-flight work, fair batches, seed backoff, recovery probes, local assessments, expiry, and metrics. Implement cancellation and joining in `stop()` with the first background task. Acceptance: three real nodes converge, late/down seeds recover, restarts are distinct, closing one instance leaves others working, and stalled exchanges or startup rollback leave no plugin workers behind.
+- [ ] **Departure and lifecycle completion:** Implement asynchronous bounded `leave`, terminal dissemination, and completion reporting. Acceptance: departures stay terminal; failed startup, admin shutdown, console quit/end-of-input, and repeated close clean up promptly while accepted handlers retain their table during draining. Run the host suite and packaged-plugin integration tests.
+- [ ] **Capacity, fairness, and partition validation:** Exercise the configured membership cap with multiple batches and a controllable TCP fixture/relay. Measure convergence and prove fair record transmission, bounded outbound concurrency, capacity-safe updates, and recovery after partitions. Tune the proposed limits and intervals from these results before calling the trusted-LAN baseline ready.
+- [ ] **Optional UDP discovery:** Add only after seed-based operation passes the preceding checks. Acceptance: controlled datagrams only queue validated TCP handshakes; unavailable UDP, lost announcements, and same-host port contention leave seeds working. Include receiver cancellation in the existing lifecycle tests.
+- [ ] **Beyond-trusted-LAN prerequisites:** Add byte-counted request and response limits before parsing, aggregate HTTP header limits, authenticated membership/transport, and an advertised-destination policy before dialing forwarded candidates. Test oversized/slow input, identity failures, and denied destinations. These are deployment prerequisites for that environment, not completed by the existing character limit or `swarmId` validation.
+
+A `swarmId` separates accidental configurations but is not an authentication credential. The host currently supplies neither TLS nor authenticated peer identity, and the plugin cannot infer the socket's remote address from `execute(Map)` alone. Keep administrative ports restricted because the existing shutdown command is unauthenticated.
 
 Once membership works, application features can select reachable peers from its local view. Keep gossip records descriptive: receiving an instruction name as metadata must never execute that instruction. Distributed task routing, event delivery, and deduplication require explicit additional protocols.
