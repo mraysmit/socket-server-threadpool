@@ -19,6 +19,7 @@ import dev.mars.server.ServerInstance;
 import dev.mars.server.ServerOptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -38,6 +39,38 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(20)
 class StartStopTest {
+    @Test
+    void productionClasspathExcludesMathAndTextTestFixtures() throws Exception {
+        var types = java.util.List.of(StartStop.class, com.fasterxml.jackson.databind.ObjectMapper.class,
+                com.fasterxml.jackson.core.JsonFactory.class, com.fasterxml.jackson.annotation.JsonProperty.class);
+        var paths = new java.util.ArrayList<String>();
+        for (Class<?> type : types) {
+            paths.add(Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toString());
+        }
+        String production = String.join(java.io.File.pathSeparator, paths);
+        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
+                "send {\"instruction\":\"math.add\",\"parameters\":{\"a\":10,\"b\":20}}\n"
+                + "send {\"instruction\":\"text.concat\",\"parameters\":{\"a\":\"Hello \",\"b\":\"world\"}}\n"
+                + "send Still healthy\nquit\n", production);
+        assertEquals(0, result.exitCode(), result.output());
+        assertTrue(result.output().contains("instructions=[echo]"), result.output());
+        assertTrue(result.output().contains("Unknown instruction: math.add"), result.output());
+        assertTrue(result.output().contains("Unknown instruction: text.concat"), result.output());
+        assertTrue(result.output().contains("result=\"Received: Still healthy\""), result.output());
+        assertReleased(result);
+    }
+
+    @Test
+    void commandLineAcceptsMultipleFoldersIncludingPathsWithSpaces(@TempDir Path temporary) throws Exception {
+        Path first = Files.createDirectory(temporary.resolve("first plugins"));
+        Path second = Files.createDirectory(temporary.resolve("second plugins"));
+        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
+                "--plugins-dir", first.toString(), "--plugins-dir", second.toString()}, "send Hello\nquit\n");
+        assertEquals(0, result.exitCode(), result.output());
+        assertTrue(result.output().contains("result=\"Received: Hello\""), result.output());
+        assertReleased(result);
+    }
+
     @Test
     void consoleExecutesJsonCommandsAndContinuesAfterPluginError() throws Exception {
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
@@ -162,9 +195,13 @@ class StartStopTest {
     }
 
     private Result run(String mainClass, String[] args, String input) throws Exception {
+        return run(mainClass, args, input,
+                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")));
+    }
+
+    private Result run(String mainClass, String[] args, String input, String classes) throws Exception {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
-        String classes = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
         var command = new ArrayList<String>();
         command.add(java.toString()); command.add("-cp"); command.add(classes); command.add(mainClass);
         // Preserve embedded JSON quotes through Windows' native command-line parser.

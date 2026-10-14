@@ -16,7 +16,7 @@ each plugin owns its parameter validation and business logic.
 The console accepts a structured command, for example:
 
 ```text
-send {"instruction":"math.add","parameters":{"a":10,"b":20}}
+send {"instruction":"echo","parameters":{"text":"Hello server"}}
 ```
 
 The client adds a message UUID and protocol version. The command protocol
@@ -30,7 +30,7 @@ port. A successful reply contains:
   "serverId": "Server-001",
   "connectionId": 42,
   "status": "OK",
-  "result": 30
+  "result": "Received: Hello server"
 }
 ```
 
@@ -53,9 +53,12 @@ Returned values must be JSON-serializable. Plugins are trusted Java code running
 inside the server process.
 
 - **Discovery:** Built-in and classpath providers load by default. Add JARs with
-  `--plugins-dir plugins`; load them at startup through a class loader and
+  repeated `--plugins-dir <directory>` arguments; load JARs from all supplied
+  folders at startup through one shared class loader and
   discover implementations with Java's [ServiceLoader](https://docs.oracle.com/en/java/javase/27/docs/api/java.base/java/util/ServiceLoader.html).
   Each JAR declares providers in `META-INF/services/dev.mars.plugin.CommandPlugin`.
+  Dependency JARs can reside in any supplied folder. Only immediate JAR files are
+  scanned; equivalent paths are deduplicated and every directory must exist.
 - **Registry:** Build an immutable instruction-to-plugin map before reporting ready.
   Duplicate instruction names or invalid providers fail startup with resource cleanup.
 - **Execution:** Dispatch on the existing per-connection virtual thread. Shared
@@ -73,8 +76,10 @@ inside the server process.
 - **Client:** Validate the message ID and optional expected server ID, then return
   the result or structured error, without requiring an echoed-text match.
 
-Built-ins are `math.add` (numeric `a`, `b`), `text.concat` (string `a`, `b`), and
-`echo` (string `text`, returning `Received: <text>`). Plain `send <text>` invokes
+The production command built-in is `echo` (string `text`, returning
+`Received: <text>`). `math.add` and `text.concat` are test-only providers in
+`src/test/java/dev/mars/plugin/fixtures`, with registration under test resources;
+neither is packaged in the server JAR. Plain `send <text>` invokes
 `echo`; the legacy text wire format remains supported. HTTP and administrative
 commands keep their existing roles. Plugins load once per startup, and their
 class loader closes after accepted work finishes during shutdown.

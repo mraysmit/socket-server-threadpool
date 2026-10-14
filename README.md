@@ -46,9 +46,11 @@ src/
 │       ├── HttpResponseBuilder.java
 │       └── HttpResponseWriter.java
 ├── main/resources/META-INF/services/dev.mars.plugin.CommandPlugin
+├── test/resources/META-INF/services/dev.mars.plugin.CommandPlugin
 └── test/java/dev/mars/
     ├── StartStopTest.java
     ├── plugin/
+    │   ├── fixtures/              # Test-only MathAddPlugin and TextConcatPlugin
     │   ├── PluginRegistryTest.java
     │   ├── PluginExecutionTest.java
     │   ├── StartupPluginTest.java
@@ -181,23 +183,16 @@ Once the server reports `Server ready`, enter these commands at its console
 prompt, one at a time:
 
 ```text
-send {"instruction":"math.add","parameters":{"a":10,"b":20}}
-send {"instruction":"text.concat","parameters":{"a":"Hello ","b":"world"}}
 send {"instruction":"echo","parameters":{"text":"Hello server"}}
 status
 quit
 ```
 
-Each plugin reply includes `status=OK` and its result:
-
-| Command instruction | Expected result |
-|---|---|
-| `math.add` | `30` |
-| `text.concat` | `"Hello world"` |
-| `echo` | `"Received: Hello server"` |
+The echo reply includes `status=OK | result="Received: Hello server"`.
 
 `status` checks the running server, and `quit` stops the server and exits the
-application. These three plugins are built in, so no external JAR is required.
+application. `echo` is built in, so no external JAR is required. `math.add` and
+`text.concat` are test-only fixtures and are unavailable in a normal server launch.
 
 The server ID is the first startup argument, or can be passed with `--server-id`.
 To use a generated UUID default,
@@ -255,10 +250,10 @@ mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-
 | `[serverId]` or `--server-id <id>` | Generated UUID | ID reported in logs and replies |
 | `--port <number>` | `9000` | HTTP/text-message listening port |
 | `--admin-port <number>` | `9001` | Administrative listening port |
-| `--plugins-dir <directory>` | Omitted | Load additional JAR providers from this directory; built-ins are always available |
+| `--plugins-dir <directory>` | Omitted | Repeat to supply a list of runtime plugin/dependency JAR folders; built-ins are always available |
 
 Ports must be integers from 0 through 65535. Nonzero main and admin ports must
-differ. Unknown/duplicate options, missing values, and invalid ports fail before
+differ. Unknown options, duplicate options other than `--plugins-dir`, missing values, and invalid ports fail before
 startup. Use `--help` to display usage.
 
 To let the operating system assign both ports automatically:
@@ -270,7 +265,7 @@ java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-003 --po
 The app keeps both bound sockets open and reports the actual ports:
 
 ```text
-Server ready | serverId=Server-003 | main=localhost:52000 | admin=localhost:52001 | instructions=[echo, math.add, text.concat]
+Server ready | serverId=Server-003 | main=localhost:52000 | admin=localhost:52001 | instructions=[echo]
 ```
 
 Port numbers in this example are illustrative. The console automatically uses its
@@ -393,24 +388,28 @@ Administrative commands on the configured admin port remain `status` and `shutdo
 At the application console, enter:
 
 ```text
-send {"instruction":"math.add","parameters":{"a":10,"b":20}}
-send {"instruction":"text.concat","parameters":{"a":"Hello ","b":"world"}}
 send {"instruction":"echo","parameters":{"text":"Hello server"}}
 ```
 
-The first command prints a reply such as:
+The command prints a reply such as:
 
 ```text
-Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | status=OK | result=30
+Server response: messageId=11111111-1111-4111-8111-111111111111 | serverId=Server-001 | connectionId=1 | status=OK | result="Received: Hello server"
 ```
 
 | Instruction | Required parameters | Result |
 |---|---|---|
-| `math.add` | Numbers `a`, `b` | Decimal sum |
-| `text.concat` | Strings `a`, `b` | Concatenated string |
 | `echo` | String `text` | `Received: <text>` |
 
-Built-ins reject missing, extra, or incorrectly typed parameters. Instruction names
+The production command built-in is `echo`; the address broadcaster is startup-only.
+`MathAddPlugin` (`math.add`) and `TextConcatPlugin` (`text.concat`) live under
+`src/test/java/dev/mars/plugin/fixtures/` and are registered only in
+`src/test/resources/META-INF/services/dev.mars.plugin.CommandPlugin`. Maven makes
+them available during server tests, and excludes their classes and registration
+from the production JAR and normal Java/Maven launches. Use the external
+`math.multiply` example below for a command plugin that can be loaded at runtime.
+
+The echo plugin rejects missing, extra, or incorrectly typed parameters. Instruction names
 are case-sensitive and match `[A-Za-z][A-Za-z0-9._-]*`. Other plugins may accept
 any number of named parameters and return JSON numbers, strings, booleans, objects,
 arrays, or null. Plain text invokes `echo`; text beginning with `{` is interpreted
@@ -420,8 +419,8 @@ Use JSON escapes such as `\n` within strings; each request occupies one wire lin
 Java callers can obtain generic results directly:
 
 ```java
-CommandReply reply = client.execute("math.add", Map.of("a", 10, "b", 20));
-System.out.println(reply.result()); // 30
+CommandReply reply = client.execute("echo", Map.of("text", "Hello server"));
+System.out.println(reply.result()); // Received: Hello server
 // execute(UUID, instruction, parameters) accepts a caller-supplied correlation ID.
 ```
 
@@ -433,13 +432,13 @@ command as its message argument; preserve embedded double quotes through your sh
 For a raw TCP client, send the complete versioned envelope on the main port:
 
 ```json
-{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","instruction":"math.add","parameters":{"a":10,"b":20}}
+{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","instruction":"echo","parameters":{"text":"Hello server"}}
 ```
 
 Example replies (the server also includes null `error` or `result` fields):
 
 ```json
-{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":1,"status":"OK","result":30}
+{"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":1,"status":"OK","result":"Received: Hello server"}
 {"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":2,"status":"ERROR","error":{"code":"UNKNOWN_INSTRUCTION","message":"Unknown instruction: missing"}}
 ```
 
@@ -453,26 +452,26 @@ provide correlation only, so retries may execute the instruction again.
 
 #### Build and Run the Standalone Example
 
-A complete plugin project is included at [`examples/multiply-plugin`](examples/multiply-plugin).
+A complete plugin project is included at [`plugins/multiply-plugin`](plugins/multiply-plugin).
 From the repository root, build and install the server API locally, then package
 and test the example:
 
 ```powershell
 mvn clean install
-mvn -f examples/multiply-plugin/pom.xml clean verify
+mvn -f plugins/multiply-plugin/pom.xml clean verify
 ```
 
 The reusable JAR is:
 
 ```text
-examples/multiply-plugin/target/multiply-plugin-1.0-SNAPSHOT.jar
+plugins/multiply-plugin/target/multiply-plugin-1.0-SNAPSHOT.jar
 ```
 
 It stays on disk after the tests finish. Start a server that loads it directly
 from the example's output directory:
 
 ```powershell
-mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir examples/multiply-plugin/target"
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir plugins/multiply-plugin/target"
 ```
 
 The ready log includes `math.multiply`. At the server console, enter:
@@ -491,32 +490,87 @@ bundling the server classes.
 The example's `mvn verify` runs a packaged-JAR integration test in a separate
 server JVM, verifies parameter errors and the result `42`, and prints
 `Standalone plugin JAR test PASSED`. Its reports are under
-`examples/multiply-plugin/target/failsafe-reports/`. Root `mvn test` runs the server
+`plugins/multiply-plugin/target/failsafe-reports/`. Root `mvn test` runs the server
 tests; use the separate example command above to test this standalone artifact.
 Reinstall the server after API changes and rebuild the example after changes to
 its source. The example's `clean` removes its previous JAR before rebuilding it.
 
-#### Why There Are Two META-INF Locations
+#### Loading Plugins from Runtime Folders
+
+Supply the folder list at launch by repeating `--plugins-dir`, once per folder.
+For example, after compiling and copying the host's runtime dependencies, launch
+directly with Java in PowerShell:
+
+```powershell
+mvn compile dependency:copy-dependencies "-DincludeScope=runtime"
+java -cp "target/classes;target/dependency/*" dev.mars.StartStop Server-001 --plugins-dir "C:\server plugins\math" --plugins-dir "C:\server plugins\text"
+```
+
+Replace those two folders with existing directories containing your plugin JARs
+and their dependency JARs. Paths with spaces must be quoted. The directories are
+application arguments after the main class; no individual plugin JAR needs to be
+added to the Java classpath or to the server's Maven dependencies.
+
+The equivalent Maven invocation uses the same repeated application option:
+
+```powershell
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir C:/server-plugins/math --plugins-dir C:/server-plugins/text"
+```
+
+The server scans immediate `.jar` files in every supplied directory at runtime,
+in the order folders are supplied and with JARs sorted within each folder.
+It creates one class loader for the complete list, so a plugin in one folder can
+use dependency JARs from another. `ServiceLoader` discovers implementations using
+their existing registration file. Terminal output includes
+`Loading plugin JAR | path=<absolute-path>` for each JAR.
+
+Repeated or equivalent directory/JAR paths are loaded once. Subdirectories are
+not scanned recursively: for the included project, supply
+`plugins/multiply-plugin/target`, where the built JAR resides. Every supplied
+directory must exist; a bad folder, corrupt archive, invalid provider, or duplicate
+instruction across folders fails startup before listeners open. An empty folder
+is allowed. Omitting the options loads built-in and application-classpath providers.
+
+Plugin discovery happens once during server startup. Change the command-line list
+or replace a JAR and restart the server to use the new selection. Runtime loading
+does not provide hot reload. The loader is closed after accepted work finishes.
+
+Java callers can supply the same list through
+`new ServerOptions("Server-001", 0, 0, List.of(firstFolder, secondFolder))`;
+`pluginDirectories()` exposes an immutable snapshot. The single-`Path` constructor
+remains available for existing callers.
+
+To test multiple folders, including shared dependencies and cleanup:
+
+```powershell
+mvn test "-Dtest=ExternalPluginTest,ServerOptionsTest,StartStopTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+#### Plugin Service Registrations
 
 Each Maven project owns its service registration files and packages them into
 its own JAR:
 
 | Source file | Packaged in | Registered providers |
 |---|---|---|
-| `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `MathAddPlugin`, `TextConcatPlugin`, `EchoPlugin`, and startup-only `AddressBroadcastPlugin` |
-| `examples/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
+| `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `EchoPlugin` and startup-only `AddressBroadcastPlugin` |
+| `src/test/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Test classpath only; excluded from the server JAR | `MathAddPlugin` and `TextConcatPlugin` from `dev.mars.plugin.fixtures` |
+| `plugins/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
 
 Inside each JAR, the registration has the same path:
 `META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
 resources in separate JARs. `ServiceLoader` discovers both and combines their
 provider lists at startup.
 
+During `mvn test`, the test registration also supplies the math and text fixtures.
+That file remains under `target/test-classes` and is not included in the server JAR.
+
 All plugins share the `CommandPlugin` interface and this single service-file
 name. The optional `start(PluginContext)` method defaults to doing nothing.
 Startup-only plugins such as the address broadcaster use the same registration
 file and leave `instruction()` at its default `null`, so they add no command.
 
-With `--plugins-dir examples/multiply-plugin/target`, the server scans that
+With `--plugins-dir plugins/multiply-plugin/target`, the server scans that
 directory for JARs and creates a class loader for them. `ServiceLoader` discovers
 the built-ins through the parent application class loader and the external
 provider through the plugin loader. The registry creates an instruction-to-plugin
@@ -568,7 +622,8 @@ mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-
 ```
 
 Then enter `send {"instruction":"math.multiply","parameters":{"a":6,"b":7}}`.
-The result is `42`. The directory must exist; an empty directory still enables
+The result is `42`. Repeat `--plugins-dir` to load more runtime folders. Every
+directory must exist; an empty directory still enables
 built-ins. Providers already on the application classpath are also discovered.
 Invalid JAR archives/providers and duplicate or invalid instruction names fail
 startup before listeners open. The ready log lists all registered instructions.
@@ -721,23 +776,23 @@ To include the JSON client's reply-validation tests as well:
 mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,AddressBroadcastPluginTest,ExternalPluginTest,TextMessageClientTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
-These verify built-in results, parameter validation, request/reply validation,
+These verify built-in and fixture results, parameter validation, request/reply validation,
 correlation across two named servers, 100 concurrent commands, real external JAR
 compilation/discovery/execution, plugin exceptions, invalid providers, duplicate
 instructions, and release of JAR files at shutdown. The terminal includes
 `Plugin test PASSED`, `Concurrent plugin test PASSED`, and `External JAR test PASSED`
-with instruction names and verified results. Each built-in (`math.add`,
-`text.concat`, and `echo`) prints its inputs and result from both `Server-001` and
+with instruction names and verified results. The test fixtures (`math.add`,
+`text.concat`) and production `echo` plugin print their inputs and result from both `Server-001` and
 `Server-002`. The concurrency test sends 100 `math.add` calls, so its request logs
 are more numerous. External plugin tests require a full JDK for Java compilation.
 
-To see just the three built-ins with their results from both servers:
+To see the two test fixtures and `echo` with their results from both servers:
 
 ```powershell
 mvn test "-Dtest=PluginExecutionTest#commandsReturnResultsAndCorrelatedIdsFromEachServer" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
-This runs three parameterized cases, one per built-in. Each case checks both
+This runs three parameterized cases, one per command under test. Each case checks both
 servers, producing six `Plugin test PASSED` entries. Abridged examples:
 
 ```text
@@ -791,7 +846,7 @@ The test creates and removes its own plugin files and server; `external.multiply
 is available only in that test instance. For an external plugin you can run
 manually, follow [Adding an External Plugin](#adding-an-external-plugin) to package
 and load the standalone `math.multiply` example. Its JAR is retained under
-`examples/multiply-plugin/target/`; the test-generated `external.multiply` JAR
+`plugins/multiply-plugin/target/`; the test-generated `external.multiply` JAR
 described above is still temporary.
 
 #### Startup and Lifecycle Tests

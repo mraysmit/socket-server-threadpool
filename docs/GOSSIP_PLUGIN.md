@@ -273,7 +273,7 @@ Inject a monotonic clock, random source, and transport boundary into the runtime
 
 ## Packaging and running a local swarm
 
-Follow the existing [multiply plugin example](../examples/multiply-plugin/pom.xml): create a separate Java 27 Maven project, depend on `dev.mars:socket-client-server:1.0-SNAPSHOT` with scope `provided`, and package only the plugin implementation and its own resources. Do not include copies of host SPI classes.
+Follow the existing [multiply plugin example](../plugins/multiply-plugin/pom.xml): create a separate Java 27 Maven project, depend on `dev.mars:socket-client-server:1.0-SNAPSHOT` with scope `provided`, and package only the plugin implementation and its own resources. Do not include copies of host SPI classes.
 
 Create this service file inside the plugin project:
 
@@ -289,11 +289,11 @@ example.gossip.GossipPlugin
 
 Use a dedicated plugin directory containing the gossip JAR and any dependencies it needs. Built-in providers are inherited through the host's parent class loader. Loading duplicate gossip providers fails startup because their instruction names conflict. Restart members to load a new plugin JAR; there is no hot reload.
 
-After implementing the plugin and lifecycle extension, build the host and plugin, then copy the plugin JAR into `plugins/gossip`. The following illustrates a proposed project at `examples/gossip-plugin`:
+After implementing the plugin and lifecycle extension, build the host and plugin, then copy the plugin JAR into `plugins/gossip`. The following illustrates a proposed project at `plugins/gossip-plugin`:
 
 ```powershell
 mvn clean install
-mvn -f examples/gossip-plugin/pom.xml clean verify
+mvn -f plugins/gossip-plugin/pom.xml clean verify
 mvn dependency:copy-dependencies "-DincludeScope=runtime"
 ```
 

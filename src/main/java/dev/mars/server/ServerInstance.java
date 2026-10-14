@@ -42,7 +42,7 @@ public final class ServerInstance implements AutoCloseable {
     }
 
     public static ServerInstance start(ServerOptions options) throws IOException {
-        var plugins = PluginRegistry.load(options.pluginsDir());
+        var plugins = PluginRegistry.loadDirectories(options.pluginDirectories());
         ServerInstance instance;
         try {
             instance = new ServerInstance(options, plugins);

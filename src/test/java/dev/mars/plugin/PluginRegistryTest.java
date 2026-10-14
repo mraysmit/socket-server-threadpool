@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class PluginRegistryTest {
     @Test
-    void discoversBuiltinServiceProviders() throws Exception {
+    void discoversProductionAndTestServiceProviders() throws Exception {
         try (var registry = PluginRegistry.load(null)) {
             assertEquals(Set.of("math.add", "text.concat", "echo"), registry.instructions());
             assertThrows(UnsupportedOperationException.class, () -> registry.instructions().clear());

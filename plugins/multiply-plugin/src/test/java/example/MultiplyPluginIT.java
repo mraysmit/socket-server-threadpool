@@ -21,6 +21,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import dev.mars.StartStop;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
@@ -37,10 +38,18 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Exercises the packaged artifact through a server JVM with no example classes on its classpath. */
 @Timeout(25)
 class MultiplyPluginIT {
+    @TempDir Path additionalDirectory;
     @Test
     void packagedJarLoadsAndReturnsResultThroughServerConsole() throws Exception {
         Path plugin = Path.of(System.getProperty("example.plugin.jar")).toAbsolutePath();
         assertTrue(Files.isRegularFile(plugin), "Run mvn verify to package the plugin before testing");
+        Path hostJar = Path.of(StartStop.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        try (var host = new JarFile(hostJar.toFile())) {
+            assertNull(host.getEntry("dev/mars/plugin/builtin/MathAddPlugin.class"));
+            assertNull(host.getEntry("dev/mars/plugin/builtin/TextConcatPlugin.class"));
+            assertTrue(host.stream().noneMatch(entry -> entry.getName().startsWith("dev/mars/plugin/fixtures/")),
+                    "Test plugin classes must not be packaged in the server JAR");
+        }
         try (var jar = new JarFile(plugin.toFile())) {
             assertNotNull(jar.getEntry("example/MultiplyPlugin.class"));
             var provider = jar.getEntry("META-INF/services/dev.mars.plugin.CommandPlugin");
@@ -60,7 +69,8 @@ class MultiplyPluginIT {
         Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
         Process process = new ProcessBuilder(java.toString(), "-cp", classpath, "dev.mars.StartStop",
-                "Server-001", "--port", "0", "--admin-port", "0", "--plugins-dir", plugin.getParent().toString())
+                "Server-001", "--port", "0", "--admin-port", "0", "--plugins-dir", plugin.getParent().toString(),
+                "--plugins-dir", additionalDirectory.toString())
                 .redirectErrorStream(true).start();
         try (var reader = Executors.newVirtualThreadPerTaskExecutor()) {
             var output = reader.submit(() -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
@@ -77,7 +87,7 @@ class MultiplyPluginIT {
                 String actual = output.get(3, TimeUnit.SECONDS);
                 System.out.print(actual);
                 assertEquals(0, process.exitValue(), actual);
-                assertTrue(actual.contains("instructions=[echo, math.add, math.multiply, text.concat]"), actual);
+                assertTrue(actual.contains("instructions=[echo, math.multiply]"), actual);
                 assertTrue(actual.contains("INVALID_PARAMETERS"), actual);
                 assertTrue(actual.contains("serverId=Server-001"), actual);
                 assertTrue(actual.contains("status=OK | result=42"), actual);

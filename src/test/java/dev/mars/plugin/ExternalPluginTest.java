@@ -32,6 +32,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
+import java.util.List;
 import java.util.jar.JarEntry;
 import java.util.jar.JarOutputStream;
 
@@ -200,23 +201,115 @@ class ExternalPluginTest {
                 """.formatted(instruction, body), "dev.mars.plugin.CommandPlugin");
     }
 
+    @Test
+    void loadsPluginsAndSharedDependenciesFromMultipleRuntimeDirectories() throws Exception {
+        Path first = Files.createDirectory(temporary.resolve("first plugins"));
+        Path second = Files.createDirectory(temporary.resolve("second plugins"));
+        Path library = compileJar(second, """
+                package example;
+                public class ExampleLibrary {
+                    public static int answer() { return 42; }
+                }
+                """);
+        Path alpha = compileJar(first, """
+                package example;
+                import dev.mars.plugin.CommandPlugin;
+                import java.util.Map;
+                public class ExamplePlugin implements CommandPlugin {
+                    public String instruction() { return "external.alpha"; }
+                    public Object execute(Map<String,Object> parameters) { return ExampleLibrary.answer(); }
+                }
+                """, List.of(library), "dev.mars.plugin.CommandPlugin");
+        Path beta = compileJar(second, """
+                package example;
+                import dev.mars.plugin.CommandPlugin;
+                import java.util.Map;
+                public class OtherPlugin implements CommandPlugin {
+                    public String instruction() { return "external.beta"; }
+                    public Object execute(Map<String,Object> parameters) { return "second folder"; }
+                }
+                """, "dev.mars.plugin.CommandPlugin");
+        try (var server = ServerInstance.start(new ServerOptions("Server-001", 0, 0, List.of(first, second)))) {
+            var client = new TextMessageClient("localhost", server.getPort(), "Server-001");
+            assertEquals(BigInteger.valueOf(42), client.execute("external.alpha", Map.of()).result());
+            assertEquals("second folder", client.execute("external.beta", Map.of()).result());
+            System.out.println("Multiple plugin folders test PASSED | external.alpha=42 | external.beta=second folder");
+        }
+        for (Path jar : List.of(alpha, beta, library)) { Files.delete(jar); }
+    }
+
+    @Test
+    void rejectsDuplicateInstructionsAcrossFoldersAndReleasesBothJars() throws Exception {
+        Path first = Files.createDirectory(temporary.resolve("first"));
+        Path second = Files.createDirectory(temporary.resolve("second"));
+        Path alpha = providerJar(first, "external.same", "return 1;");
+        Path beta = compileJar(second, """
+                package example;
+                import dev.mars.plugin.CommandPlugin;
+                import java.util.Map;
+                public class OtherPlugin implements CommandPlugin {
+                    public String instruction() { return "external.same"; }
+                    public Object execute(Map<String,Object> parameters) { return 2; }
+                }
+                """, "dev.mars.plugin.CommandPlugin");
+        var error = assertThrows(IOException.class,
+                () -> ServerInstance.start(new ServerOptions("Server-001", 0, 0, List.of(first, second))));
+        assertTrue(error.getMessage().contains("Duplicate plugin instruction: external.same"), error.getMessage());
+        Files.delete(alpha); Files.delete(beta);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"missing", "file", "corrupt"})
+    void invalidLaterFolderFailsStartupAndKeepsEarlierJarReleased(String scenario) throws Exception {
+        Path first = Files.createDirectory(temporary.resolve("valid"));
+        Path jar = providerJar(first, "external.valid", "return 1;");
+        Path invalid = temporary.resolve("invalid");
+        switch (scenario) {
+            case "file" -> Files.writeString(invalid, "not a directory");
+            case "corrupt" -> Files.writeString(Files.createDirectory(invalid).resolve("broken.jar"), "not a jar");
+            default -> { }
+        }
+        assertThrows(IOException.class,
+                () -> ServerInstance.start(new ServerOptions("Server-001", 0, 0, List.of(first, invalid))));
+        Files.delete(jar);
+    }
+
+    @Test
+    void repeatedAndEquivalentDirectoryPathsLoadProviderOnce() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("plugins"));
+        Path jar = providerJar(directory, "external.once", "return 1;");
+        try (var registry = PluginRegistry.loadDirectories(List.of(directory, directory.resolve("."), directory))) {
+            assertTrue(registry.instructions().contains("external.once"));
+        }
+        Files.delete(jar);
+    }
+
     private Path compileJar(Path directory, String content, String... services) throws Exception {
-        Path source = temporary.resolve("ExamplePlugin.java");
+        return compileJar(directory, content, List.of(), services);
+    }
+
+    private Path compileJar(Path directory, String content, List<Path> dependencies, String... services) throws Exception {
+        var match = java.util.regex.Pattern.compile("public class ([A-Za-z0-9_]+)").matcher(content);
+        assertTrue(match.find(), "Fixture must declare a public class");
+        String name = match.group(1);
+        Path source = temporary.resolve(name + ".java");
         Files.writeString(source, content);
-        Path classes = Files.createDirectory(temporary.resolve("compiled"));
+        Path classes = Files.createTempDirectory(temporary, "compiled-");
         Path api = Path.of(CommandPlugin.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+        String classpath = api + dependencies.stream().map(path -> java.io.File.pathSeparator + path)
+                .collect(java.util.stream.Collectors.joining());
         var compiler = ToolProvider.getSystemJavaCompiler();
         assertNotNull(compiler, "External plugin tests require a JDK");
-        assertEquals(0, compiler.run(null, null, null, "-encoding", "UTF-8", "-classpath", api.toString(),
+        assertEquals(0, compiler.run(null, null, null, "-encoding", "UTF-8", "-classpath", classpath,
                 "-d", classes.toString(), source.toString()));
-        Path jar = directory.resolve("example.jar");
+        Path jar = directory.resolve(name + ".jar");
         try (var output = new JarOutputStream(Files.newOutputStream(jar))) {
-            output.putNextEntry(new JarEntry("example/ExamplePlugin.class"));
-            Files.copy(classes.resolve("example/ExamplePlugin.class"), output);
+            output.putNextEntry(new JarEntry("example/" + name + ".class"));
+            Files.copy(classes.resolve("example/" + name + ".class"), output);
             output.closeEntry();
             for (String service : services) {
                 output.putNextEntry(new JarEntry("META-INF/services/" + service));
-                output.write("example.ExamplePlugin\n".getBytes(StandardCharsets.UTF_8));
+                output.write(("example." + name + "\n").getBytes(StandardCharsets.UTF_8));
                 output.closeEntry();
             }
         }

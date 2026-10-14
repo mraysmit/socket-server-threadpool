@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package dev.mars.plugin.builtin;
+package dev.mars.plugin.fixtures;
 
 import dev.mars.plugin.CommandPlugin;
 import dev.mars.plugin.InvalidParametersException;

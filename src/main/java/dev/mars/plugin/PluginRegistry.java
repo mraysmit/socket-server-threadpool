@@ -70,26 +70,39 @@ public final class PluginRegistry implements AutoCloseable {
     }
 
     public static PluginRegistry load(Path directory) throws IOException {
+        return loadDirectories(directory == null ? List.of() : List.of(directory));
+    }
+
+    /** JARs from all supplied folders share a loader; only immediate .jar files are scanned. */
+    public static PluginRegistry loadDirectories(List<Path> directories) throws IOException {
         URLClassLoader loader = null;
         try {
+            directories = List.copyOf(directories);
             ClassLoader parent = CommandPlugin.class.getClassLoader();
             ClassLoader discovery = parent;
-            if (directory != null) {
-                if (!Files.isDirectory(directory)) { throw new IOException("Plugin directory does not exist: " + directory); }
-                URL[] jars;
-                try (var files = Files.list(directory)) {
-                    var paths = files.filter(Files::isRegularFile)
+            if (!directories.isEmpty()) {
+                var folders = new java.util.LinkedHashSet<Path>();
+                var paths = new java.util.LinkedHashSet<Path>();
+                for (Path supplied : directories) {
+                    if (!Files.isDirectory(supplied)) { throw new IOException("Plugin directory does not exist: " + supplied); }
+                    Path directory = supplied.toRealPath();
+                    if (!folders.add(directory)) { continue; }
+                    try (var files = Files.list(directory)) {
+                        for (Path path : files.filter(Files::isRegularFile)
                             .filter(path -> path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".jar"))
-                            .sorted().toList();
-                    jars = new URL[paths.size()];
-                    for (int i = 0; i < paths.size(); i++) {
-                        try (var jar = new JarFile(paths.get(i).toFile())) {
-                            jars[i] = paths.get(i).toUri().toURL();
+                            .sorted().toList()) {
+                            paths.add(path.toRealPath());
                         }
                     }
                 }
+                var jars = new URL[paths.size()];
+                int index = 0;
+                for (Path path : paths) {
+                    try (var jar = new JarFile(path.toFile())) { jars[index++] = path.toUri().toURL(); }
+                }
                 loader = new URLClassLoader(jars, parent);
                 discovery = loader;
+                for (Path path : paths) { System.out.println("Loading plugin JAR | path=" + path); }
             }
             var registry = new PluginRegistry(ServiceLoader.load(CommandPlugin.class, discovery), loader);
             if (registry.loadedPlugins.isEmpty()) { throw new IllegalArgumentException("No plugins discovered"); }

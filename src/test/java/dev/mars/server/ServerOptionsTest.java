@@ -31,7 +31,7 @@ class ServerOptionsTest {
         var options = ServerOptions.parse();
         assertEquals(9000, options.port());
         assertEquals(9001, options.adminPort());
-        assertNull(options.pluginsDir());
+        assertTrue(options.pluginDirectories().isEmpty());
         assertDoesNotThrow(() -> UUID.fromString(options.serverId()));
     }
 
@@ -58,8 +58,21 @@ class ServerOptionsTest {
 
     @Test
     void parsesPluginDirectoryIncludingSpaces() {
-        assertEquals(java.nio.file.Path.of("custom plugins"),
-                ServerOptions.parse("Server-001", "--plugins-dir", "custom plugins").pluginsDir());
+        assertEquals(java.util.List.of(java.nio.file.Path.of("custom plugins")),
+                ServerOptions.parse("Server-001", "--plugins-dir", "custom plugins").pluginDirectories());
+    }
+
+    @Test
+    void acceptsRepeatedPluginDirectoryOptionsInOrderAndKeepsAnImmutableSnapshot() {
+        var options = ServerOptions.parse("--plugins-dir", "plugins/math", "Server-001",
+                "--plugins-dir", "custom plugins", "--port", "0", "--admin-port", "0");
+        assertEquals(java.util.List.of(java.nio.file.Path.of("plugins/math"), java.nio.file.Path.of("custom plugins")),
+                options.pluginDirectories());
+        assertThrows(UnsupportedOperationException.class, () -> options.pluginDirectories().clear());
+        var supplied = new java.util.ArrayList<>(options.pluginDirectories());
+        var copied = new ServerOptions("Server-001", 0, 0, supplied);
+        supplied.clear();
+        assertEquals(2, copied.pluginDirectories().size());
     }
 
     @Test
@@ -77,7 +90,7 @@ class ServerOptionsTest {
     static Stream<Arguments> invalidOptions() {
         return Stream.of(
                 new String[]{"--plugins-dir"}, new String[]{"--plugins-dir", " "},
-                new String[]{"--plugins-dir", "plugins", "--plugins-dir", "other"},
+                new String[]{"--plugins-dir", "plugins", "--plugins-dir"},
                 new String[]{"--port"}, new String[]{"--admin-port"}, new String[]{"--server-id"},
                 new String[]{"--port", "--admin-port", "9011"},
                 new String[]{"--port", "-1"}, new String[]{"--port", "65536"},

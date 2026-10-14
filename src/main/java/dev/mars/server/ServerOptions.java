@@ -18,17 +18,25 @@ package dev.mars.server;
 import java.util.HashSet;
 import java.util.UUID;
 import java.nio.file.Path;
+import java.util.List;
+import java.util.ArrayList;
 
 /** Validated startup options for one server instance. */
-public record ServerOptions(String serverId, int port, int adminPort, Path pluginsDir) {
+public record ServerOptions(String serverId, int port, int adminPort, List<Path> pluginDirectories) {
     public static final int DEFAULT_PORT = 9000;
     public static final int DEFAULT_ADMIN_PORT = 9001;
-    public static final String USAGE = "Usage: StartStop [serverId] [--port <0-65535>] [--admin-port <0-65535>] [--server-id <id>] [--plugins-dir <directory>]";
+    public static final String USAGE = "Usage: StartStop [serverId] [--port <0-65535>] [--admin-port <0-65535>] [--server-id <id>] [--plugins-dir <directory>]...";
 
-    public ServerOptions(String serverId, int port, int adminPort) { this(serverId, port, adminPort, null); }
+    public ServerOptions(String serverId, int port, int adminPort) { this(serverId, port, adminPort, List.of()); }
+
+    /** Compatibility constructor for callers supplying one optional directory. */
+    public ServerOptions(String serverId, int port, int adminPort, Path pluginsDir) {
+        this(serverId, port, adminPort, pluginsDir == null ? List.of() : List.of(pluginsDir));
+    }
 
     public ServerOptions {
         serverId = resolveServerId(serverId);
+        pluginDirectories = List.copyOf(pluginDirectories);
         validatePort(port, "Main port");
         validatePort(adminPort, "Admin port");
         if (port != 0 && port == adminPort) {
@@ -55,7 +63,7 @@ public record ServerOptions(String serverId, int port, int adminPort, Path plugi
         boolean hasId = false;
         int port = DEFAULT_PORT;
         int adminPort = DEFAULT_ADMIN_PORT;
-        Path pluginsDir = null;
+        var pluginDirectories = new ArrayList<Path>();
         var seen = new HashSet<String>();
         for (int i = 0; i < args.length; i++) {
             String option = args[i];
@@ -70,7 +78,7 @@ public record ServerOptions(String serverId, int port, int adminPort, Path plugi
             if (!(option.equals("--port") || option.equals("--admin-port") || option.equals("--server-id") || option.equals("--plugins-dir"))) {
                 throw new IllegalArgumentException("Unknown option: " + option + ". " + USAGE);
             }
-            if (!seen.add(option)) {
+            if (!seen.add(option) && !option.equals("--plugins-dir")) {
                 throw new IllegalArgumentException("Duplicate option: " + option);
             }
             if (++i == args.length || args[i].startsWith("--")) {
@@ -88,12 +96,12 @@ public record ServerOptions(String serverId, int port, int adminPort, Path plugi
                 case "--admin-port" -> adminPort = parsePort(args[i], option);
                 case "--plugins-dir" -> {
                     if (args[i].isBlank()) { throw new IllegalArgumentException("Plugin directory must not be blank"); }
-                    pluginsDir = Path.of(args[i]);
+                    pluginDirectories.add(Path.of(args[i]));
                 }
                 default -> throw new AssertionError(option);
             }
         }
-        return new ServerOptions(id, port, adminPort, pluginsDir);
+        return new ServerOptions(id, port, adminPort, pluginDirectories);
     }
 
     private static int parsePort(String value, String option) {

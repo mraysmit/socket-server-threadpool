@@ -67,7 +67,7 @@ class StartupPluginTest {
 
     @Test
     void commandPluginsWithoutStartupCapabilityRemainUsable() throws Exception {
-        try (var registry = PluginRegistry.of(List.of(new dev.mars.plugin.builtin.MathAddPlugin()))) {
+        try (var registry = PluginRegistry.of(List.of(new dev.mars.plugin.fixtures.MathAddPlugin()))) {
             registry.start(new PluginContext("Server-001", 9010, 9011));
             var reply = registry.dispatch(new CommandRequest(1, UUID.randomUUID(), "math.add", Map.of("a", 10, "b", 20)),
                     "Server-001", 1);
