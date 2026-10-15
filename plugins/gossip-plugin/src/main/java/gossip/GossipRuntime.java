@@ -214,10 +214,11 @@ final class GossipRuntime implements AutoCloseable {
             peers = departurePending.stream().filter(peer -> !workers.containsKey(peer))
                     .limit(Math.min(config.fanout(), slots)).toList();
         } else { peers = selector.select(table.snapshot(), Set.copyOf(workers.keySet()), slots); }
+        var roundDestinations = new HashSet<String>();
         for (var peer : peers) {
             String id = table.snapshot().self().key().serverId();
             boolean departing = leaving;
-            var worker = Thread.ofVirtual().name("gossip-" + id + "-exchange").unstarted(() -> exchange(peer, departing));
+            var worker = Thread.ofVirtual().name("gossip-" + id + "-exchange").unstarted(() -> exchange(peer, departing, roundDestinations));
             worker.setContextClassLoader(CommandPlugin.class.getClassLoader());
             workers.put(peer, worker);
             ownedWorkers.add(worker);
@@ -232,7 +233,7 @@ final class GossipRuntime implements AutoCloseable {
         }
     }
 
-    private void exchange(GossipConfig.Seed peer, boolean departing) {
+    private void exchange(GossipConfig.Seed peer, boolean departing, Set<String> roundDestinations) {
         String resolvedKey = null;
         boolean acquired = false;
         boolean resolving = true;
@@ -245,17 +246,20 @@ final class GossipRuntime implements AutoCloseable {
             resolvedKey = endpoint.host() + ":" + endpoint.port();
             synchronized (this) {
                 if (stopped || (!departing && leaving)) { return; }
+                selector.resolved(peer, endpoint, table.snapshot());
                 if (endpoint.port() == table.snapshot().self().port() && (address.isLoopbackAddress() || localAddresses.contains(address))) {
                     metrics.skipped.incrementAndGet();
                     outcome = "SKIPPED";
                     return;
                 }
-                if (!resolvedInFlight.add(resolvedKey)) { resolvedKey = null; metrics.skipped.incrementAndGet(); outcome = "SKIPPED"; return; }
+                if (!roundDestinations.add(resolvedKey) || !resolvedInFlight.add(resolvedKey)) {
+                    resolvedKey = null; metrics.skipped.incrementAndGet(); outcome = "SKIPPED"; return;
+                }
                 acquired = true;
             }
             transport.exchange(endpoint);
             outcome = "SUCCESS";
-            selector.success(peer);
+            selector.success(peer, endpoint);
         } catch (IOException | RuntimeException e) {
             synchronized (this) {
                 if (!stopped && (departing || !leaving)) {

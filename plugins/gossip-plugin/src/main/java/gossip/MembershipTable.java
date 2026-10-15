@@ -16,6 +16,7 @@
 package gossip;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -128,9 +129,10 @@ public final class MembershipTable {
             throw new MembershipException(CONFLICT, "A direct peer must not be the local process");
         }
         long now = clock.getAsLong();
-        // Plan the entire transaction against immutable entries, then publish after conflict/capacity checks.
+        // Validate conflicts and plan known updates before spending capacity on admissions.
         var proposed = new LinkedHashMap<>(entries);
         var retained = new LinkedHashMap<>(suppressions);
+        var admissions = new LinkedHashMap<MemberKey, Entry>();
         int admitted = 0;
         int advanced = 0;
         int ignored = 0;
@@ -178,17 +180,30 @@ public final class MembershipTable {
                 long lastAdvance = suppressed != null && incoming.state() == ALIVE
                         && incoming.heartbeat() == suppressed.heartbeat() ? suppressed.lastAdvance() : now;
                 old = new Entry(incoming, lastAdvance, null, false, now);
-                retained.remove(key);
-                admitted++;
             }
             if (directRecord && old.record().state() == ALIVE && old.record().sameEndpoint(incoming)) {
                 old = new Entry(old.record(), old.lastAdvance(), now, true, old.stateSince());
             }
-            proposed.put(key, old);
+            if (entries.containsKey(key)) { proposed.put(key, old); }
+            else { admissions.put(key, old); }
         }
         long active = proposed.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
-        if (active > config.maxMembers() || (long) proposed.size() + retained.size() > config.maxRecords()) {
-            throw new MembershipException(CAPACITY, "Membership admission exceeds max.members or max.records");
+        long identities = (long) proposed.size() + retained.size();
+        var orderedAdmissions = new ArrayList<>(admissions.entrySet());
+        // Restore known retained identities before spending remaining slots on genuinely new keys.
+        orderedAdmissions.sort(Comparator.comparing(entry -> !retained.containsKey(entry.getKey())));
+        for (var admission : orderedAdmissions) {
+            boolean alive = admission.getValue().record().state() == ALIVE;
+            boolean newIdentity = !retained.containsKey(admission.getKey());
+            if ((alive && active >= config.maxMembers()) || (newIdentity && identities >= config.maxRecords())) {
+                ignored++;
+                continue;
+            }
+            proposed.put(admission.getKey(), admission.getValue());
+            retained.remove(admission.getKey());
+            admitted++;
+            if (alive) { active++; }
+            if (newIdentity) { identities++; }
         }
         entries = proposed;
         suppressions = retained;

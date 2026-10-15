@@ -15,22 +15,31 @@
  */
 package gossip;
 
+import gossip.fixture.DnsProcessFixture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(15)
 class GossipRuntimeTest {
+    @TempDir Path temporary;
+
     private static GossipConfig config(String seeds) {
         var properties = GossipConfigTest.minimal();
         properties.setProperty("round.millis", "20");
@@ -125,6 +134,79 @@ class GossipRuntimeTest {
             GossipDnsResolverTest.await(() -> metrics.workers == 0 && client.threads.stream().noneMatch(Thread::isAlive));
             assertEquals(2, client.calls.size());
         }
+    }
+
+    @Test void coldHostnameAliasCannotDialTheSameEndpointTwiceEvenAfterTheFirstCallFinishes() throws Exception {
+        var config = config("Peer@wait.test:9010");
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        table.mergeDirect(PeerSelectorTest.record("Peer", 2, 9010), List.of());
+        var metrics = new GossipMetrics();
+        var client = new Client(false, false);
+        var release = temporary.resolve("release-dns");
+        var helpers = new CopyOnWriteArrayList<Process>();
+        try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
+                new Random(5), controlledResolver(release, helpers))) {
+            runtime.round();
+            GossipDnsResolverTest.await(() -> client.calls.size() == 1 && metrics.workers == 1);
+            // The numeric exchange has completed; the alias is deliberately still resolving.
+            Files.createFile(release);
+            GossipDnsResolverTest.await(() -> metrics.workers == 0 && client.threads.stream().noneMatch(Thread::isAlive));
+            assertEquals(1, client.calls.size(), "Resolved destinations must be unique for the whole round, not just while in flight");
+            assertEquals(1, metrics.skipped.get());
+            assertEquals(0, metrics.retryingPeers);
+            assertTrue(client.threads.stream().allMatch(Thread::isVirtual));
+            runtime.round();
+            GossipDnsResolverTest.await(() -> metrics.workers == 0 && client.threads.stream().noneMatch(Thread::isAlive));
+            assertEquals(2, client.calls.size());
+            assertEquals(1, metrics.skipped.get(), "Later rounds should coalesce the verified alias before creating a worker");
+            assertEquals(1, helpers.size());
+        }
+        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+    }
+
+    @Test void aSuccessfulHostnameBootstrapBecomesOneOrdinaryTargetOnLaterRounds() throws Exception {
+        var config = config("Peer@wait.test:9010");
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        var metrics = new GossipMetrics();
+        var calls = new CopyOnWriteArrayList<GossipConfig.Seed>();
+        var threads = new CopyOnWriteArrayList<Thread>();
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
+                calls.add(peer); threads.add(Thread.currentThread());
+                var record = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
+                        1, MemberRecord.State.ALIVE, Map.of());
+                table.mergeDirect(record, List.of());
+                return new GossipWire.Exchange(record, List.of());
+            }
+            @Override public void close() { }
+        };
+        var release = Files.createFile(temporary.resolve("release-dns"));
+        var helpers = new CopyOnWriteArrayList<Process>();
+        try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
+                new Random(6), controlledResolver(release, helpers))) {
+            for (int round = 1; round <= 3; round++) {
+                runtime.round();
+                GossipDnsResolverTest.await(() -> metrics.workers == 0 && threads.stream().noneMatch(Thread::isAlive));
+                assertEquals(round, calls.size(), "Hostname and advertised address must share one target");
+            }
+            assertEquals(1, helpers.size());
+            assertEquals(0, metrics.skipped.get());
+        }
+        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+    }
+
+    private GossipDnsResolver controlledResolver(Path release, List<Process> helpers) {
+        return new GossipDnsResolver(8, 2, Duration.ofSeconds(5), System::nanoTime, host -> {
+            Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
+            if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
+            try {
+                String classpath = Path.of(DnsProcessFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
+                var process = new ProcessBuilder(java.toString(), "-cp", classpath, DnsProcessFixture.class.getName(), host, release.toString())
+                        .redirectErrorStream(true).start();
+                helpers.add(process);
+                return process;
+            } catch (java.net.URISyntaxException e) { throw new IOException(e); }
+        });
     }
 
     private static final class Client implements GossipRuntime.ExchangeClient {

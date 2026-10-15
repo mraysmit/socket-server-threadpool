@@ -510,6 +510,21 @@ Shutdown cancels owned DNS/TCP work and joins runtime workers. See the
 [gossip plugin document](docs/GOSSIP_PLUGIN.md) for configuration, build/run commands,
 packaged-JAR tests, and the implementation checklist.
 
+At membership capacity, gossip still applies updates and departures for known
+members and returns a successful exchange reply; new records that cannot fit are
+skipped. Invalid records and identity conflicts still reject the entire batch.
+Healthy seeds participate in ordinary fanout, and verified hostname/IP aliases
+share selection and retry state. A delayed DNS lookup cannot dial a destination
+twice within the same round.
+
+Run the capacity and seed-selection regression tests with terminal output:
+
+```powershell
+mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=MembershipTableTest,GossipCapacityTest,PeerSelectorTest,GossipRuntimeTest,GossipCommandsTest,GossipTransportTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+The socket capacity cases print `Capacity test PASSED` after verifying the results.
+
 #### Loading Plugins from Runtime Folders
 
 Supply the folder list at launch by repeating `--plugins-dir`, once per folder.

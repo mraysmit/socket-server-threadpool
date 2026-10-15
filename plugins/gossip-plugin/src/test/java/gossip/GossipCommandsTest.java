@@ -185,16 +185,14 @@ class GossipCommandsTest {
         } finally { plugin.stop(); }
     }
 
-    @Test void capacityAndVersionConflictsReturnTypedParameterErrorsWithoutPartialUpdates() throws Exception {
+    @Test void saturationRepliesSuccessfullyButVersionConflictsStillReturnTypedErrors() throws Exception {
         var config = config(32768, 4, 2);
         var plugin = plugin(config);
         try {
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
             plugin.execute(wire.parameters(peer, List.of()));
-            var capacity = assertThrows(InvalidParametersException.class,
-                    () -> plugin.execute(wire.parameters(member("Other", 3), List.of())));
-            assertTrue(capacity.getMessage().startsWith("CAPACITY:"));
+            assertNotNull(plugin.execute(wire.parameters(member("Other", 3), List.of())));
             var changed = new MemberRecord(peer.key(), "elsewhere.invalid", 9000, 1, peer.state(), Map.of());
             var conflict = assertThrows(InvalidParametersException.class, () -> plugin.execute(wire.parameters(changed, List.of())));
             assertTrue(conflict.getMessage().startsWith("CONFLICT:"));

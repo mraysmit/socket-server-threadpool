@@ -270,7 +270,7 @@ class MembershipTableTest {
         table.merge(List.of(peer));
         var other = member("Other", 3, 1);
         var before = table.snapshot();
-        assertReason(CAPACITY, () -> table.merge(List.of(other)));
+        assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.merge(List.of(other)));
         assertEquals(before, table.snapshot());
         table.merge(List.of(version(peer, 2)));
         assertEquals(2, view(table, peer.key()).record().heartbeat());
@@ -290,10 +290,10 @@ class MembershipTableTest {
         assertEquals(2, table.snapshot().retainedIdentities());
         assertEquals(1, table.snapshot().tombstones());
         var other = member("Other", 3, 0);
-        assertReason(CAPACITY, () -> table.merge(List.of(other)));
+        assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.merge(List.of(other)));
         table.advanceLocal();
         clock.advance(60);
-        assertReason(CAPACITY, () -> table.merge(List.of(other)));
+        assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.merge(List.of(other)));
         table.maintain();
         table.merge(List.of(other));
         assertEquals(2, table.snapshot().activeMembers());
@@ -404,8 +404,8 @@ class MembershipTableTest {
                 }));
                 results.add(workers.submit(() -> {
                     gate.await();
-                    try { table.merge(List.of(member("Extra-" + heartbeat, 100 + heartbeat, 0))); }
-                    catch (MembershipException e) { assertEquals(CAPACITY, e.reason()); }
+                    var result = table.merge(List.of(member("Extra-" + heartbeat, 100 + heartbeat, 0)));
+                    assertEquals(1, result.admitted() + result.ignored());
                     return null;
                 }));
             }
@@ -415,6 +415,96 @@ class MembershipTableTest {
         assertEquals(32, view(table, peer.key()).record().heartbeat());
         assertEquals(4, table.snapshot().activeMembers());
         assertEquals(4, table.snapshot().retainedIdentities());
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void saturationSkipsNewIdentitiesButCommitsKnownUpdatesInEitherOrder(boolean excessFirst) {
+        var table = new MembershipTable(config(2, 2), self, clock);
+        table.mergeDirect(peer, List.of());
+        clock.advance(5);
+        var updated = version(peer, 2);
+        var excess = member("Excess", 3, 1);
+
+        var result = table.merge(excessFirst ? List.of(excess, updated) : List.of(updated, excess));
+
+        assertEquals(new MembershipTable.MergeResult(0, 1, 1), result);
+        assertEquals(updated, view(table, peer.key()).record());
+        assertEquals(0, view(table, peer.key()).advanceAgeNanos());
+        assertEquals(2, table.snapshot().retainedIdentities());
+        assertEquals(2, table.snapshot().activeMembers());
+    }
+
+    @Test void aSkippedAdmissionDoesNotHideLaterValidationOrVersionConflicts() {
+        var table = new MembershipTable(config(2, 4), self, clock);
+        table.mergeDirect(peer, List.of());
+        clock.advance(5);
+        var before = table.snapshot();
+        var excess = member("Excess", 3, 1);
+        var forged = new MemberRecord(self.key(), "forged.invalid", 9010, 0, self.state(), Map.of());
+        assertReason(CONFLICT, () -> table.mergeDirect(version(peer, 2), List.of(excess, forged)));
+        assertEquals(before, table.snapshot());
+        var malformed = new LinkedHashMap<>(excess.toWire());
+        malformed.put("heartbeat", 1.5);
+        assertReason(INVALID_RECORD, () -> table.mergeEncoded(List.of(version(peer, 2).toWire(), malformed)));
+        assertEquals(before, table.snapshot());
+    }
+
+    @Test void skippedSuppressionRecoveryPreservesItsVersionAndCanRecoverAfterAKnownDeparture() {
+        var table = new MembershipTable(config(2, 3), self, clock);
+        table.merge(List.of(peer));
+        clock.advance(60);
+        table.maintain();
+        var replacement = member("Replacement", 3, 1);
+        table.merge(List.of(replacement));
+        assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.mergeDirect(peer, List.of()));
+        assertEquals(1, table.snapshot().tombstones());
+        assertEquals(3, table.snapshot().retainedIdentities());
+        var forged = new MemberRecord(peer.key(), "forged.invalid", 9010, peer.heartbeat(), peer.state(), Map.of());
+        var before = table.snapshot();
+        assertReason(CONFLICT, () -> table.merge(List.of(forged, version(replacement, 2))));
+        assertEquals(before, table.snapshot());
+
+        var result = table.mergeDirect(peer, List.of(departed(replacement)));
+
+        assertEquals(new MembershipTable.MergeResult(1, 1, 0), result);
+        assertEquals(0, table.snapshot().tombstones());
+        assertEquals(3, table.snapshot().retainedIdentities());
+        assertEquals(2, table.snapshot().activeMembers());
+        assertEquals(TimeUnit.MILLISECONDS.toNanos(60), view(table, peer.key()).advanceAgeNanos());
+        assertEquals(0L, view(table, peer.key()).directSuccessAgeNanos());
+    }
+
+    @Test void skippedAliveAdmissionsDoNotBlockTerminalRecordsThatStillFit() {
+        var table = new MembershipTable(config(2, 3), self, clock);
+        table.merge(List.of(peer));
+        var excess = member("Excess", 3, 1);
+        var left = departed(member("Gone", 4, 1));
+        var another = departed(member("Also-Gone", 5, 1));
+
+        var result = table.merge(List.of(excess, left, another));
+
+        assertEquals(new MembershipTable.MergeResult(1, 0, 2), result);
+        assertEquals(left, view(table, left.key()).record());
+        assertEquals(2, table.snapshot().activeMembers());
+        assertEquals(3, table.snapshot().retainedIdentities());
+    }
+
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void retainedIdentityRecoveryHasPriorityOverNewAdmissionsInEitherOrder(boolean recoveryFirst) {
+        var table = new MembershipTable(config(2, 3), self, clock);
+        table.merge(List.of(peer));
+        clock.advance(60);
+        table.maintain();
+        var recovered = version(peer, 2);
+        var excess = member("Excess", 3, 1);
+
+        var result = table.merge(recoveryFirst ? List.of(recovered, excess) : List.of(excess, recovered));
+
+        assertEquals(new MembershipTable.MergeResult(1, 0, 1), result);
+        assertEquals(recovered, view(table, peer.key()).record());
+        assertEquals(2, table.snapshot().activeMembers());
+        assertEquals(2, table.snapshot().retainedIdentities());
+        assertEquals(0, table.snapshot().tombstones());
     }
 
     private static void assertReason(MembershipException.Reason reason, org.junit.jupiter.api.function.Executable operation) {

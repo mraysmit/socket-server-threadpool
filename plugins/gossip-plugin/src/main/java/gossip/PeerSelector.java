@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.LongSupplier;
@@ -28,11 +29,13 @@ import java.util.random.RandomGenerator;
 /** Bounded candidate/retry state, random ordinary fanout, and fair reserved recovery opportunities. */
 final class PeerSelector {
     private static final long MAX_BACKOFF = Duration.ofSeconds(30).toNanos();
+    private static final long ALIAS_NANOS = Duration.ofSeconds(60).toNanos();
     private final GossipConfig config;
     private final LongSupplier clock;
     private final RandomGenerator random;
     private final long roundNanos;
     private final Map<GossipConfig.Seed, Retry> retries = new LinkedHashMap<>();
+    private final Map<GossipConfig.Seed, Alias> aliases = new LinkedHashMap<>();
     private int recoveryCursor;
     private long selections;
 
@@ -44,29 +47,37 @@ final class PeerSelector {
     }
 
     synchronized List<GossipConfig.Seed> select(MembershipTable.Snapshot snapshot, Set<GossipConfig.Seed> busy, int slots) {
-        var candidates = new LinkedHashMap<GossipConfig.Seed, Boolean>();
+        long now = clock.getAsLong();
+        aliases.values().removeIf(alias -> now - alias.verifiedAt() >= ALIAS_NANOS);
+        var candidates = new LinkedHashMap<GossipConfig.Seed, Candidate>();
         var self = snapshot.self();
         for (var member : snapshot.members()) {
             if (member.record().key().equals(self.key()) || member.record().state() == MemberRecord.State.LEFT) { continue; }
             var record = member.record();
             var peer = new GossipConfig.Seed(record.key().serverId(), record.host(), record.port());
-            if (!isSelf(self, peer)) { candidates.merge(peer, member.assessment() != MembershipTable.Assessment.ALIVE, (a, b) -> a && b); }
+            if (!isSelf(self, peer)) {
+                var candidate = new Candidate(peer, member.assessment() != MembershipTable.Assessment.ALIVE);
+                candidates.merge(canonical(peer), candidate, (a, b) -> a.recovery() ? b : a);
+            }
         }
         int cap = Math.max(0, config.maxMembers() - 1);
         for (var seed : config.seeds()) {
-            if (!isSelf(self, seed) && (candidates.containsKey(seed) || candidates.size() < cap)) {
-                candidates.put(seed, true);
+            var key = canonical(seed);
+            if (!isSelf(self, seed) && (candidates.containsKey(key) || candidates.size() < cap)) {
+                // A verified healthy seed remains ordinary; recovering seeds retain their DNS fallback.
+                candidates.compute(key, (ignored, known) -> known != null && !known.recovery()
+                        ? known : new Candidate(seed, true));
             }
         }
-        retries.keySet().removeIf(peer -> !candidates.containsKey(peer) && !busy.contains(peer));
+        var busyKeys = busy.stream().map(this::canonical).collect(java.util.stream.Collectors.toSet());
+        retries.keySet().removeIf(peer -> !candidates.containsKey(peer) && !busyKeys.contains(peer));
         var ordinary = new ArrayList<GossipConfig.Seed>();
         var recovery = new ArrayList<GossipConfig.Seed>();
-        long now = clock.getAsLong();
         for (var item : candidates.entrySet()) {
-            if (busy.contains(item.getKey())) { continue; }
+            if (busyKeys.contains(item.getKey())) { continue; }
             Retry retry = retries.get(item.getKey());
             if (retry != null && now - retry.attempted < retry.delay) { continue; }
-            (item.getValue() ? recovery : ordinary).add(item.getKey());
+            (item.getValue().recovery() ? recovery : ordinary).add(item.getValue().peer());
         }
         for (int i = ordinary.size() - 1; i > 0; i--) {
             int swap = random.nextInt(i + 1);
@@ -92,9 +103,36 @@ final class PeerSelector {
         return peer;
     }
 
-    synchronized void success(GossipConfig.Seed peer) { retries.remove(peer); }
+    synchronized void success(GossipConfig.Seed peer) { retries.remove(canonical(peer)); }
+
+    /** DNS may confirm an alias of an endpoint whose identity is already directly verified. */
+    synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, MembershipTable.Snapshot snapshot) {
+        var resolved = normalized(endpoint);
+        if (!config.seeds().contains(peer) || normalized(peer).equals(resolved)) { return; }
+        boolean verified = snapshot.members().stream().anyMatch(member -> member.endpointVerified()
+                && !member.record().key().equals(snapshot.self().key())
+                && member.assessment() == MembershipTable.Assessment.ALIVE
+                && normalized(new GossipConfig.Seed(member.record().key().serverId(), member.record().host(), member.record().port())).equals(resolved));
+        if (verified) { rememberAlias(peer, resolved); }
+    }
+
+    /** Called only after a correlated, identity-checked exchange succeeds. Never resolve DNS here. */
+    synchronized void success(GossipConfig.Seed peer, GossipConfig.Seed endpoint) {
+        var previous = canonical(peer);
+        var resolved = normalized(endpoint);
+        rememberAlias(peer, resolved);
+        retries.remove(previous);
+        retries.remove(resolved);
+    }
+
+    private void rememberAlias(GossipConfig.Seed peer, GossipConfig.Seed resolved) {
+        if (config.seeds().contains(peer) && !normalized(peer).equals(resolved)) {
+            aliases.put(normalized(peer), new Alias(resolved, clock.getAsLong()));
+        }
+    }
 
     synchronized void failure(GossipConfig.Seed peer) {
+        peer = canonical(peer);
         Retry old = retries.get(peer);
         int failures = old == null ? 1 : Math.min(31, old.failures + 1);
         long base = Math.min(roundNanos, MAX_BACKOFF);
@@ -114,6 +152,19 @@ final class PeerSelector {
     }
     synchronized int retryCount() { return retries.size(); }
 
+    private GossipConfig.Seed canonical(GossipConfig.Seed peer) {
+        var normalized = normalized(peer);
+        Alias alias = aliases.get(normalized);
+        return alias != null && clock.getAsLong() - alias.verifiedAt() < ALIAS_NANOS ? alias.endpoint() : normalized;
+    }
+
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) {
+        String host;
+        try { host = InetAddress.ofLiteral(peer.host()).getHostAddress(); }
+        catch (IllegalArgumentException notLiteral) { host = peer.host().toLowerCase(Locale.ROOT); }
+        return new GossipConfig.Seed(peer.serverId(), host, peer.port());
+    }
+
     static boolean isSelf(MemberRecord self, GossipConfig.Seed peer) {
         if (self.port() != peer.port()) { return false; }
         if (self.host().equalsIgnoreCase(peer.host())) { return true; }
@@ -122,4 +173,6 @@ final class PeerSelector {
     }
 
     private record Retry(int failures, long attempted, long delay) { }
+    private record Alias(GossipConfig.Seed endpoint, long verifiedAt) { }
+    private record Candidate(GossipConfig.Seed peer, boolean recovery) { }
 }

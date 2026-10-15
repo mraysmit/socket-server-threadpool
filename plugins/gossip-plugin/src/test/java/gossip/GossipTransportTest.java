@@ -268,19 +268,21 @@ class GossipTransportTest {
         }
     }
 
-    @Test void aRealPeerCapacityErrorLeavesTheInitiatorIsolatedAndItsTableUnchanged() throws Exception {
+    @Test void aFullRealPeerStillRepliesAndTheInitiatorLearnsItWithoutExceedingItsOwnCap() throws Exception {
         var config = GossipCommandsTest.config(32768, 32, 2);
         var first = new GossipPlugin(config, false);
         var second = new GossipPlugin(config, false);
         try (var a = GossipServerFixture.start("Server-A", first); var b = GossipServerFixture.start("Server-B", second)) {
             var client = new TextMessageClient("127.0.0.1", b.getPort(), "Server-B");
             client.execute("gossip", new GossipWire(config).parameters(GossipCommandsTest.member("Third", 3), List.of()));
-            var failure = assertThrows(CommandExecutionException.class,
-                    () -> first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort())));
-            assertTrue(failure.reply().error().message().startsWith("CAPACITY:"));
+            var reply = first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort()));
+            assertEquals("Server-B", reply.sender().key().serverId());
             var status = GossipCommandsTest.execute(first, Map.of("operation", "status"));
-            assertEquals(true, status.get("isolated"));
-            assertEquals(1, ((Map<?, ?>) status.get("capacity")).get("retainedIdentities"));
+            assertEquals(false, status.get("isolated"));
+            assertEquals(2, ((Map<?, ?>) status.get("capacity")).get("retainedIdentities"));
+            assertEquals(2, ((Map<?, ?>) GossipCommandsTest.execute(second, Map.of("operation", "status")).get("capacity")).get("retainedIdentities"));
+            assertTrue(GossipSwarmTest.members(first).stream().anyMatch(row -> "Server-B".equals(row.get("serverId"))));
+            assertTrue(GossipSwarmTest.members(second).stream().noneMatch(row -> "Server-A".equals(row.get("serverId"))));
         }
     }
 

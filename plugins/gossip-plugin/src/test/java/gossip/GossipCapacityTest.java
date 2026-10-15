@@ -15,14 +15,12 @@
  */
 package gossip;
 
-import dev.mars.client.CommandExecutionException;
 import dev.mars.client.TextMessageClient;
-import dev.mars.protocol.CommandError;
 import dev.mars.server.GossipServerFixture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -87,8 +85,8 @@ class GossipCapacityTest {
         return records;
     }
 
-    @ParameterizedTest @ValueSource(ints = {128, 256})
-    void full128MemberHostAcceptsUpdatesButRejectsMixedExcessAdmissionsAtomically(int retainedCap) throws Exception {
+    @ParameterizedTest @CsvSource({"128, false", "128, true", "256, false", "256, true"})
+    void full128MemberHostKeepsUpdatingKnownMembersAndSkipsOnlyExcessAdmissions(int retainedCap, boolean departureFirst) throws Exception {
         var config = GossipTestNetwork.config(128, retainedCap, 8, 3072, "127.0.0.1", "");
         var plugin = new GossipPlugin(config, false);
         try (var server = GossipServerFixture.start("Receiver", plugin)) {
@@ -100,43 +98,36 @@ class GossipCapacityTest {
             assertEquals(128, before.size());
             assertEquals(128, ((Map<?, ?>) GossipSwarmTest.status(plugin).get("capacity")).get("activeMembers"));
             var wire = new GossipWire(config);
-            var advancedSender = version(peers.getFirst(), 2);
-            var advancedOther = version(peers.get(1), 2);
             var excess = record("Excess", 500, 1);
-            for (var batch : List.of(List.of(excess, advancedOther), List.of(advancedOther, excess))) {
-                var error = assertThrows(CommandExecutionException.class, () -> client.execute("gossip", wire.parameters(advancedSender, batch)));
-                assertEquals(CommandError.Code.INVALID_PARAMETERS, error.reply().error().code());
-                assertTrue(error.reply().error().message().startsWith("CAPACITY:"));
-                assertEquals(before, records(client, config), "Capacity rejection partially changed owner versions or metadata");
+            for (int heartbeat = 2; heartbeat <= 3; heartbeat++) {
+                var advancedSender = version(peers.getFirst(), heartbeat);
+                var advancedOther = version(peers.get(1), heartbeat);
+                var batch = heartbeat == 2 ? List.of(excess, advancedOther) : List.of(advancedOther, excess);
+                assertEquals("OK", client.execute("gossip", wire.parameters(advancedSender, batch)).status());
+                var updated = records(client, config);
+                assertEquals(128, updated.size());
+                assertEquals(advancedSender, updated.get(advancedSender.key()));
+                assertEquals(advancedOther, updated.get(advancedOther.key()));
+                assertFalse(updated.containsKey(excess.key()));
             }
-            client.execute("gossip", wire.parameters(advancedSender, List.of(advancedOther)));
-            var updated = records(client, config);
-            assertEquals(128, updated.size());
-            assertEquals(advancedSender, updated.get(advancedSender.key()));
-            assertEquals(advancedOther, updated.get(advancedOther.key()));
-
             var retiring = peers.getLast();
             var left = new MemberRecord(retiring.key(), retiring.host(), retiring.port(), retiring.heartbeat(), MemberRecord.State.LEFT, retiring.metadata());
-            client.execute("gossip", wire.parameters(advancedSender, List.of(left)));
-            var beforeReplacement = records(client, config);
-            var nextSender = version(advancedSender, 3);
-            if (retainedCap == 128) {
-                var error = assertThrows(CommandExecutionException.class, () -> client.execute("gossip", wire.parameters(nextSender, List.of(excess))));
-                assertTrue(error.reply().error().message().startsWith("CAPACITY:"));
-                assertEquals(beforeReplacement, records(client, config), "A free active slot must not bypass retained-identity capacity");
-                client.execute("gossip", wire.parameters(nextSender, List.of()));
-                assertEquals(nextSender, records(client, config).get(nextSender.key()));
-            } else {
-                client.execute("gossip", wire.parameters(nextSender, List.of(excess)));
-                assertEquals(129, records(client, config).size());
-            }
+            var nextSender = version(peers.getFirst(), 4);
+            client.execute("gossip", wire.parameters(nextSender, departureFirst ? List.of(left, excess) : List.of(excess, left)));
+            var updated = records(client, config);
+            assertEquals(nextSender, updated.get(nextSender.key()));
+            assertEquals(left, updated.get(left.key()));
+            assertEquals(retainedCap != 128, updated.containsKey(excess.key()), "A freed active slot must still respect retained-identity capacity");
+            assertEquals(retainedCap == 128 ? 128 : 129, updated.size());
             var capacity = (Map<?, ?>) GossipSwarmTest.status(plugin).get("capacity");
             assertEquals(retainedCap == 128 ? 127 : 128, capacity.get("activeMembers"));
             assertTrue(((Number) capacity.get("retainedIdentities")).intValue() <= retainedCap);
+            assertEquals(0L, ((Number) ((Map<?, ?>) GossipSwarmTest.status(plugin).get("exchanges")).get("rejected")).longValue());
+            System.out.printf("Capacity test PASSED | members=128 | retainedCap=%d | departureFirst=%s | known updates preserved%n", retainedCap, departureFirst);
         }
     }
 
-    @Test void concurrentAdmissionsCompeteForTheLastSlotWithoutPartialUpdatesFromTheRejectedBatch() throws Exception {
+    @Test void concurrentAdmissionsCompeteForTheLastSlotWhileBothKnownUpdatesCommit() throws Exception {
         var config = GossipTestNetwork.config(4, 8, 4, 4096, "127.0.0.1", "");
         var plugin = new GossipPlugin(config, false);
         try (var server = GossipServerFixture.start("Receiver", plugin);
@@ -147,24 +138,24 @@ class GossipCapacityTest {
             fill(client, config, List.of(one, two));
             var gate = new CountDownLatch(1);
             var wire = new GossipWire(config);
+            var newOne = record("New-One", 3, 1);
+            var newTwo = record("New-Two", 4, 1);
             var first = workers.submit(() -> {
                 gate.await();
-                try { client.execute("gossip", wire.parameters(version(one, 2), List.of(record("New-One", 3, 1)))); return true; }
-                catch (CommandExecutionException e) { assertTrue(e.reply().error().message().startsWith("CAPACITY:")); return false; }
+                return client.execute("gossip", wire.parameters(version(one, 2), List.of(newOne)));
             });
             var second = workers.submit(() -> {
                 gate.await();
-                try { client.execute("gossip", wire.parameters(version(two, 2), List.of(record("New-Two", 4, 1)))); return true; }
-                catch (CommandExecutionException e) { assertTrue(e.reply().error().message().startsWith("CAPACITY:")); return false; }
+                return client.execute("gossip", wire.parameters(version(two, 2), List.of(newTwo)));
             });
             gate.countDown();
-            boolean firstWon = first.get(3, TimeUnit.SECONDS);
-            boolean secondWon = second.get(3, TimeUnit.SECONDS);
-            assertNotEquals(firstWon, secondWon);
+            assertEquals("OK", first.get(3, TimeUnit.SECONDS).status());
+            assertEquals("OK", second.get(3, TimeUnit.SECONDS).status());
             var records = records(client, config);
             assertEquals(4, records.size());
-            assertEquals(firstWon ? version(one, 2) : one, records.get(one.key()));
-            assertEquals(secondWon ? version(two, 2) : two, records.get(two.key()));
+            assertNotEquals(records.containsKey(newOne.key()), records.containsKey(newTwo.key()));
+            assertEquals(version(one, 2), records.get(one.key()));
+            assertEquals(version(two, 2), records.get(two.key()));
         }
     }
 }
