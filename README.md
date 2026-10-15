@@ -644,8 +644,8 @@ its own JAR:
 |---|---|---|
 | `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `EchoPlugin` and startup-only `AddressBroadcastPlugin` |
 | `src/test/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Test classpath only; excluded from the server JAR | `MathAddPlugin` and `TextConcatPlugin` from `dev.mars.plugin.fixtures` |
-| `plugins/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
-| `plugins/gossip-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Gossip plugin JAR | `gossip.GossipPlugin` (`gossip`) |
+| `plugins/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Multiply plugin JAR | `dev.mars.plugins.multiply.MultiplyPlugin` (`math.multiply`) |
+| `plugins/gossip-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Gossip plugin JAR | `dev.mars.plugins.gossip.GossipPlugin` (`gossip`) |
 
 Inside each JAR, the registration has the same path:
 `META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
@@ -678,7 +678,7 @@ Implement the public SPI in a separate Java 27 project using this project's buil
 JAR as a compile-time dependency. For example:
 
 ```java
-package example;
+package dev.mars.plugins.multiply;
 
 import dev.mars.plugin.CommandPlugin;
 import dev.mars.plugin.InvalidParametersException;
@@ -700,7 +700,7 @@ In that plugin project, add
 `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` containing:
 
 ```text
-example.MultiplyPlugin
+dev.mars.plugins.multiply.MultiplyPlugin
 ```
 
 Package the plugin normally, create a `plugins` directory, and copy its JAR there

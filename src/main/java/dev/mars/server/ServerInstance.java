@@ -50,7 +50,7 @@ public final class ServerInstance implements AutoCloseable {
     }
 
     /** Starts with a caller-supplied registry, which the instance then owns and closes. */
-    static ServerInstance start(ServerOptions options, PluginRegistry plugins) throws IOException {
+    public static ServerInstance start(ServerOptions options, PluginRegistry plugins) throws IOException {
         ServerInstance instance;
         try {
             instance = new ServerInstance(options, plugins);
