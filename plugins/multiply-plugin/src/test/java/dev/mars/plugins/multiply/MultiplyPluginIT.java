@@ -15,41 +15,28 @@
  */
 package dev.mars.plugins.multiply;
 
-import com.fasterxml.jackson.annotation.JsonProperty;
-import com.fasterxml.jackson.core.JsonFactory;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import dev.mars.StartStop;
 import dev.mars.client.CommandExecutionException;
 import dev.mars.client.TextMessageClient;
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.Json;
+import dev.mars.testing.HostProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-import java.io.BufferedReader;
-import java.io.File;
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
+import java.time.Duration;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
 import java.util.jar.JarFile;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
 
 import static dev.mars.protocol.CommandError.Code.INVALID_PARAMETERS;
 import static dev.mars.protocol.CommandError.Code.UNKNOWN_INSTRUCTION;
@@ -58,6 +45,8 @@ import static org.junit.jupiter.api.Assertions.*;
 /** Exercises the packaged artifact through a server JVM with no example classes on its classpath. */
 @Timeout(25)
 class MultiplyPluginIT {
+    private static final String SERVER_ID = "Server-001";
+    private static final Duration WAIT = Duration.ofSeconds(10);
     @TempDir Path temporary;
 
     @Test
@@ -78,12 +67,13 @@ class MultiplyPluginIT {
 
     @Test
     void multiplyIsUnavailableWithoutRuntimePluginDirectory() throws Exception {
-        try (var server = new ServerProcess()) {
-            var client = server.client();
+        try (var server = HostProcess.console(SERVER_ID).start()) {
+            var client = client(server);
             UUID id = UUID.randomUUID();
             var failure = assertThrows(CommandExecutionException.class,
                     () -> client.execute(id, "math.multiply", Map.of("a", 6, "b", 7)));
             assertFailure(failure, id, UNKNOWN_INSTRUCTION);
+            assertCleanExit(server);
         }
     }
 
@@ -92,8 +82,9 @@ class MultiplyPluginIT {
     void packagedJarLoadsFromEitherRuntimeDirectoryAndReturnsCorrelatedResults(boolean secondFolder) throws Exception {
         Path plugins = copyPlugin();
         Path empty = Files.createDirectory(temporary.resolve("empty plugins"));
-        try (var server = secondFolder ? new ServerProcess(empty, plugins) : new ServerProcess(plugins, empty)) {
-            var client = server.client();
+        try (var server = secondFolder ? HostProcess.console(SERVER_ID, empty, plugins).start()
+                : HostProcess.console(SERVER_ID, plugins, empty).start()) {
+            var client = client(server);
             var connections = new HashSet<Long>();
             String[][] cases = {
                     {"{\"a\":6,\"b\":7}", "42"},
@@ -114,14 +105,15 @@ class MultiplyPluginIT {
                 assertTrue(connections.add(reply.connectionId()), "Each connection must have its own ID");
                 System.out.println("Standalone plugin JAR test PASSED | instruction=math.multiply | " + reply);
             }
+            assertCleanExit(server);
         }
         Files.delete(plugins.resolve(pluginJar().getFileName()));
     }
 
     @Test
     void invalidParametersReturnCorrelatedErrorsAndPluginRemainsUsable() throws Exception {
-        try (var server = new ServerProcess(copyPlugin())) {
-            var client = server.client();
+        try (var server = HostProcess.console(SERVER_ID, copyPlugin()).start()) {
+            var client = client(server);
             for (String parameters : List.of("{}", "{\"a\":6}", "{\"b\":7}", "{\"a\":null,\"b\":7}",
                     "{\"a\":\"6\",\"b\":7}", "{\"a\":true,\"b\":7}", "{\"a\":[],\"b\":7}",
                     "{\"a\":6,\"b\":7,\"extra\":1}")) {
@@ -138,6 +130,7 @@ class MultiplyPluginIT {
             assertEquals("OK", reply.status());
             assertNull(reply.error());
             assertEquals(new java.math.BigInteger("42"), reply.result());
+            assertCleanExit(server);
         }
     }
 
@@ -171,68 +164,11 @@ class MultiplyPluginIT {
         return directory;
     }
 
-    private static String productionClasspath() {
-        // Include only the server and its JSON dependencies. The provider must come from --plugins-dir.
-        return List.of(StartStop.class, ObjectMapper.class, JsonFactory.class, JsonProperty.class)
-                .stream().map(type -> {
-                    try { return Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toString(); }
-                    catch (Exception e) { throw new IllegalStateException(e); }
-                }).distinct().collect(Collectors.joining(File.pathSeparator));
+    private static TextMessageClient client(HostProcess server) throws IOException {
+        return new TextMessageClient("localhost", server.awaitReady(SERVER_ID, WAIT).port(), SERVER_ID);
     }
 
-    /** The child has no example classes; only the server discovers the copied runtime JAR. */
-    private static final class ServerProcess implements AutoCloseable {
-        private final Process process;
-        private final ExecutorService reader = Executors.newVirtualThreadPerTaskExecutor();
-        private final CompletableFuture<Integer> port = new CompletableFuture<>();
-        private final Future<String> output;
-
-        ServerProcess(Path... directories) throws IOException {
-            Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
-            if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
-            var command = new ArrayList<>(List.of(java.toString(), "-cp", productionClasspath(), "dev.mars.StartStop",
-                    "Server-001", "--port", "0", "--admin-port", "0"));
-            for (Path directory : directories) { command.add("--plugins-dir"); command.add(directory.toString()); }
-            process = new ProcessBuilder(command).redirectErrorStream(true).start();
-            output = reader.submit(() -> {
-                var captured = new StringBuilder();
-                var ready = Pattern.compile("Server ready \\| serverId=Server-001 \\| main=localhost:(\\d+)");
-                try (var lines = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-                    String line;
-                    while ((line = lines.readLine()) != null) {
-                        captured.append(line).append('\n');
-                        System.out.println(line);
-                        var match = ready.matcher(line);
-                        if (match.find()) { port.complete(Integer.parseInt(match.group(1))); }
-                    }
-                    port.completeExceptionally(new IOException("Server exited before readiness:\n" + captured));
-                    return captured.toString();
-                } catch (IOException e) {
-                    port.completeExceptionally(e);
-                    throw e;
-                }
-            });
-        }
-
-        TextMessageClient client() throws Exception {
-            return new TextMessageClient("localhost", port.get(10, TimeUnit.SECONDS), "Server-001");
-        }
-
-        @Override
-        public void close() throws Exception {
-            try {
-                if (process.isAlive()) {
-                    try (var input = process.getOutputStream()) { input.write("quit\n".getBytes(StandardCharsets.UTF_8)); }
-                }
-                assertTrue(process.waitFor(10, TimeUnit.SECONDS), "Server did not exit");
-                assertEquals(0, process.exitValue(), output.get(3, TimeUnit.SECONDS));
-            } finally {
-                if (process.isAlive()) {
-                    process.destroyForcibly();
-                    assertTrue(process.waitFor(5, TimeUnit.SECONDS));
-                }
-                reader.close();
-            }
-        }
+    private static void assertCleanExit(HostProcess server) throws IOException {
+        assertEquals(0, server.stop(WAIT), server.outputText());
     }
 }

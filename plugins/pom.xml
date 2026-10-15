@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <!--
+        Builds the host first and then every plugin against it in one reactor, so a host change
+        that breaks a plugin, or the host's plugin test support, fails this build:
+            mvn -f plugins/pom.xml verify
+        Use verify (not test): plugins resolve the host's test-support JAR, which exists only after packaging.
+    -->
+    <groupId>dev.mars.plugins</groupId>
+    <artifactId>host-and-plugins</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <modules>
+        <module>..</module>
+        <module>gossip-plugin</module>
+        <module>multiply-plugin</module>
+    </modules>
+</project>

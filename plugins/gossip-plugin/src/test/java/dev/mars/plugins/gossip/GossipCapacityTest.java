@@ -16,7 +16,7 @@
 package dev.mars.plugins.gossip;
 
 import dev.mars.client.TextMessageClient;
-import dev.mars.plugins.gossip.fixture.GossipServerFixture;
+import dev.mars.testing.TestServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -89,7 +89,7 @@ class GossipCapacityTest {
     void full128MemberHostKeepsUpdatingKnownMembersAndSkipsOnlyExcessAdmissions(int retainedCap, boolean departureFirst) throws Exception {
         var config = GossipTestNetwork.config(128, retainedCap, 8, 3072, "127.0.0.1", "");
         var plugin = new GossipPlugin(config, false);
-        try (var server = GossipServerFixture.start("Receiver", plugin)) {
+        try (var server = TestServer.start("Receiver", plugin)) {
             var client = new TextMessageClient("127.0.0.1", server.getPort(), "Receiver");
             var peers = new ArrayList<MemberRecord>();
             for (int i = 0; i < 127; i++) { peers.add(record("Peer-%03d".formatted(i), i + 1, 1)); }
@@ -130,7 +130,7 @@ class GossipCapacityTest {
     @Test void concurrentAdmissionsCompeteForTheLastSlotWhileBothKnownUpdatesCommit() throws Exception {
         var config = GossipTestNetwork.config(4, 8, 4, 4096, "127.0.0.1", "");
         var plugin = new GossipPlugin(config, false);
-        try (var server = GossipServerFixture.start("Receiver", plugin);
+        try (var server = TestServer.start("Receiver", plugin);
              var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             var client = new TextMessageClient("127.0.0.1", server.getPort(), "Receiver");
             var one = record("One", 1, 1);

@@ -709,27 +709,13 @@ class ExternalPluginTest {
     void consoleQuitEofAndShutdownStopPluginWorkers(String input) throws Exception {
         Path directory = Files.createDirectory(temporary.resolve("plugins"));
         Path jar = lifecycleJar(directory, false, false);
-        Path javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java.exe");
-        if (!Files.exists(javaExecutable)) { javaExecutable = Path.of(System.getProperty("java.home"), "bin", "java"); }
-        var process = new ProcessBuilder(javaExecutable.toString(), "-Ddev.mars.announce=false", "-cp",
-                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
-                "dev.mars.StartStop", "Console", "--port", "0", "--admin-port", "0", "--plugins-dir", directory.toString())
-                .redirectErrorStream(true).start();
-        try (var reader = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
-            var output = reader.submit(() -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-            try {
-                try (var stdin = process.getOutputStream()) { stdin.write(input.getBytes(StandardCharsets.UTF_8)); }
-                assertTrue(process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS), "Console did not exit");
-                assertEquals(0, process.exitValue(), output.get(2, java.util.concurrent.TimeUnit.SECONDS));
-                assertEquals("worker stopped", Files.readString(temporary.resolve("Console.worker-stopped")));
-                assertEquals("stop\n", Files.readString(temporary.resolve("Console.stopped")));
-                System.out.println("External plugin lifecycle CLI test PASSED | input=" + Json.write(input));
-            } finally {
-                if (process.isAlive()) {
-                    process.destroyForcibly();
-                    assertTrue(process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS));
-                }
-            }
+        try (var process = dev.mars.testing.HostProcess.console("Console", directory).start()) {
+            process.input(input);
+            process.closeInput();
+            assertEquals(0, process.awaitExit(java.time.Duration.ofSeconds(10)), process.outputText());
+            assertEquals("worker stopped", Files.readString(temporary.resolve("Console.worker-stopped")));
+            assertEquals("stop\n", Files.readString(temporary.resolve("Console.stopped")));
+            System.out.println("External plugin lifecycle CLI test PASSED | input=" + Json.write(input));
         }
         Files.delete(jar);
     }

@@ -501,6 +501,38 @@ tests; use the separate example command above to test this standalone artifact.
 Reinstall the server after API changes and rebuild the example after changes to
 its source. The example's `clean` removes its previous JAR before rebuilding it.
 
+#### Testing Plugins
+
+The host publishes its plugin test support as a separate test JAR,
+`socket-client-server-1.0-SNAPSHOT-tests.jar`, containing only package
+`dev.mars.testing`. The host's own tests use the same classes, so a host change
+that breaks them fails the host build. Add it to a plugin project with test scope:
+
+```xml
+<dependency>
+    <groupId>dev.mars</groupId>
+    <artifactId>socket-client-server</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <type>test-jar</type>
+    <scope>test</scope>
+</dependency>
+```
+
+| Class | Use |
+|---|---|
+| `TestServer` | Starts an in-process server with plugin instances you supply, plus the built-in `echo` command. |
+| `HostProcess.console(...)` | Runs the real console in a separate JVM whose classpath holds only the host and its JSON libraries, so the plugin can load only from `--plugins-dir`. Waits for readiness, sends input, and checks a clean exit. |
+| `HostProcess.controller()` | Runs a separate JVM that starts and stops several servers on command and stays alive afterwards, so tests can check plugin cleanup (for example, that the plugin JAR can be deleted) before the JVM exits. |
+
+To build the host and then verify every plugin against it in one run:
+
+```powershell
+mvn -f plugins/pom.xml clean verify
+```
+
+Use `verify` rather than `test` here: the plugins need the host's test JAR, which
+is only created when the host is packaged.
+
 The separate [`plugins/gossip-plugin`](plugins/gossip-plugin/pom.xml) project provides
 the gossip provider, validated membership model, `exchange`, paginated `members`,
 diagnostic `status`, and asynchronous `leave`, with bounded peer transport. Jittered rounds automatically

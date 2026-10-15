@@ -21,7 +21,7 @@ import dev.mars.protocol.CommandError;
 import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.CommandRequest;
-import dev.mars.plugins.gossip.fixture.GossipServerFixture;
+import dev.mars.testing.TestServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -349,7 +349,7 @@ class GossipTransportTest {
         var config = GossipCommandsTest.config(32768, 2, 128);
         var first = new GossipPlugin(config, false);
         var second = new GossipPlugin(config, false);
-        try (var a = GossipServerFixture.start("Server-A", first); var b = GossipServerFixture.start("Server-B", second)) {
+        try (var a = TestServer.start("Server-A", first); var b = TestServer.start("Server-B", second)) {
             var bEndpoint = new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort());
             first.exchangeWith(bEndpoint);
             second.exchangeWith(new GossipConfig.Seed("Server-A", "127.0.0.1", a.getPort()));
@@ -395,7 +395,7 @@ class GossipTransportTest {
         var config = GossipCommandsTest.config(32768, 32, 2);
         var first = new GossipPlugin(config, false);
         var second = new GossipPlugin(config, false);
-        try (var a = GossipServerFixture.start("Server-A", first); var b = GossipServerFixture.start("Server-B", second)) {
+        try (var a = TestServer.start("Server-A", first); var b = TestServer.start("Server-B", second)) {
             var client = new TextMessageClient("127.0.0.1", b.getPort(), "Server-B");
             client.execute("gossip", new GossipWire(config).parameters(GossipCommandsTest.member("Third", 3), List.of()));
             var reply = first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort()));
@@ -416,7 +416,7 @@ class GossipTransportTest {
     @Test void anAliasForTheLocalEndpointCannotTurnASelfExchangeIntoBootstrapSuccess() throws Exception {
         var config = GossipCommandsTest.config(32768, 32, 128);
         var plugin = new GossipPlugin(config, false);
-        try (var server = GossipServerFixture.start("Self", plugin)) {
+        try (var server = TestServer.start("Self", plugin)) {
             assertThrows(IOException.class, () -> plugin.exchangeWith(new GossipConfig.Seed("Self", "localhost", server.getPort())));
             var status = GossipCommandsTest.execute(plugin, Map.of("operation", "status"));
             assertEquals(true, status.get("isolated"));

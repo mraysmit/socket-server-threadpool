@@ -17,6 +17,7 @@ package dev.mars;
 
 import dev.mars.server.ServerInstance;
 import dev.mars.server.ServerOptions;
+import dev.mars.testing.HostProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -28,12 +29,10 @@ import java.net.ServerSocket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashSet;
 import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -63,7 +62,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
                         "--plugins-dir", directory.toString()},
                 "send {\"instruction\":\"test.console\",\"parameters\":{}}\nquit\n",
-                productionClasspath());
+                HostProcess.hostClasspath());
         assertEquals(0, result.exitCode(), result.output());
         if (registered) {
             assertCommandReplies(result, "Server-001", "result=\"Loaded from runtime JAR\"");
@@ -73,16 +72,6 @@ class StartStopTest {
         }
         assertReleased(result);
         Files.delete(jar);
-    }
-
-    private String productionClasspath() throws Exception {
-        var types = java.util.List.of(StartStop.class, com.fasterxml.jackson.databind.ObjectMapper.class,
-                com.fasterxml.jackson.core.JsonFactory.class, com.fasterxml.jackson.annotation.JsonProperty.class);
-        var paths = new java.util.ArrayList<String>();
-        for (Class<?> type : types) {
-            paths.add(Path.of(type.getProtectionDomain().getCodeSource().getLocation().toURI()).toString());
-        }
-        return String.join(java.io.File.pathSeparator, paths);
     }
 
     @Test
@@ -101,7 +90,7 @@ class StartStopTest {
         var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
                 "send {\"instruction\":\"unknown\",\"parameters\":{}}\n"
                 + "send {\"instruction\":\"echo\",\"parameters\":{\"text\":\"still healthy\"}}\nquit\n",
-                productionClasspath());
+                HostProcess.hostClasspath());
         assertEquals(0, result.exitCode(), result.output());
         assertCommandReplies(result, "Server-001", "error=UNKNOWN_INSTRUCTION: Unknown instruction: unknown",
                 "result=\"Received: still healthy\"");
@@ -114,7 +103,7 @@ class StartStopTest {
             var result = run("dev.mars.client.TextMessageClient", new String[]{"--port", "" + instance.getPort(),
                     "--expected-server-id", "Server-001",
                     "{\"instruction\":\"echo\",\"parameters\":{\"text\":\"hello world\"}}"}, "",
-                    productionClasspath());
+                    HostProcess.hostClasspath());
             assertEquals(0, result.exitCode(), result.output());
             assertCommandReplies(result, "Server-001", "result=\"Received: hello world\"");
         }
@@ -225,27 +214,11 @@ class StartStopTest {
     }
 
     private Result run(String mainClass, String[] args, String input, String classes) throws Exception {
-        Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
-        if (!Files.exists(java)) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
-        var command = new ArrayList<String>();
-        command.add(java.toString()); command.add("-Ddev.mars.announce=false");
-        command.add("-cp"); command.add(classes); command.add(mainClass);
-        // Preserve embedded JSON quotes through Windows' native command-line parser.
-        boolean windows = System.getProperty("os.name").startsWith("Windows");
-        command.addAll(Arrays.stream(args).map(arg -> windows ? arg.replace("\"", "\\\"") : arg).toList());
-        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
-        try (var outputReader = Executors.newVirtualThreadPerTaskExecutor()) {
-            var output = outputReader.submit(() -> new String(process.getInputStream().readAllBytes(), StandardCharsets.UTF_8));
-            try {
-                try (var stdin = process.getOutputStream()) { stdin.write(input.getBytes(StandardCharsets.UTF_8)); }
-                assertTrue(process.waitFor(10, TimeUnit.SECONDS), "Command did not exit: " + command);
-                return new Result(process.exitValue(), output.get(2, TimeUnit.SECONDS));
-            } finally {
-                if (process.isAlive()) {
-                    process.destroyForcibly();
-                    assertTrue(process.waitFor(5, TimeUnit.SECONDS));
-                }
-            }
+        try (var process = HostProcess.of(mainClass, args).classpath(classes).start()) {
+            process.input(input);
+            process.closeInput();
+            int exitCode = process.awaitExit(Duration.ofSeconds(10));
+            return new Result(exitCode, process.outputText());
         }
     }
 

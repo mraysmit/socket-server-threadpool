@@ -17,7 +17,7 @@ package dev.mars.plugins.gossip;
 
 import dev.mars.client.TextMessageClient;
 import dev.mars.plugin.InvalidParametersException;
-import dev.mars.plugins.gossip.fixture.GossipServerFixture;
+import dev.mars.testing.TestServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -137,12 +137,12 @@ class GossipDepartureTest {
 
     @Test void threeNodeDeparturePropagatesAndStaleAliveCannotReviveItWhileOtherNodesKeepWorking() throws Exception {
         var owner = new GossipPlugin(GossipSwarmTest.config(""));
-        try (var a = GossipServerFixture.start("Owner", owner)) {
+        try (var a = TestServer.start("Owner", owner)) {
             var seed = "Owner@127.0.0.1:" + a.getPort();
             var departing = new GossipPlugin(GossipSwarmTest.config(seed));
             var other = new GossipPlugin(GossipSwarmTest.config(seed));
-            try (var b = GossipServerFixture.start("Departing", departing);
-                 var c = GossipServerFixture.start("Other", other)) {
+            try (var b = TestServer.start("Departing", departing);
+                 var c = TestServer.start("Other", other)) {
                 GossipDnsResolverTest.await(() -> {
                     try { return GossipSwarmTest.members(departing).size() == 3 && GossipSwarmTest.members(other).size() == 3; }
                     catch (Exception e) { throw new RuntimeException(e); }
@@ -187,8 +187,8 @@ class GossipDepartureTest {
         var config = GossipSwarmTest.config("");
         var departing = new GossipPlugin(config, false);
         var peer = new GossipPlugin(config, false);
-        try (var origin = GossipServerFixture.start("Departing", departing);
-             var remote = GossipServerFixture.start("Peer", peer)) {
+        try (var origin = TestServer.start("Departing", departing);
+             var remote = TestServer.start("Peer", peer)) {
             var stale = MemberRecord.fromWire(GossipSwarmTest.status(departing).get("self"));
             var sender = MemberRecord.fromWire(GossipSwarmTest.status(peer).get("self"));
             var wire = new GossipWire(config);
@@ -219,7 +219,7 @@ class GossipDepartureTest {
         try (var peer = new GossipSwarmTest.StalledPeer()) {
             // Disable ordinary rounds so the first wire request must carry LEFT.
             var plugin = new GossipPlugin(GossipSwarmTest.config("Stalled@127.0.0.1:" + peer.port()), false);
-            try (var server = GossipServerFixture.start("Self", plugin)) {
+            try (var server = TestServer.start("Self", plugin)) {
                 var client = new TextMessageClient("127.0.0.1", server.getPort(), "Self");
                 long began = System.nanoTime();
                 client.execute("gossip", Map.of("operation", "leave"));
@@ -314,7 +314,7 @@ class GossipDepartureTest {
     @Test void administrativeShutdownCancelsAnActiveDepartureWithoutWaitingForItsBudget() throws Exception {
         try (var peer = new GossipSwarmTest.StalledPeer()) {
             var plugin = new GossipPlugin(GossipSwarmTest.config("Stalled@127.0.0.1:" + peer.port()), false);
-            try (var server = GossipServerFixture.start("Self", plugin)) {
+            try (var server = TestServer.start("Self", plugin)) {
                 plugin.execute(Map.of("operation", "leave"));
                 assertTrue(peer.request.get(2, TimeUnit.SECONDS));
                 long began = System.nanoTime();

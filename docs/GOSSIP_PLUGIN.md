@@ -368,7 +368,7 @@ Host tests exercise normal close, administrative shutdown, console quit/end-of-i
 
 ## Suggested plugin classes
 
-The implementation uses package `dev.mars.plugins.gossip`, with production sources under `plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip` and tests under `plugins/gossip-plugin/src/test/java/dev/mars/plugins/gossip`. Test fixtures use `dev.mars.plugins.gossip.fixture`: the child-JVM launchers, and `GossipServerFixture`, which starts host servers through the public `ServerInstance.start(ServerOptions, PluginRegistry)`. Service registration names `dev.mars.plugins.gossip.GossipPlugin`. Embedded Java callers must update their imports and rebuild against the renamed classes. The command instruction remains `gossip`.
+The implementation uses package `dev.mars.plugins.gossip`, with production sources under `plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip` and tests under `plugins/gossip-plugin/src/test/java/dev/mars/plugins/gossip`. Tests start host servers only through the host-owned test-support JAR: `dev.mars.testing.TestServer` for in-process servers and `dev.mars.testing.HostProcess` for separate host JVMs that load the packaged plugin from `--plugins-dir`. `dev.mars.plugins.gossip.fixture` holds only `DnsProcessFixture`, which imitates the plugin's own DNS helper. Service registration names `dev.mars.plugins.gossip.GossipPlugin`. Embedded Java callers must update their imports and rebuild against the renamed classes. The command instruction remains `gossip`.
 
 | Class | Responsibility |
 |---|---|
@@ -411,6 +411,8 @@ mvn clean install
 mvn -f plugins/gossip-plugin/pom.xml clean verify
 mvn dependency:copy-dependencies "-DincludeScope=runtime"
 ```
+
+`mvn clean install` also installs the host's test-support JAR, which the plugin's tests use. To build and verify the host and every plugin together, run `mvn -f plugins/pom.xml clean verify`.
 
 The project builds `plugins/gossip-plugin/target/gossip-plugin-1.0-SNAPSHOT.jar`. The local demo files [`gossip-001.properties`](../config/gossip-001.properties), [`gossip-002.properties`](../config/gossip-002.properties), and [`gossip-003.properties`](../config/gossip-003.properties) share a swarm ID and seed list. Load the JAR directly from its target directory, or copy it to a dedicated runtime folder. Start each process from the repository root in its own PowerShell terminal; these seed-only demo commands disable LAN announcements:
 

@@ -22,7 +22,7 @@ import dev.mars.plugin.PluginContext;
 import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.CommandRequest;
-import dev.mars.plugins.gossip.fixture.GossipServerFixture;
+import dev.mars.testing.TestServer;
 import dev.mars.server.ServerInstance;
 
 import java.io.BufferedReader;
@@ -70,7 +70,7 @@ final class GossipTestNetwork implements AutoCloseable {
             @Override public void stop() throws Exception { plugin.stop(); }
         };
         try {
-            var backend = GossipServerFixture.start(id, wrapper);
+            var backend = TestServer.start(id, wrapper);
             relay.backend = backend.getPort();
             var node = new Node(id, config, plugin, backend, relay);
             nodes.add(node);

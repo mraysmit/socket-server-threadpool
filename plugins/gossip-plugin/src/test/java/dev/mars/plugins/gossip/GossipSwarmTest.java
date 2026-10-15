@@ -18,7 +18,7 @@ package dev.mars.plugins.gossip;
 import dev.mars.client.TextMessageClient;
 import dev.mars.plugin.CommandPlugin;
 import dev.mars.plugin.PluginContext;
-import dev.mars.plugins.gossip.fixture.GossipServerFixture;
+import dev.mars.testing.TestServer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -57,11 +57,11 @@ class GossipSwarmTest {
 
     @Test void threeServersConvergeThroughSeedsAndRecoverARestartWithoutStoppingTheOthers() throws Exception {
         var first = new GossipPlugin(config(""));
-        try (var a = GossipServerFixture.start("Server-A", first)) {
+        try (var a = TestServer.start("Server-A", first)) {
             String seed = "Server-A@127.0.0.1:" + a.getPort();
             var second = new GossipPlugin(config(seed));
             var third = new GossipPlugin(config("Server-A@localhost:" + a.getPort()));
-            try (var b = GossipServerFixture.start("Server-B", second); var c = GossipServerFixture.start("Server-C", third)) {
+            try (var b = TestServer.start("Server-B", second); var c = TestServer.start("Server-C", third)) {
                 long began = System.nanoTime();
                 await(() -> alive(first) == 3 && alive(second) == 3 && alive(third) == 3
                         && ((Number) ((Map<?, ?>) status(first).get("self")).get("heartbeat")).longValue() > 0);
@@ -80,7 +80,7 @@ class GossipSwarmTest {
                 await(() -> members(first).stream().anyMatch(row -> oldBoot.equals(row.get("bootId"))
                         && List.of("SUSPECT", "DEAD").contains(row.get("assessment"))));
                 var restarted = new GossipPlugin(config(seed));
-                try (var newB = GossipServerFixture.start("Server-B", restartPort, restarted)) {
+                try (var newB = TestServer.start("Server-B", restartPort, restarted)) {
                     String boot = (String) ((Map<?, ?>) status(restarted).get("self")).get("bootId");
                     assertNotEquals(oldBoot, boot);
                     await(() -> members(first).stream().anyMatch(row -> boot.equals(row.get("bootId")) && "ALIVE".equals(row.get("assessment")))
@@ -96,12 +96,12 @@ class GossipSwarmTest {
         int latePort;
         try (var reservation = new ServerSocket(0)) { latePort = reservation.getLocalPort(); }
         var follower = new GossipPlugin(config("Late@127.0.0.1:" + latePort));
-        try (var first = GossipServerFixture.start("Follower", follower)) {
+        try (var first = TestServer.start("Follower", follower)) {
             await(() -> ((Number) ((Map<?, ?>) status(follower).get("self")).get("heartbeat")).longValue() >= 2);
             assertEquals(true, status(follower).get("isolated"));
             assertTrue(((Number) ((Map<?, ?>) status(follower).get("runtime")).get("retryingPeers")).intValue() > 0);
             var late = new GossipPlugin(config(""));
-            try (var second = GossipServerFixture.start("Late", latePort, late)) {
+            try (var second = TestServer.start("Late", latePort, late)) {
                 await(() -> alive(follower) == 2 && alive(late) == 2);
                 assertEquals(false, status(follower).get("isolated"));
             }
@@ -111,7 +111,7 @@ class GossipSwarmTest {
     @Test void adminShutdownCancelsAStalledScheduledExchangeAndRetainsTheTableForAcceptedHandlers() throws Exception {
         try (var peer = new StalledPeer()) {
             var plugin = new GossipPlugin(config("Stalled@127.0.0.1:" + peer.port()));
-            try (var server = GossipServerFixture.start("Server-A", plugin)) {
+            try (var server = TestServer.start("Server-A", plugin)) {
                 peer.request.get(5, TimeUnit.SECONDS);
                 long began = System.nanoTime();
                 assertEquals("Shutting down server...", request(server.getAdminPort(), "shutdown\n"));
@@ -137,7 +137,7 @@ class GossipSwarmTest {
                     throw new IOException("Later provider failed after gossip scheduled work");
                 }
             };
-            assertThrows(IOException.class, () -> GossipServerFixture.start("Rollback", plugin, failure));
+            assertThrows(IOException.class, () -> TestServer.start("Rollback", plugin, failure));
             assertTrue(peer.closed.get(2, TimeUnit.SECONDS));
             assertEquals("STOPPED", status(plugin).get("workerState"));
             assertEquals(0, ((Map<?, ?>) status(plugin).get("runtime")).get("workers"));
@@ -146,13 +146,13 @@ class GossipSwarmTest {
 
     @Test void incompatibleSwarmsAreCountedAndDoNotAdmitForeignMembers() throws Exception {
         var owner = new GossipPlugin(config(""));
-        try (var first = GossipServerFixture.start("Owner", owner)) {
+        try (var first = TestServer.start("Owner", owner)) {
             var properties = GossipConfigTest.minimal();
             properties.setProperty("swarm.id", "other");
             properties.setProperty("round.millis", "50");
             properties.setProperty("seeds", "Owner@127.0.0.1:" + first.getPort());
             var foreign = new GossipPlugin(GossipConfig.fromProperties(properties, "Foreign"));
-            try (var second = GossipServerFixture.start("Foreign", foreign)) {
+            try (var second = TestServer.start("Foreign", foreign)) {
                 await(() -> ((Number) ((Map<?, ?>) ((Map<?, ?>) status(foreign).get("runtime")).get("failures")).get("SWARM")).longValue() > 0);
                 assertEquals(1, members(owner).size());
                 assertEquals(1, members(foreign).size());
