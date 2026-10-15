@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Implemented plugin architecture and design |
-| Last updated | 2026-10-14 |
+| Last updated | 2026-10-15 |
 | Applies to | Socket Client Server 1.0-SNAPSHOT |
 
 See [README.md](../README.md) for startup and test commands.
@@ -75,11 +75,14 @@ inside the server process.
   plugins require no changes. Hook failures abort startup with listener cleanup.
 - **Optional shutdown:** `stop()` defaults to no-op. Stop entered providers once
   in reverse recorded startup-entry order, including a provider whose startup failed. Quiesce
-  background work before closing listeners; retain handler state while accepted
-  requests drain, then release the loader. Administrative shutdown requests this
+  background work after the main listener closes and before the admin monitor stops;
+  retain handler state while accepted requests drain, then release the loader. Administrative shutdown requests this
   stop without joining its own task; instance close completes joins and cleanup.
   Continue cleanup after hook exceptions and aggregate failures. Hooks must close
   their sockets and join their own workers; the host cannot force a hook deadline.
+  Each host drain call waits up to five seconds, interrupts remaining workers, and
+  waits up to five more seconds. The main listener and owner close both call drain.
+  A handler that ignores interruption can outlive these waits and loader close.
 - **Errors:** Return `status: "ERROR"` with an error code and message, using
   `INVALID_REQUEST`, `UNKNOWN_INSTRUCTION`, `INVALID_PARAMETERS`, or `PLUGIN_ERROR`.
   Preserve the request ID whenever valid, plus server and connection IDs. A plugin
@@ -93,15 +96,23 @@ The production command built-in is `echo` (string `text`, returning
 neither is packaged in the server JAR. Plain `send <text>` invokes
 `echo`; the legacy text wire format remains supported. HTTP and administrative
 commands keep their existing roles. Plugins load once per startup, and their
-class loader closes after accepted work finishes during shutdown.
+class loader closes after the bounded request-drain attempts during shutdown.
 Message IDs provide correlation; duplicate-request suppression is a separate feature.
 
 The built-in startup-only `AddressBroadcastPlugin` sends the server ID, interface
 IPv4 address, and actual TCP ports as JSON to each active subnet's UDP broadcast
 address on port 9002, and logs the endpoint. It runs once per interface and closes
 its UDP sockets. Announcement failures are logged without preventing TCP startup.
+Set `-Ddev.mars.announce=false` to suppress UDP sends; the root test workflow sets
+this property and broadcaster fixtures use explicitly enabled controlled instances.
+
+Standalone projects under `plugins/multiply-plugin` and `plugins/gossip-plugin`
+demonstrate runtime JAR loading. Gossip adds bounded membership exchanges and
+per-instance diagnostics; see [GOSSIP_PLUGIN.md](GOSSIP_PLUGIN.md) for its behavior,
+configuration, and separate test workflow.
 
 Tests cover external-JAR discovery, duplicate instructions, numeric and text
 results, Unicode, invalid parameters, unknown instructions, malformed requests,
 plugin exceptions, reply-ID mismatches, concurrent calls, and multiple server instances.
-Use the existing Maven/JUnit workflow: `mvn test` and `mvn clean verify`.
+Use the existing Maven/JUnit workflow: `mvn test` and `mvn clean verify` for the host.
+Standalone plugin projects are verified separately with the commands in the README.

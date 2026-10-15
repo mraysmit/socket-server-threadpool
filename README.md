@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Maintained project and usage guide |
-| Last updated | 2026-10-13 |
+| Last updated | 2026-10-15 |
 | Applies to | Socket Client Server 1.0-SNAPSHOT |
 
 A Java-based socket server that handles each client connection on its own virtual thread, with graceful shutdown and administrative monitoring.
@@ -128,8 +128,8 @@ src/
 
 - **Java Version**: 27
 - **Build Tool**: Maven
-- **Main Server Port**: 9000
-- **Admin Port**: 9001
+- **Main Server Default Port**: 9000
+- **Admin Default Port**: 9001
 - **Request Executor**: One virtual thread per connection
 - **Listener Executor**: One named virtual thread per main/admin listener task
 - **Command Protocol**: One UTF-8 JSON request line and reply line per connection, version 1
@@ -300,7 +300,7 @@ The application provides an interactive console with the following commands:
 - `send <JSON command>` - Execute an instruction with named parameters and display its result
 - `status` - Check if the server is running
 - `shutdown` - Stop the main server and shutdown monitor
-- `quit` - Close both listeners, wait for accepted work, and exit
+- `quit` - Close the instance, quiesce plugins, drain accepted work with a timeout, and exit
 
 Command keywords are case-insensitive. The configured admin socket (default 9001) accepts
 `status` and `shutdown`; `send` and `quit` belong to the application console.
@@ -576,7 +576,8 @@ is allowed. Omitting the options loads built-in and application-classpath provid
 
 Plugin discovery happens once during server startup. Change the command-line list
 or replace a JAR and restart the server to use the new selection. Runtime loading
-does not provide hot reload. The loader is closed after accepted work finishes.
+does not provide hot reload. The loader closes after the bounded request-drain
+attempts described in [Optional Plugin Shutdown](#optional-plugin-shutdown).
 
 Java callers can supply the same list through
 `new ServerOptions("Server-001", 0, 0, List.of(firstFolder, secondFolder))`;
@@ -599,10 +600,11 @@ its own JAR:
 | `src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Server JAR | `EchoPlugin` and startup-only `AddressBroadcastPlugin` |
 | `src/test/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Test classpath only; excluded from the server JAR | `MathAddPlugin` and `TextConcatPlugin` from `dev.mars.plugin.fixtures` |
 | `plugins/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Example plugin JAR | `example.MultiplyPlugin` (`math.multiply`) |
+| `plugins/gossip-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Gossip plugin JAR | `gossip.GossipPlugin` (`gossip`) |
 
 Inside each JAR, the registration has the same path:
 `META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
-resources in separate JARs. `ServiceLoader` discovers both and combines their
+resources in separate JARs. `ServiceLoader` discovers available registrations and combines their
 provider lists at startup.
 
 During `mvn test`, the test registration also supplies the math and text fixtures.
@@ -677,8 +679,9 @@ class loader; returned values are normalized to JSON before replying. Plugins
 validate their own parameters and throw `InvalidParametersException` for caller
 errors; other exceptions become `PLUGIN_ERROR`. Plugins are trusted code inside
 the server process. There is no sandbox, hot reload, or per-command execution
-deadline. The class loader closes after accepted work completes when the instance
-is closed. See [EXEC_PLUGIN.md](docs/EXEC_PLUGIN.md) for the one-page design.
+deadline. Instance close attempts a bounded drain before closing the class loader;
+a handler that ignores interruption can outlive those waits. See
+[EXEC_PLUGIN.md](docs/EXEC_PLUGIN.md) for the one-page design.
 
 #### Optional Plugin Startup
 
@@ -750,12 +753,19 @@ in reverse recorded startup-entry order, with that provider's context class load
 initialized provider is included in cleanup; providers whose startup was never
 entered are not stopped. Constructors should avoid allocating resources.
 
-`ServerInstance.requestStop()` quiesces plugins before closing the admin and main
-listeners. Administrative `shutdown` uses this path without joining its own
-monitor task. `ServerInstance.close()` also requests a stop, then joins listeners
-and drains accepted requests before closing the plugin class loader. Console
+`ServerInstance.requestStop()` closes the main listener, quiesces plugins, then
+stops the admin monitor. Administrative `shutdown` uses this path without joining
+its own monitor task. `ServerInstance.close()` also requests a stop, then joins
+listeners and completes request draining before closing the plugin class loader. Console
 `quit` and end-of-input reach `close()`. After administrative shutdown, `quit` or
 owner close completes the joins and loader cleanup.
+
+Each drain call waits up to five seconds, interrupts remaining workers, and waits
+up to another five seconds. The main listener drains in its `finally` block;
+owner close also calls drain. A plugin handler that ignores interruption can
+outlive these waits, so loader close is not a guarantee that arbitrary plugin code
+has exited. These timeouts are separate from plugin stop hooks, which have no
+host-enforced deadline.
 
 A stop hook must prevent new background work, close sockets that unblock its
 workers, and join those workers before returning. Keep state needed by already
@@ -779,11 +789,23 @@ mvn test "-Dtest=ConcurrentPluginStartupTest,PluginLifecycleTest,ExternalPluginT
 #### Built-in Address Broadcast
 
 `AddressBroadcastPlugin` is a startup-only built-in, loaded automatically without
-an external JAR or a `send` command. It sends one UTF-8 JSON UDP datagram per
+an external JAR or a `send` command. When enabled, it sends one UTF-8 JSON UDP datagram per
 distinct active IPv4 broadcast-capable interface to that subnet's broadcast
 address on **UDP port 9002**, and prints the same advertised endpoint in the
 terminal. This is a discovery destination port, independent of the server's main
 and admin TCP ports. Multiple servers can all announce to UDP port 9002.
+
+Announcements are enabled by default. Set the JVM property
+`-Ddev.mars.announce=false` to suppress UDP sends and print an announcement-skipped
+entry instead. For example:
+
+```powershell
+mvn compile exec:java "-Ddev.mars.announce=false" "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --port 0 --admin-port 0"
+```
+
+Root Surefire and gossip Surefire/Failsafe set this property to `false` so their
+servers do not broadcast onto the real network. Broadcaster tests explicitly
+enable fixture instances with controlled loopback destinations.
 
 Start an instance normally, or with automatic TCP ports:
 
@@ -830,7 +852,7 @@ failures, missing interfaces, opt-in initialization, and failed-startup cleanup.
 
 #### Automated Tests
 
-Run all JUnit tests, including the socket tests:
+Run the server project's JUnit tests, including the socket tests:
 
 ```powershell
 mvn test
@@ -851,9 +873,11 @@ mvn test "-Dtest=ThreadPooledServerTest"
 mvn test "-Dtest=ServerLifecycleTest"
 ```
 
-#### Plugin Tests
+#### Host Plugin Tests
 
-Run only the plugin tests with command-line output:
+Run only the host's plugin/SPI tests with command-line output. The standalone
+multiply and gossip projects use their separate Maven commands above; root
+`mvn test` does not run those projects.
 
 ```powershell
 mvn test "-Dtest=PluginRegistryTest,PluginExecutionTest,StartupPluginTest,ConcurrentPluginStartupTest,PluginLifecycleTest,AddressBroadcastPluginTest,ExternalPluginTest,MathAddPluginTest,TextConcatPluginTest,EchoPluginTest" "-Dmaven.test.redirectTestOutputToFile=false"
@@ -885,8 +909,8 @@ types, missing runtime dependencies during discovery/startup/execution, recovery
 after replacing a bad JAR, uppercase JAR extensions, ignored files and nested
 folders, concurrent startup attempts, independent plugin state across server
 instances, context-class-loader restoration, and usable parameter-error replies.
-The standalone plugin integration test also checks that the packaged host JAR
-contains neither test fixture classes nor the old math/text built-in classes.
+The standalone multiply integration test checks its own JAR's provider registration
+and verifies that it does not bundle the host's `CommandPlugin` API.
 
 To see the two test fixtures and `echo` with their results from both servers:
 
@@ -1093,16 +1117,29 @@ try (var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0)))
 ```
 
 `getPort()` and `getAdminPort()` return the actual bound ports, including when
-automatic allocation was requested. Closing the instance releases both listeners
-and waits for accepted tasks. The console uses these same resolved settings.
+automatic allocation was requested. Closing the instance releases both listeners,
+quiesces plugins, and attempts bounded request draining. The console uses these
+same resolved settings.
 
 ### Virtual Thread Execution
 
 The request executor uses `Executors.newVirtualThreadPerTaskExecutor()`; there is
 no fixed worker pool size. Main and admin listeners each run on a named virtual
 thread through a thread-per-task executor. Plugin startup also uses virtual
-threads. During shutdown, the listener stops accepting clients and waits for
-accepted request tasks to finish. Workers use a 10-second socket read timeout.
+threads. During shutdown, the listener stops accepting clients and drains accepted
+requests using the timeouts described in [Optional Plugin Shutdown](#optional-plugin-shutdown).
+Workers use a 10-second socket read timeout.
+
+The main listener services at most 1,024 connections concurrently by default;
+excess clients wait in the operating system's connection backlog (requested size
+256). These admission limits are shared by application and plugin traffic and
+are not command-line options. Virtual threads remove the fixed worker-pool size,
+but do not remove socket or memory limits.
+
+Request and HTTP header lines are capped at 65,536 decoded Java characters (UTF-16
+code units), rather than UTF-8 bytes. The host does not yet cap aggregate HTTP
+header bytes, and the general-purpose `TextMessageClient` reply reader is unbounded.
+The gossip plugin applies its own raw response byte limit before JSON parsing.
 
 [Virtual threads are daemon threads](https://docs.oracle.com/en/java/javase/27/docs/api/java.base/java/lang/Thread.html),
 so an embedding application's main thread must remain alive while its servers
@@ -1148,7 +1185,7 @@ The server provides comprehensive logging:
 - Client connection notifications
 - Request processing timestamps
 - Thread identification for debugging
-- Error handling with stack traces
+- Request abort and cleanup failure details
 - Server lifecycle events
 
 Connection and request logs include a readable timestamp, connection ID, client
@@ -1164,6 +1201,11 @@ The same connection ID appears in both entries and is unique within the running
 JVM. The source port distinguishes clients sharing an IP address. `messageId=-`
 means a text-message ID has not been read, or the connection carries HTTP traffic.
 Timestamps use the JVM's local time zone.
+
+The external gossip plugin has its own UTC diagnostic format on standard error;
+see [Operational logging](docs/GOSSIP_PLUGIN.md#operational-logging). Console writes
+are synchronous, so a blocked output destination can delay a request or shutdown
+even when log volume is rate limited.
 
 ## 🔄 Lifecycle Management
 
@@ -1186,15 +1228,16 @@ Timestamps use the JVM's local time zone.
 
 ### Server Shutdown
 
-1. Acknowledge `shutdown` and close the administrative listener
-2. Mark the main server stopped and close its listening socket
-3. Close the request executor, waiting for accepted tasks to finish
-4. Enter `quit` to leave the console command loop and allow the application to exit
+1. Acknowledge an administrative `shutdown`; console `quit` or end-of-input also enters the instance stop path
+2. Stop the main listener so no new requests reach quiescing plugins
+3. Invoke entered plugins' optional stop hooks once, then stop the admin monitor
+4. On owner close, join listeners and complete the bounded request-drain attempts
+5. Close the registry and external plugin class loader
 
 Using `quit` directly, or closing console input, also closes the whole instance
-and waits for its listener and worker executors to terminate.
-Closing the instance also releases the external plugin class loader after accepted
-work finishes. An admin `shutdown` stops listeners; enter `quit` to close the console
+and joins its listener tasks while attempting bounded request draining. A handler
+that ignores interruption can outlive the drain attempts. An admin `shutdown`
+requests listener/plugin stop; enter `quit` to close the console
 and finish instance cleanup.
 
 ## 🤝 Contributing

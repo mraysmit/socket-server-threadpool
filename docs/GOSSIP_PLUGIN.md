@@ -3,7 +3,7 @@
 | Document metadata | Details |
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
-| Status | Seed runtime, departure, and bounded capacity/fairness/partition/load validation complete; optional UDP discovery pending |
+| Status | Seed runtime, departure, bounded capacity/fairness/partition/load validation, and operational logging complete; optional UDP discovery pending |
 | Last updated | 2026-10-15 |
 
 ## Purpose and scope
@@ -288,7 +288,9 @@ During shutdown, `status` retains `workerState="STOPPING"` until owned resource 
 
 Identity warnings share one 30-second monotonic-time window per plugin instance, across inbound/outbound peers; scheduler warnings have their own window. The first warning is immediate. Repeated warnings are suppressed, and the next permitted entry includes `suppressed=<count>` for the previous window. The limiter has constant-size state, with no per-peer log cache or queue. Cleanup and final departure entries bypass these warning windows. Neither successful rounds nor ordinary DNS/network failures produce per-round logs; their counts remain in `status`.
 
-Message/error fields are bounded and escape control characters and delimiters to preserve one-line formatting. Raw requests, replies, and member metadata are not included. Inbound SPI calls do not expose the host message ID, so inbound entries use `messageId=-`; the host request log supplies that correlation. Diagnostic sink failures do not replace protocol or cleanup exceptions. Logging creates no threads and does not write while holding membership locks or the runtime state monitor.
+Message/error fields are bounded and escape control characters and delimiters to preserve one-line formatting. Raw requests, replies, and member metadata are not included. Inbound SPI calls do not expose the host message ID, so inbound entries use `messageId=-`; the host request log supplies that correlation. Runtime exceptions thrown by the diagnostic sink are ignored rather than replacing protocol or cleanup exceptions. Logging creates no threads and does not write while holding membership locks or the runtime state monitor.
+
+Output is synchronous on the calling thread. Rate limiting bounds repeated warning volume, not output latency: a blocked standard-error destination can delay an exchange, the scheduler, or cleanup. Cleanup entries are written after the join/deadline bookkeeping, while close remains serialized, so the three-second join deadline does not bound console writes or total `stop()` latency. Existing sink tests cover exceptions from the sink, not a sink that blocks indefinitely.
 
 Example entries (abbreviated context):
 
@@ -345,7 +347,7 @@ The implemented host contract is:
 
 The admin command runs inside the monitor task. Its stop-request path must not join that same task or call `listeners.close()` from inside it. Preserve the current console behavior: `shutdown` requests a stop; `quit` or end-of-input reaches instance close and completes joins and loader cleanup.
 
-The gossip stop hook prevents new rounds, interrupts its scheduler and exchange workers, closes active transport channels/selectors, kills DNS helpers, and joins every owned runtime thread. Joining uses a shared three-second deadline measured from the beginning of cleanup; helper termination additionally has a one-second wait per process after all helpers are forcibly destroyed. This is a bounded cleanup attempt, not a hard real-time guarantee for local process launch or operating-system calls. Failure propagates through the host's aggregated cleanup errors and reports `CLEANUP_FAILED`. Repeated close is serialized and preserves any cleanup failure. The membership table remains available to already accepted handlers. Optional UDP discovery must later join this same resource lifecycle. Keep handlers short and responsive to cancellation.
+The gossip stop hook prevents new rounds, interrupts its scheduler and exchange workers, closes active transport channels/selectors, kills DNS helpers, and joins every owned runtime thread. Joining uses a shared three-second deadline measured from the beginning of cleanup; helper termination additionally has a one-second wait per process after all helpers are forcibly destroyed. This is a bounded cleanup attempt, not a hard real-time guarantee for local process launch, operating-system calls, or synchronous diagnostic output. Failure propagates through the host's aggregated cleanup errors and reports `CLEANUP_FAILED`. Repeated close is serialized and preserves any cleanup failure. The membership table remains available to already accepted handlers. Optional UDP discovery must later join this same resource lifecycle. Keep handlers short and responsive to cancellation.
 
 The explicit `leave` operation publishes a terminal local record and schedules the bounded asynchronous attempt described above. `stop()` cancels that attempt, closes resources, and joins owned threads. Other nodes eventually time out a process that exits without delivering `LEFT`.
 
@@ -360,6 +362,7 @@ The implementation uses package `gossip`, with production sources under `plugins
 | `GossipPlugin` | Implements the SPI, owns a runtime instance, and dispatches operations. |
 | `GossipConfig` | Parses and validates configuration for the resolved server ID. |
 | `GossipRuntime` | Coordinates rounds, lifecycle, in-flight limits, and diagnostics. |
+| `GossipMetrics`, `GossipLog` | Share per-instance counters and rate-limited console diagnostics across runtime, commands, and transport. |
 | `MembershipTable` | Validates merges, versions, observations, expiry, and snapshots. |
 | `MemberRecord` and `MemberKey` | Immutable owner data and compound identity. |
 | `PeerSelector` | Random fanout, fair recovery opportunities, and retry backoff. |
@@ -443,7 +446,7 @@ Use JUnit and the existing real-socket/external-JAR approach. Mockito and replac
 
 Use fake elapsed time for precise expiry tests and eventual assertions with bounded deadlines for live convergence. Record observed convergence times rather than promising logarithmic timing from the general gossip model. Verify startup rollback after a later provider fails, so cleanup covers gossip workers that were already scheduled.
 
-The plugin currently has 204 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml clean verify "-Dmaven.test.redirectTestOutputToFile=true"` after operational logging and the shutdown-status fix. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
+The plugin currently has 204 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest review verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml verify "-Dmaven.test.redirectTestOutputToFile=true"` after operational logging and the shutdown-status fix. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
 
 In addition to configuration and deterministic-clock model coverage, command/transport tests verify real two-node exchanges, Unicode/null metadata, exact envelope byte boundaries, oversized UTF-8 replies, strict paging/cursors, independent rotating batches, identity/version/swarm failures, remote capacity errors, self-contact aliases, concurrency caps, read-idle and trickle deadlines, interruption, and close cancellation. Runtime tests cover jitter/backoff, fair priority/scan batches, heartbeat/maintenance while saturated, late seeds, three-node convergence, restart recovery, unchanged echo/HTTP/admin behavior, incompatible swarms, active-exchange startup rollback, and stalled TCP/DNS cleanup. Real helper processes exercise lookup caching, timeout, invalid output, and cancellation.
 
