@@ -75,6 +75,32 @@ class PeerSelectorTest {
         assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
     }
 
+    @Test void fullMembershipCannotHideAlternateSeedsAndCapacityBackoffGrowsUntilAdmissionSucceeds() {
+        var properties = GossipConfigTest.minimal();
+        properties.setProperty("round.millis", "100");
+        properties.setProperty("max.members", "2");
+        properties.setProperty("fanout", "1");
+        properties.setProperty("seeds", "Full@full.test:9010,Other@127.0.0.1:9020");
+        var config = GossipConfig.fromProperties(properties, "Self");
+        var table = new MembershipTable(config, self, clock::get);
+        var full = new GossipConfig.Seed("Full", "127.0.0.1", 9010);
+        table.mergeDirect(record("Full", 2, 9010), List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(2));
+        var seed = config.seeds().getFirst();
+        selector.capacity(seed, full);
+        assertEquals(List.of(config.seeds().getLast()), selector.select(table.snapshot(), Set.of(), 1));
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
+        assertEquals(List.of(full), selector.select(table.snapshot(), Set.of(config.seeds().getLast()), 1));
+        selector.capacity(seed, full);
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
+        assertTrue(selector.select(table.snapshot(), Set.of(config.seeds().getLast()), 1).isEmpty(), "Second capacity hint must preserve exponential backoff");
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(125));
+        assertEquals(List.of(full), selector.select(table.snapshot(), Set.of(config.seeds().getLast()), 1));
+        selector.success(seed, full);
+        assertEquals(0, selector.retryCount());
+        assertEquals(List.of(full), selector.select(table.snapshot(), Set.of(config.seeds().getLast()), 1));
+    }
+
     @Test void deadPeersGetReservedRecoveryProbesDespiteOrdinaryTraffic() {
         var config = config(1, "");
         var table = new MembershipTable(config, self, clock::get);

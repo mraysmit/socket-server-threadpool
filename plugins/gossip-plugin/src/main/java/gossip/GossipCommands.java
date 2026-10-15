@@ -82,12 +82,13 @@ final class GossipCommands {
     private Object exchange(Map<String, Object> parameters) {
         var incoming = wire.decode(parameters, true);
         var self = table.snapshot().self();
+        MembershipTable.ExchangeMerge merge;
         try {
             if (incoming.sender().key().equals(self.key())) {
                 throw new MembershipException(MembershipException.Reason.CONFLICT, "Exchange sender must not be the local process");
             }
             wire.requireForwardable(self, incoming.records());
-            table.merge(incoming.records());
+            merge = table.mergeExchange(incoming.sender(), incoming.members());
         } catch (MembershipException failure) {
             if (failure.reason() == MembershipException.Reason.CONFLICT) {
                 var peer = incoming.sender();
@@ -96,8 +97,8 @@ final class GossipCommands {
             throw failure;
         }
         var snapshot = table.snapshot();
-        var batch = responses.select(snapshot, config.maxBatchMembers(), wire.replyMemberBudget(snapshot.self()));
-        var result = wire.result(snapshot.self(), batch);
+        var batch = responses.select(snapshot, config.maxBatchMembers(), wire.replyMemberBudget(snapshot.self(), incoming.gossipVersion()));
+        var result = wire.result(snapshot.self(), batch, incoming.gossipVersion(), merge.senderAdmission());
         wire.requireReplyFits(snapshot.self().key().serverId(), result);
         metrics.success(false);
         return result;
@@ -158,7 +159,7 @@ final class GossipCommands {
 
     private static Map<String, Object> capacity(MembershipTable.Snapshot snapshot) {
         return Map.of("activeMembers", snapshot.activeMembers(), "retainedIdentities", snapshot.retainedIdentities(),
-                "tombstones", snapshot.tombstones());
+                "tombstones", snapshot.tombstones(), "admissionsSkipped", snapshot.admissionsSkipped());
     }
 
     private static String encodeCursor(MemberKey self, int next) {

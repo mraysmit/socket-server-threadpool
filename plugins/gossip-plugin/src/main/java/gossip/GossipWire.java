@@ -37,7 +37,9 @@ public final class GossipWire {
     private static final UUID BUDGET_ID = new UUID(0, 0);
     private final GossipConfig config;
 
-    public record Exchange(MemberRecord sender, List<MemberRecord> members) {
+    public record Exchange(MemberRecord sender, List<MemberRecord> members, int gossipVersion,
+                           MembershipTable.Admission senderAdmission) {
+        public Exchange(MemberRecord sender, List<MemberRecord> members) { this(sender, members, 1, null); }
         public Exchange { members = List.copyOf(members); }
         public List<MemberRecord> records() {
             var records = new ArrayList<MemberRecord>();
@@ -52,9 +54,11 @@ public final class GossipWire {
     public Exchange decode(Object value, boolean request) {
         Set<String> fields = request ? Set.of("operation", "gossipVersion", "swarmId", "sender", "members")
                 : Set.of("gossipVersion", "swarmId", "sender", "members");
-        if (!(value instanceof Map<?, ?> map) || !map.keySet().equals(fields)) { throw invalid("Invalid exchange fields"); }
+        if (!(value instanceof Map<?, ?> map)) { throw invalid("Invalid exchange fields"); }
+        int version = exactInteger(map.get("gossipVersion"), "gossipVersion", 1, 2);
+        if (!request && version == 2) { fields = Set.of("gossipVersion", "swarmId", "sender", "members", "senderAdmission"); }
+        if (!map.keySet().equals(fields)) { throw invalid("Invalid exchange fields"); }
         if (request && !"exchange".equals(map.get("operation"))) { throw invalid("operation must be exchange"); }
-        if (exactInteger(map.get("gossipVersion"), "gossipVersion", 1, 1) != 1) { throw invalid("Unsupported gossipVersion"); }
         if (!config.swarmId().equals(map.get("swarmId"))) { throw invalid("swarmId does not match this swarm"); }
         if (!(map.get("members") instanceof List<?> members) || members.size() >= config.maxBatchMembers()) {
             throw invalid("Sender and members exceed max.batch.members");
@@ -68,15 +72,26 @@ public final class GossipWire {
             if (!keys.add(record.key())) { throw invalid("Duplicate member key in exchange"); }
             decoded.add(record);
         }
-        var exchange = new Exchange(sender, decoded);
-        if (request && requestBytes(parameters(sender, decoded)).length > config.maxExchangeBytes()) {
+        MembershipTable.Admission admission = null;
+        if (!request && version == 2) {
+            if (!(map.get("senderAdmission") instanceof String text)) { throw invalid("Invalid senderAdmission"); }
+            try { admission = MembershipTable.Admission.valueOf(text); }
+            catch (IllegalArgumentException e) { throw invalid("Invalid senderAdmission"); }
+        }
+        var exchange = new Exchange(sender, decoded, version, admission);
+        if (request && requestBytes(parameters(sender, decoded, version)).length > config.maxExchangeBytes()) {
             throw invalid("Complete canonical request exceeds max.exchange.bytes");
         }
         return exchange;
     }
 
     public Map<String, Object> parameters(MemberRecord self, List<MemberRecord> members) {
+        return parameters(self, members, 1);
+    }
+
+    public Map<String, Object> parameters(MemberRecord self, List<MemberRecord> members, int version) {
         var result = new LinkedHashMap<>(result(self, members));
+        result.put("gossipVersion", exactInteger(version, "gossipVersion", 1, 2));
         result.put("operation", "exchange");
         return Map.copyOf(result);
     }
@@ -84,6 +99,15 @@ public final class GossipWire {
     public Map<String, Object> result(MemberRecord self, List<MemberRecord> members) {
         return Map.of("gossipVersion", 1, "swarmId", config.swarmId(), "sender", self.toWire(),
                 "members", members.stream().map(MemberRecord::toWire).toList());
+    }
+
+    public Map<String, Object> result(MemberRecord self, List<MemberRecord> members, int version, MembershipTable.Admission admission) {
+        exactInteger(version, "gossipVersion", 1, 2);
+        if (version == 1) { return result(self, members); }
+        var result = new LinkedHashMap<>(result(self, members));
+        result.put("gossipVersion", version);
+        result.put("senderAdmission", java.util.Objects.requireNonNull(admission).name());
+        return Map.copyOf(result);
     }
 
     public byte[] requestBytes(Map<String, Object> parameters) {
@@ -97,8 +121,12 @@ public final class GossipWire {
 
     /** Reserve the largest legal host connection ID because the handler cannot see the actual ID. */
     int replyMemberBudget(MemberRecord self) {
+        return replyMemberBudget(self, 1);
+    }
+
+    int replyMemberBudget(MemberRecord self, int version) {
         return config.maxExchangeBytes() - bytes(new CommandReply(1, BUDGET_ID, self.key().serverId(),
-                Long.MAX_VALUE, "OK", result(self, List.of()), null)).length;
+                Long.MAX_VALUE, "OK", result(self, List.of(), version, MembershipTable.Admission.CAPACITY), null)).length;
     }
 
     /** UUIDs have fixed serialized width; Long.MAX_VALUE reserves the largest legal connection ID. */
@@ -114,14 +142,14 @@ public final class GossipWire {
     /** Check new records before merging, so a single unforwardable record cannot break later replies. */
     public void requireForwardable(MemberRecord self, List<MemberRecord> records) {
         var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
-        requireReplyFits(self.key().serverId(), result(budgetSelf, List.of()));
+        requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY));
         for (MemberRecord record : records) {
             if (!record.key().equals(self.key())) {
                 if (requestBytes(parameters(record, List.of())).length > config.maxExchangeBytes()) {
                     throw invalid("Single sender exceeds the complete request budget");
                 }
                 if (config.maxBatchMembers() > 1) {
-                    requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(record)));
+                    requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(record), 2, MembershipTable.Admission.CAPACITY));
                 }
             }
             var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record, MembershipTable.Assessment.CANDIDATE,
@@ -130,7 +158,7 @@ public final class GossipWire {
                     (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
             requireReplyFits(self.key().serverId(), page(budgetSelf, List.of(memberView(worst)), cursor,
                     Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
-                            "tombstones", config.maxRecords())));
+                            "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE)));
         }
     }
 

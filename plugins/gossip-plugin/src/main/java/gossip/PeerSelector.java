@@ -60,10 +60,9 @@ final class PeerSelector {
                 candidates.merge(canonical(peer), candidate, (a, b) -> a.recovery() ? b : a);
             }
         }
-        int cap = Math.max(0, config.maxMembers() - 1);
         for (var seed : config.seeds()) {
             var key = canonical(seed);
-            if (!isSelf(self, seed) && (candidates.containsKey(key) || candidates.size() < cap)) {
+            if (!isSelf(self, seed)) {
                 // A verified healthy seed remains ordinary; recovering seeds retain their DNS fallback.
                 candidates.compute(key, (ignored, known) -> known != null && !known.recovery()
                         ? known : new Candidate(seed, true));
@@ -125,6 +124,16 @@ final class PeerSelector {
         retries.remove(resolved);
     }
 
+    /** A reachable peer may be full. Preserve exponential backoff and verified DNS identity. */
+    synchronized void capacity(GossipConfig.Seed peer, GossipConfig.Seed endpoint) {
+        var previous = canonical(peer);
+        var resolved = normalized(endpoint);
+        Retry retry = retries.remove(previous);
+        rememberAlias(peer, resolved);
+        if (retry != null) { retries.put(resolved, retry); }
+        failure(resolved);
+    }
+
     private void rememberAlias(GossipConfig.Seed peer, GossipConfig.Seed resolved) {
         if (config.seeds().contains(peer) && !normalized(peer).equals(resolved)) {
             aliases.put(normalized(peer), new Alias(resolved, clock.getAsLong()));
@@ -139,7 +148,7 @@ final class PeerSelector {
         for (int i = 1; i < failures && base < MAX_BACKOFF; i++) { base = Math.min(MAX_BACKOFF, base * 2); }
         long low = base - base / 4;
         long delay = low + random.nextLong(Math.max(1, Math.min(MAX_BACKOFF - low, base / 2) + 1));
-        if (retries.containsKey(peer) || retries.size() < config.maxMembers()) {
+        if (retries.containsKey(peer) || retries.size() < (long) config.maxMembers() + config.seeds().size()) {
             retries.put(peer, new Retry(failures, clock.getAsLong(), delay));
         }
     }

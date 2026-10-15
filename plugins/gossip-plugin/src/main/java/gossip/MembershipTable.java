@@ -33,12 +33,17 @@ import static gossip.MembershipException.Reason.*;
 /** Per-instance owner state and local observations. No method performs network I/O. */
 public final class MembershipTable {
     public enum Assessment { CANDIDATE, ALIVE, SUSPECT, DEAD, LEFT }
+    public enum Admission { ADMITTED, CAPACITY, IGNORED }
 
     public record MemberView(MemberRecord record, Assessment assessment, long advanceAgeNanos,
                              Long directSuccessAgeNanos, boolean endpointVerified, boolean identityConflict) { }
 
     public record Snapshot(MemberRecord self, List<MemberView> members, Set<String> identityConflicts,
-                           int activeMembers, int retainedIdentities, int tombstones) {
+                           int activeMembers, int retainedIdentities, int tombstones, long admissionsSkipped) {
+        public Snapshot(MemberRecord self, List<MemberView> members, Set<String> identityConflicts,
+                        int activeMembers, int retainedIdentities, int tombstones) {
+            this(self, members, identityConflicts, activeMembers, retainedIdentities, tombstones, 0);
+        }
         public Snapshot {
             members = List.copyOf(members);
             identityConflicts = Set.copyOf(identityConflicts);
@@ -46,6 +51,7 @@ public final class MembershipTable {
     }
 
     public record MergeResult(int admitted, int advanced, int ignored) { }
+    public record ExchangeMerge(MergeResult merge, Admission senderAdmission) { }
 
     private final GossipConfig config;
     private final MemberKey localKey;
@@ -55,6 +61,7 @@ public final class MembershipTable {
     private final long retentionNanos;
     private Map<MemberKey, Entry> entries = new LinkedHashMap<>();
     private Map<MemberKey, Suppression> suppressions = new LinkedHashMap<>();
+    private long admissionsSkipped;
 
     public MembershipTable(GossipConfig config, MemberRecord self) { this(config, self, System::nanoTime); }
 
@@ -81,13 +88,22 @@ public final class MembershipTable {
     }
 
     /** Forwarded owner records supply activity evidence, but do not verify their advertised endpoints. */
-    public MergeResult merge(List<MemberRecord> records) { return apply(validateBatch(records), null); }
+    public MergeResult merge(List<MemberRecord> records) { return apply(validateBatch(records), null, null).merge(); }
+
+    /** Admission of the sender is captured atomically with the committed merge, not a later snapshot. */
+    public ExchangeMerge mergeExchange(MemberRecord sender, List<MemberRecord> forwarded) {
+        return apply(validateExchange(sender, forwarded), null, sender.key());
+    }
 
     /**
      * The caller must first validate correlation, swarm, and responder identity against the dialed peer.
      * Only this responder gains direct-success evidence; members carried in its batch do not.
      */
     public MergeResult mergeDirect(MemberRecord responder, List<MemberRecord> forwarded) {
+        return apply(validateExchange(responder, forwarded), responder, null).merge();
+    }
+
+    private List<MemberRecord> validateExchange(MemberRecord responder, List<MemberRecord> forwarded) {
         if (responder == null) { throw new MembershipException(INVALID_RECORD, "Direct responder is required"); }
         checkBatchSize(forwarded);
         if (forwarded.size() >= config.maxBatchMembers()) {
@@ -96,7 +112,7 @@ public final class MembershipTable {
         var records = new ArrayList<MemberRecord>();
         records.add(responder);
         records.addAll(forwarded);
-        return apply(validateBatch(records), responder);
+        return validateBatch(records);
     }
 
     private List<MemberRecord> validateBatch(List<MemberRecord> records) {
@@ -124,7 +140,7 @@ public final class MembershipTable {
         }
     }
 
-    private synchronized MergeResult apply(List<MemberRecord> records, MemberRecord direct) {
+    private synchronized ExchangeMerge apply(List<MemberRecord> records, MemberRecord direct, MemberKey sender) {
         if (direct != null && direct.key().equals(localKey)) {
             throw new MembershipException(CONFLICT, "A direct peer must not be the local process");
         }
@@ -136,6 +152,8 @@ public final class MembershipTable {
         int admitted = 0;
         int advanced = 0;
         int ignored = 0;
+        int skipped = 0;
+        boolean senderSkipped = false;
         for (MemberRecord incoming : records) {
             MemberKey key = incoming.key();
             Entry old = proposed.get(key);
@@ -197,6 +215,8 @@ public final class MembershipTable {
             boolean newIdentity = !retained.containsKey(admission.getKey());
             if ((alive && active >= config.maxMembers()) || (newIdentity && identities >= config.maxRecords())) {
                 ignored++;
+                skipped++;
+                senderSkipped |= admission.getKey().equals(sender);
                 continue;
             }
             proposed.put(admission.getKey(), admission.getValue());
@@ -207,7 +227,10 @@ public final class MembershipTable {
         }
         entries = proposed;
         suppressions = retained;
-        return new MergeResult(admitted, advanced, ignored);
+        admissionsSkipped += Math.min(skipped, Long.MAX_VALUE - admissionsSkipped);
+        var admission = proposed.containsKey(sender) ? Admission.ADMITTED
+                : senderSkipped ? Admission.CAPACITY : Admission.IGNORED;
+        return new ExchangeMerge(new MergeResult(admitted, advanced, ignored), admission);
     }
 
     /** Periodic expiry is explicit so rejected merges cannot mutate the table by pruning it. */
@@ -288,7 +311,7 @@ public final class MembershipTable {
                     entry.endpointVerified(), conflicts.contains(entry.record().key().serverId())));
         }
         return new Snapshot(entries.get(localKey).record(), members, conflicts, active,
-                entries.size() + suppressions.size(), suppressions.size());
+                entries.size() + suppressions.size(), suppressions.size(), admissionsSkipped);
     }
 
     private Assessment assessment(Entry entry, long now) {

@@ -260,9 +260,12 @@ final class GossipRuntime implements AutoCloseable {
                 }
                 acquired = true;
             }
-            transport.exchange(endpoint);
+            var exchange = transport.exchange(endpoint);
             outcome = "SUCCESS";
-            selector.success(peer, endpoint);
+            if (!departing && exchange.senderAdmission() == MembershipTable.Admission.CAPACITY) {
+                selector.capacity(peer, endpoint);
+                metrics.failure(GossipMetrics.Failure.CAPACITY);
+            } else { selector.success(peer, endpoint); }
         } catch (IOException | RuntimeException e) {
             synchronized (this) {
                 if (!stopped && (departing || !leaving)) {

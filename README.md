@@ -517,6 +517,32 @@ Healthy seeds participate in ordinary fanout, and verified hostname/IP aliases
 share selection and retry state. A delayed DNS lookup cannot dial a destination
 twice within the same round.
 
+Status now exposes `capacity.admissionsSkipped`: the cumulative number of records
+skipped because active-member or retained-identity capacity was full. It counts
+committed merges in either direction, including repeated admission attempts;
+stale/duplicate records and rejected invalid batches do not increase it.
+
+Gossip version 2 exchange replies include `senderAdmission`: `ADMITTED` means the
+sender's identity is retained as a full record, `CAPACITY` means its admission was
+skipped for lack of space, and `IGNORED` means retention rules suppressed it.
+The scheduled runtime backs off a capacity-limited peer and keeps other configured
+seeds eligible even when its own membership table is full. `isolated=false`
+indicates a successful exchange; use the admission hint to determine remote admission.
+
+New transports try gossip version 2, then retry version 1 once only after a
+correlated unsupported-version error. Both attempts share one outbound permit
+and one overall socket deadline. Version 1 requests still receive the original
+reply shape, with admission unknown. The outer host command protocol remains version 1.
+
+Run the admission, compatibility, byte-budget, and seed-selection tests with output:
+
+```powershell
+mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=GossipWireTest,MembershipTableTest,GossipCommandsTest,GossipTransportTest,PeerSelectorTest,GossipRuntimeTest,GossipBatchSelectorTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+Verified cases print `Admission hint test PASSED`, `Admission compatibility test PASSED`,
+and `Admission seed test PASSED` with their checked outcomes.
+
 Run the capacity and seed-selection regression tests with terminal output:
 
 ```powershell

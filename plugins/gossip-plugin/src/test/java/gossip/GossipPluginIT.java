@@ -146,7 +146,7 @@ class GossipPluginIT {
 
     @Test void packagedProvidersExchangeInTheSameSwarmAndServeBoundedMembershipPages() throws Exception {
         Path configFile = temporary.resolve("same swarm.properties");
-        Files.writeString(configFile, "swarm.id=demo-swarm\nadvertise.host=127.0.0.1\nmax.batch.members=2\n");
+        Files.writeString(configFile, "swarm.id=demo-swarm\nadvertise.host=127.0.0.1\nmax.batch.members=2\nmax.members=2\n");
         var config = GossipConfig.load(configFile, "Server-A");
         var wire = new GossipWire(config);
         Path directory = copyPlugin();
@@ -161,6 +161,15 @@ class GossipPluginIT {
             assertTrue(GossipWire.bytes(reply).length <= config.maxExchangeBytes());
             var exchange = wire.decode(reply.result(), false);
             assertEquals("Server-B", exchange.sender().key().serverId());
+            assertEquals(1, exchange.gossipVersion());
+            assertNull(exchange.senderAdmission());
+            var modern = second.execute("gossip", wire.parameters(firstSelf, List.of(), 2));
+            assertEquals(MembershipTable.Admission.ADMITTED, wire.decode(modern.result(), false).senderAdmission());
+            assertTrue(GossipWire.bytes(modern).length <= config.maxExchangeBytes());
+            var full = second.execute("gossip", wire.parameters(GossipCommandsTest.member("Third", 3), List.of(), 2));
+            assertEquals(MembershipTable.Admission.CAPACITY, wire.decode(full.result(), false).senderAdmission());
+            assertTrue(GossipWire.bytes(full).length <= config.maxExchangeBytes());
+            assertEquals(BigInteger.ONE, ((Map<?, ?>) status(second).get("capacity")).get("admissionsSkipped"));
             first.execute("gossip", wire.parameters(exchange.sender(), exchange.members()));
             var page = assertInstanceOf(Map.class, first.execute("gossip", Map.of("operation", "members", "limit", 1)).result());
             assertEquals(1, ((List<?>) page.get("members")).size());

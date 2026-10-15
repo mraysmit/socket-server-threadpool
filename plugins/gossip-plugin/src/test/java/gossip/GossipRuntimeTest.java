@@ -136,6 +136,74 @@ class GossipRuntimeTest {
         }
     }
 
+    @Test void capacityHintBacksOffTheFullSeedAndTheNextRoundTriesAnotherSeed() throws Exception {
+        var properties = GossipConfigTest.minimal();
+        properties.setProperty("max.members", "2");
+        properties.setProperty("fanout", "1");
+        properties.setProperty("max.inflight", "1");
+        properties.setProperty("seeds", "A@127.0.0.1:9010,B@127.0.0.1:9020");
+        var config = GossipConfig.fromProperties(properties, "Self");
+        var clock = new AtomicLong();
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000), clock::get);
+        var metrics = new GossipMetrics();
+        var calls = new CopyOnWriteArrayList<String>();
+        var threads = new CopyOnWriteArrayList<Thread>();
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
+                calls.add(peer.serverId()); threads.add(Thread.currentThread());
+                var record = PeerSelectorTest.record(peer.serverId(), 2, peer.port());
+                table.mergeDirect(record, List.of());
+                metrics.success(true);
+                return new GossipWire.Exchange(record, List.of(), 2, peer.serverId().equals("A")
+                        ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED);
+            }
+            @Override public void close() { }
+        };
+        try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get, new Random(1), new GossipDnsResolver(2, 1))) {
+            runtime.round();
+            GossipDnsResolverTest.await(() -> metrics.workers == 0 && threads.stream().noneMatch(Thread::isAlive));
+            assertEquals(List.of("A"), calls);
+            assertEquals(1, metrics.retryingPeers);
+            assertEquals(1L, ((Map<?, ?>) metrics.runtime().get("failures")).get("CAPACITY"));
+            assertEquals(0L, ((Map<?, ?>) metrics.runtime().get("failures")).get("NETWORK"));
+            assertFalse(metrics.isolated(), "Reachability remains separate from remote admission");
+            runtime.round();
+            GossipDnsResolverTest.await(() -> metrics.workers == 0 && threads.stream().noneMatch(Thread::isAlive));
+            assertEquals(List.of("A", "B"), calls);
+            assertEquals(1, metrics.retryingPeers);
+            System.out.println("Admission seed test PASSED | fullSeed=A | nextSeed=B | capacityFailures=1 | networkFailures=0");
+        }
+    }
+
+    @Test void legacyRemoteCapacityErrorsIncrementOnlyTheCapacityCategoryAndBackOffThePeer() throws Exception {
+        var config = config("A@127.0.0.1:9010");
+        var clock = new AtomicLong();
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000), clock::get);
+        var metrics = new GossipMetrics();
+        var calls = new CopyOnWriteArrayList<Thread>();
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+                calls.add(Thread.currentThread());
+                throw new dev.mars.client.CommandExecutionException(dev.mars.protocol.CommandReply.failure(UUID.randomUUID(), "A", 1,
+                        dev.mars.protocol.CommandError.Code.INVALID_PARAMETERS, "CAPACITY: membership is full"));
+            }
+            @Override public void close() { }
+        };
+        try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get, new Random(2), new GossipDnsResolver(2, 1))) {
+            runtime.round();
+            GossipDnsResolverTest.await(() -> metrics.workers == 0 && calls.stream().noneMatch(Thread::isAlive));
+            assertEquals(1, calls.size());
+            var failures = (Map<?, ?>) metrics.runtime().get("failures");
+            assertEquals(1L, failures.get("CAPACITY"));
+            assertEquals(0L, failures.get("NETWORK"));
+            assertEquals(0L, failures.get("PROTOCOL"));
+            assertEquals(1, metrics.retryingPeers);
+            assertTrue(metrics.isolated());
+            runtime.round();
+            assertEquals(1, calls.size());
+        }
+    }
+
     @Test void coldHostnameAliasCannotDialTheSameEndpointTwiceEvenAfterTheFirstCallFinishes() throws Exception {
         var config = config("Peer@wait.test:9010");
         var clock = new AtomicLong();

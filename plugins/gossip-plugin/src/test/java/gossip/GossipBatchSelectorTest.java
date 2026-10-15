@@ -18,7 +18,7 @@ package gossip;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -134,8 +134,8 @@ class GossipBatchSelectorTest {
         assertEquals(List.of(larger), selector.select(snapshot(larger), 2, larger.serializedBytes()));
     }
 
-    @ParameterizedTest @ValueSource(booleans = {false, true})
-    void incrementalBudgetsMatchActualUtf8EnvelopesAtTheExactBoundary(boolean reply) {
+    @ParameterizedTest @CsvSource({"false, 1", "false, 2", "true, 1", "true, 2"})
+    void incrementalBudgetsMatchActualUtf8EnvelopesAtTheExactBoundary(boolean reply, int version) {
         var properties = GossipConfigTest.minimal();
         var metadata = new LinkedHashMap<String, Object>();
         metadata.put("text", "雪 🌍 \"quotes\" \\ \n\t");
@@ -146,17 +146,19 @@ class GossipBatchSelectorTest {
         var members = List.of(b, a); // LEFT records take the first priority slot.
         var baseWire = new GossipWire(GossipConfig.fromProperties(properties, "Self"));
         int actual = reply ? GossipWire.bytes(new CommandReply(1, new UUID(0, 0), "Self", Long.MAX_VALUE, "OK",
-                baseWire.result(SELF, members), null)).length : baseWire.requestBytes(baseWire.parameters(SELF, members)).length;
+                baseWire.result(SELF, members, version, MembershipTable.Admission.CAPACITY), null)).length
+                : baseWire.requestBytes(baseWire.parameters(SELF, members, version)).length;
         assertTrue(actual >= 1024);
         for (int difference : List.of(-1, 0, 1)) {
             properties.setProperty("max.exchange.bytes", Integer.toString(actual + difference));
             var wire = new GossipWire(GossipConfig.fromProperties(properties, "Self"));
-            int budget = reply ? wire.replyMemberBudget(SELF) : wire.requestMemberBudget(SELF);
+            int budget = reply ? wire.replyMemberBudget(SELF, version) : wire.requestMemberBudget(SELF);
             assertEquals(a.serializedBytes() + b.serializedBytes() + 1 + difference, budget);
             var selected = new GossipBatchSelector().select(snapshot(a, b), 3, budget);
             assertEquals(difference < 0 ? List.of(b) : members, selected);
             int encoded = reply ? GossipWire.bytes(new CommandReply(1, UUID.randomUUID(), "Self", Long.MAX_VALUE, "OK",
-                    wire.result(SELF, selected), null)).length : wire.requestBytes(wire.parameters(SELF, selected)).length;
+                    wire.result(SELF, selected, version, MembershipTable.Admission.CAPACITY), null)).length
+                    : wire.requestBytes(wire.parameters(SELF, selected, version)).length;
             assertTrue(encoded <= actual + difference);
         }
     }

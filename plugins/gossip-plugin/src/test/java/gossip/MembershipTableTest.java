@@ -271,7 +271,8 @@ class MembershipTableTest {
         var other = member("Other", 3, 1);
         var before = table.snapshot();
         assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.merge(List.of(other)));
-        assertEquals(before, table.snapshot());
+        assertEquals(before.members(), table.snapshot().members());
+        assertEquals(1, table.snapshot().admissionsSkipped());
         table.merge(List.of(version(peer, 2)));
         assertEquals(2, view(table, peer.key()).record().heartbeat());
         var left = departed(version(peer, 2));
@@ -505,6 +506,39 @@ class MembershipTableTest {
         assertEquals(2, table.snapshot().activeMembers());
         assertEquals(2, table.snapshot().retainedIdentities());
         assertEquals(0, table.snapshot().tombstones());
+    }
+
+    @Test void admissionHintsAndSkipCountsDistinguishCapacityFromDuplicatesAndSuppression() {
+        var table = new MembershipTable(config(2, 4), self, clock);
+        assertEquals(MembershipTable.Admission.ADMITTED, table.mergeExchange(peer, List.of()).senderAdmission());
+        assertEquals(MembershipTable.Admission.ADMITTED, table.mergeExchange(peer, List.of()).senderAdmission());
+        assertEquals(0, table.snapshot().admissionsSkipped());
+        var excess = member("Excess", 3, 1);
+        assertEquals(MembershipTable.Admission.CAPACITY, table.mergeExchange(excess, List.of()).senderAdmission());
+        assertEquals(1, table.snapshot().admissionsSkipped());
+        assertEquals(MembershipTable.Admission.ADMITTED, table.mergeExchange(peer, List.of(excess)).senderAdmission());
+        assertEquals(2, table.snapshot().admissionsSkipped());
+        var before = table.snapshot();
+        var forged = new MemberRecord(peer.key(), "forged.invalid", 9010, peer.heartbeat(), peer.state(), Map.of());
+        assertReason(CONFLICT, () -> table.mergeExchange(excess, List.of(forged)));
+        assertEquals(before, table.snapshot(), "A rejected batch must not publish tentative skip counts");
+        table.merge(List.of(departed(peer)));
+        clock.advance(60);
+        table.maintain();
+        assertEquals(MembershipTable.Admission.IGNORED, table.mergeExchange(peer, List.of()).senderAdmission());
+        assertEquals(2, table.snapshot().admissionsSkipped(), "Terminal suppression is not a capacity skip");
+        assertEquals(MembershipTable.Admission.ADMITTED, table.mergeExchange(excess, List.of()).senderAdmission());
+    }
+
+    @Test void retainedIdentityCapacityAndOutboundMergesAlsoContributeToSkipCounts() {
+        var table = new MembershipTable(config(2, 2), self, clock);
+        table.merge(List.of(departed(peer)));
+        var excess = member("Excess", 3, 1);
+        assertEquals(MembershipTable.Admission.CAPACITY, table.mergeExchange(excess, List.of()).senderAdmission());
+        table.mergeDirect(excess, List.of());
+        assertEquals(2, table.snapshot().admissionsSkipped());
+        assertEquals(1, table.snapshot().activeMembers());
+        assertEquals(2, table.snapshot().retainedIdentities());
     }
 
     private static void assertReason(MembershipException.Reason reason, org.junit.jupiter.api.function.Executable operation) {

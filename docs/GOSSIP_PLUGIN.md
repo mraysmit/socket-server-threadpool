@@ -131,7 +131,7 @@ Derive local `SUSPECT` and `DEAD` assessments when neither an owner-record advan
 
 At the initial settings, mark suspect after 60 seconds and locally dead after 180 seconds. These thresholds also depend on swarm size, batching, pauses, and network latency. Stop selecting dead members for ordinary fanout but reserve some retry opportunities for them and for seeds. Remove inactive full records after the retention interval, retaining bounded terminal suppression state where possible.
 
-Finite retention cannot prevent every stale resurrection after arbitrarily long partitions. Old records can briefly reappear after their tombstones expire, then age out when no fresh heartbeat or direct reply arrives. Cap retained identities, including old boot IDs, at `max.records`; cap the active candidate/member set at `max.members`. Reject new admissions with a clear capacity error rather than allocating without limit. Existing members must still be able to exchange updates when capacity is full.
+Finite retention cannot prevent every stale resurrection after arbitrarily long partitions. Old records can briefly reappear after their tombstones expire, then age out when no fresh heartbeat or direct reply arrives. Cap retained identities, including old boot IDs, at `max.records`; cap the active candidate/member set at `max.members`. Skip admissions that cannot fit, count them, and report the sender's admission outcome in version 2 replies. Existing members must still be able to exchange updates when capacity is full.
 
 ### Implemented table behavior
 
@@ -175,6 +175,8 @@ Set `-Ddev.mars.announce=false` to disable announcements from the ServiceLoader-
 
 Keep host protocol version `1` unchanged. Put a separate `gossipVersion` inside the plugin parameters and result so that the swarm protocol can evolve independently.
 
+The current gossip protocol supports versions 1 and 2. Each transport exchange starts with version 2; a correlated `INVALID_PARAMETERS` error with exactly `INVALID_RECORD: gossipVersion must be between 1 and 1` or `INVALID_RECORD: Unsupported gossipVersion` permits one retry using version 1. Both attempts reuse the selected records and resolved address, have fresh message IDs, and share one permit and one overall socket-work deadline. Other errors, correlation failures, and unsolicited version changes never trigger fallback. Version 1 replies keep their original four fields and decode with unknown admission. `GossipWire.parameters(self, members)` remains a version 1 convenience API; use its three-argument overload to explicitly request version 2.
+
 The following is one complete wire request. Pretty printing is for readability; send it as a single UTF-8 JSON line, with escaped newlines inside any strings.
 
 ```json
@@ -184,7 +186,7 @@ The following is one complete wire request. Pretty printing is for readability; 
   "instruction": "gossip",
   "parameters": {
     "operation": "exchange",
-    "gossipVersion": 1,
+    "gossipVersion": 2,
     "swarmId": "demo-swarm",
     "sender": {
       "serverId": "Server-001",
@@ -204,7 +206,7 @@ The normal `CommandReply` wraps a result of this shape:
 
 ```json
 {
-  "gossipVersion": 1,
+  "gossipVersion": 2,
   "swarmId": "demo-swarm",
   "sender": {
     "serverId": "Server-002",
@@ -215,11 +217,16 @@ The normal `CommandReply` wraps a result of this shape:
     "state": "ALIVE",
     "metadata": {}
   },
-  "members": []
+  "members": [],
+  "senderAdmission": "ADMITTED"
 }
 ```
 
 The result's sender is always the responding process's current record. Merge it and the batch only after validating the outer correlated reply, supported gossip version, expected swarm ID, and agreement between the outer `serverId` and the result's sender. A seed can restart with the same server ID and a different boot ID; treat that as a new process record.
+
+Version 2 replies require `senderAdmission`, captured atomically with the receiver's committed merge: `ADMITTED` means the requesting sender's identity is present as a full record (including an already retained identity); `CAPACITY` means that sender's admission was skipped for lack of an active or retained-identity slot; `IGNORED` means suppression rules prevented restoration of its full record. This reports retention of the identity, not acceptance of every forwarded record or exact owner version. The admission field is forbidden in requests and version 1 replies. Unknown values or fields are rejected before the caller merges a reply. Complete reply budgets include the hint; forwardability reserves its largest encoded size and the maximum-width admission-skip counter in inspection pages.
+
+Status and membership-page `capacity` objects include `admissionsSkipped`, a per-instance cumulative counter updated with committed inbound and outbound merges. Each capacity-skipped record increments it, including repeated attempts for the same identity; stale and duplicate known records, suppression-only ignores, and rejected invalid/conflicting batches do not. The counter saturates at `Long.MAX_VALUE`. `MergeResult.ignored()` still aggregates all ignore reasons for Java callers. `mergeExchange` additionally returns the atomic sender admission outcome. An `ALIVE` identity restored from suppression needs an active-member slot but no new retained-identity slot.
 
 Do not echo arbitrary input fields into the result. Validate required keys, string lengths, endpoint ranges, canonical UUIDs, integer bounds, allowed states, metadata size, and duplicate member keys. Count the sender toward the maximum batch count and enforce the serialized byte budget on the complete envelope, including the outer reply. Reserve room for envelope overhead before selecting records. A single oversized record is a validation error, not an excuse to exceed the budget.
 
@@ -251,7 +258,9 @@ Each round performs the following work:
 4. Snapshot a bounded record batch and start exchanges only while capacity is available. Release each transport permit and worker assignment in `finally`. Local saturation skips work without penalizing a peer.
 5. Merge each validated result and record metrics. Classify network errors, incompatible versions, capacity errors, and identity conflicts separately.
 
-Failures use exponential retry backoff beginning at the round interval, with approximately 0.75-1.25 jitter and an absolute 30-second cap. Success resets the peer's backoff. Candidate selection includes self in the `max.members` cap; seed candidates fill remaining capacity after table members. Retry state is bounded and removed when an endpoint ceases to be a candidate or active worker. `LEFT` records are excluded from member-derived targets, while configured seeds remain bootstrap targets across restarts.
+Failures use exponential retry backoff beginning at the round interval, with approximately 0.75-1.25 jitter and an absolute 30-second cap. Success resets the peer's backoff except when an ordinary version 2 exchange reports `senderAdmission=CAPACITY`: the runtime preserves and increases that destination's backoff, remembers verified DNS aliases, and increments the runtime `CAPACITY` category without a network failure. A valid exchange still clears `isolated`; reachability and remote admission are separate facts. `IGNORED` and version 1's unknown admission do not assert capacity failure. Departure attempts count successful terminal exchanges normally rather than starting ordinary admission retries.
+
+Member-derived candidates remain bounded by `max.members` (including self), but every configured nonlocal seed remains eligible even when the table is full. Candidate count is therefore at most `max.members - 1 + seeds.size()`, before alias coalescing; retry state is bounded by `max.members + seeds.size()` and removed when an endpoint ceases to be a candidate or active worker. This lets an unadmitted node try another configured seed while a full peer backs off. `LEFT` records are excluded from member-derived targets, while configured seeds remain bootstrap targets across restarts. Legacy remote `CAPACITY:` errors still classify separately and back off as failed exchanges.
 
 Configured hostname seeds share a candidate, busy exclusion, and retry backoff with matching numeric member endpoints after identity verification. A successful correlated exchange establishes the alias, as does resolution to an already directly verified `ALIVE` member with the same expected server ID and port. Forwarded unverified records cannot establish aliases, and distinct numeric endpoints or expected IDs remain distinct. Alias state is bounded by the configured seed count and expires after 60 seconds, allowing a fresh hostname lookup after DNS changes. Recovering seeds retain their configured hostname as the dial target so cached alternative DNS answers remain usable. Selection itself performs no DNS or network I/O.
 
@@ -450,9 +459,21 @@ Use JUnit and the existing real-socket/external-JAR approach. Mockito and replac
 
 Use fake elapsed time for precise expiry tests and eventual assertions with bounded deadlines for live convergence. Record observed convergence times rather than promising logarithmic timing from the general gossip model. Verify startup rollback after a later provider fails, so cleanup covers gossip workers that were already scheduled.
 
-The plugin currently has 214 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml clean verify "-Dmaven.test.redirectTestOutputToFile=true"` after the batch-selector rewrite. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
+The plugin currently has 232 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml verify "-Dmaven.test.redirectTestOutputToFile=true"` after admission reporting and version compatibility were added. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
+
+The initial clean run during admission work hit the existing six-node hostname profile's 20-second convergence deadline. Its focused rerun passed (about 13 seconds for hostname convergence), and the subsequent full verification passed without changing that deadline. This remains a variable live-network/DNS test rather than a fixed convergence guarantee.
 
 In addition to configuration and deterministic-clock model coverage, command/transport tests verify real two-node exchanges, Unicode/null metadata, exact envelope byte boundaries, oversized UTF-8 replies, strict paging/cursors, independent rotating batches, identity/version/swarm failures, remote capacity errors, self-contact aliases, concurrency caps, read-idle and trickle deadlines, interruption, and close cancellation. Runtime tests cover jitter/backoff, fair priority/scan batches, heartbeat/maintenance while saturated, late seeds, three-node convergence, restart recovery, unchanged echo/HTTP/admin behavior, incompatible swarms, active-exchange startup rollback, and stalled TCP/DNS cleanup. Real helper processes exercise lookup caching, timeout, invalid output, and cancellation.
+
+Admission coverage checks committed skip counts for inbound/outbound merges, duplicates and terminal suppression, rollback on invalid/conflicting batches, sender-specific outcomes when only forwarded records are skipped, and active/retained capacity limits. Codec and real transport tests reject missing/malformed hints without mutation or permit leaks. UTF-8 byte-boundary tests cover both gossip versions in each direction. Legacy fallback tests check both recognized version errors, fresh correlation IDs, unchanged selected records, successful metrics, rejection of uncorrelated/unrelated errors and unsolicited version changes, and a shared overall deadline. Scheduler/selector tests verify that a full seed backs off exponentially while an alternate configured seed remains eligible even at local capacity; legacy `CAPACITY:` errors explicitly increment only the capacity failure category. The packaged provider verifies version 1 shape and version 2 `ADMITTED`/`CAPACITY` replies with the real runtime JAR.
+
+Run these regressions with terminal output:
+
+```powershell
+mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=GossipWireTest,MembershipTableTest,GossipCommandsTest,GossipTransportTest,PeerSelectorTest,GossipRuntimeTest,GossipBatchSelectorTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+Verified socket/compatibility/scheduler outcomes print `Admission hint test PASSED`, `Admission compatibility test PASSED`, and `Admission seed test PASSED`. The packaged assertions run through the standalone project's `mvn verify` workflow.
 
 Departure tests verify concurrent/idempotent requests, terminal publication, replacement of an active ordinary exchange, successful and failed attempts, deadline cancellation of actual stalled TCP and DNS work, cleanup-failure reporting, retained handlers after quiescing, stale-`ALIVE` suppression, admin cancellation during departure, and repeated close. A real TCP regression also forwards a departed origin's last `ALIVE` record back to it: the exchange succeeds, replies with `LEFT`, and updates the stale peer. Model tests cover older/equal local `ALIVE` replays, valid peer updates in the same batch, and transactional rejection of forged local records. The packaged fixture excludes provider implementation classes from its parent classpath and verifies actual ServiceLoader handling, automatic three-node hostname bootstrap and departure propagation, paginated inspection, instance isolation, startup rollback, and real console quit/end-of-input/admin-shutdown cleanup. JAR deletion is checked while the Windows JVM remains alive after cleanup.
 

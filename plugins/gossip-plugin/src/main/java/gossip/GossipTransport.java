@@ -18,6 +18,7 @@ package gossip;
 import dev.mars.client.CommandExecutionException;
 import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.CommandRequest;
+import dev.mars.protocol.CommandError;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -95,54 +96,44 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 throw new IOException("Cannot exchange with the local endpoint");
             }
             var members = requests.select(snapshot, config.maxBatchMembers(), wire.requestMemberBudget(snapshot.self()));
-            messageId = UUID.randomUUID();
-            byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members)));
-            if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
-            String response;
-            try (var connection = new Connection()) {
+            // Resolve once; both protocol attempts share one permit and one socket-work deadline.
+            var address = new InetSocketAddress(peer.host(), peer.port());
+            long deadline = System.nanoTime() + exchangeNanos;
+            int version = 2;
+            while (true) {
+                messageId = UUID.randomUUID();
+                byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members, version)));
+                if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
+                var reply = CommandProtocol.parseReply(exchangeBytes(address, payload, deadline));
+                if (!messageId.equals(reply.messageId())) { throw new IOException("Gossip message ID mismatch"); }
+                if (!peer.serverId().equals(reply.serverId())) { throw new IOException("Gossip server ID mismatch"); }
+                if (reply.error() != null) {
+                    if (version == 2 && reply.error().code() == CommandError.Code.INVALID_PARAMETERS
+                            && Set.of("INVALID_RECORD: gossipVersion must be between 1 and 1",
+                            "INVALID_RECORD: Unsupported gossipVersion").contains(reply.error().message())) {
+                        version = 1;
+                        continue;
+                    }
+                    throw new CommandExecutionException(reply);
+                }
+                var result = wire.decode(reply.result(), false);
+                if (result.gossipVersion() != version) { throw GossipWire.invalid("Reply gossipVersion does not match request"); }
+                if (!reply.serverId().equals(result.sender().key().serverId())) {
+                    throw new IOException("Outer serverId disagrees with gossip sender");
+                }
+                wire.requireForwardable(table.snapshot().self(), result.records());
+                // Closing cancels uncommitted work as well as sockets. No merge may start after close returns.
                 synchronized (this) {
                     if (closed) { throw new IOException("Gossip transport is closed"); }
-                    active.add(connection);
+                    table.mergeDirect(result.sender(), result.members());
+                    metrics.success(true);
                 }
-                try {
-                    // DNS resolution is a platform call; it is not covered by socket cancellation/deadlines.
-                    var address = new InetSocketAddress(peer.host(), peer.port());
-                    long started = System.nanoTime();
-                    long deadline = started + exchangeNanos;
-                    connection.channel.configureBlocking(false);
-                    if (!connection.channel.connect(address)) {
-                        long connectDeadline = started + Math.min(connectNanos, exchangeNanos);
-                        while (!connection.channel.finishConnect()) { await(connection, SelectionKey.OP_CONNECT, connectDeadline); }
-                    }
-                    var output = ByteBuffer.allocate(payload.length + 1).put(payload).put((byte) '\n');
-                    output.flip();
-                    while (output.hasRemaining()) {
-                        checkDeadline(deadline);
-                        if (connection.channel.write(output) == 0) { await(connection, SelectionKey.OP_WRITE, deadline); }
-                    }
-                    response = readLine(connection, deadline);
-                } finally { synchronized (this) { active.remove(connection); } }
+                var merged = table.snapshot();
+                if (!merged.identityConflicts().isEmpty()) {
+                    log.identity("outbound", peer, messageId, "Reachable duplicate server IDs: " + merged.identityConflicts());
+                }
+                return result;
             }
-            var reply = CommandProtocol.parseReply(response);
-            if (!messageId.equals(reply.messageId())) { throw new IOException("Gossip message ID mismatch"); }
-            if (!peer.serverId().equals(reply.serverId())) { throw new IOException("Gossip server ID mismatch"); }
-            if (reply.error() != null) { throw new CommandExecutionException(reply); }
-            var result = wire.decode(reply.result(), false);
-            if (!reply.serverId().equals(result.sender().key().serverId())) {
-                throw new IOException("Outer serverId disagrees with gossip sender");
-            }
-            wire.requireForwardable(table.snapshot().self(), result.records());
-            // Closing cancels uncommitted work as well as sockets. No merge may start after close returns.
-            synchronized (this) {
-                if (closed) { throw new IOException("Gossip transport is closed"); }
-                table.mergeDirect(result.sender(), result.members());
-                metrics.success(true);
-            }
-            var merged = table.snapshot();
-            if (!merged.identityConflicts().isEmpty()) {
-                log.identity("outbound", peer, messageId, "Reachable duplicate server IDs: " + merged.identityConflicts());
-            }
-            return result;
         } catch (MembershipException e) {
             metrics.outboundFailures.incrementAndGet();
             if (e.reason() == MembershipException.Reason.CONFLICT) { log.identity("outbound", peer, messageId, e.getMessage()); }
@@ -155,6 +146,31 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             if (GossipRuntime.classify(e) == GossipMetrics.Failure.IDENTITY) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw e;
         } finally { permits.release(); }
+    }
+
+    private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
+        checkDeadline(deadline);
+        try (var connection = new Connection()) {
+            synchronized (this) {
+                if (closed) { throw new IOException("Gossip transport is closed"); }
+                active.add(connection);
+            }
+            try {
+                connection.channel.configureBlocking(false);
+                long started = System.nanoTime();
+                if (!connection.channel.connect(address)) {
+                    long connectDeadline = started + Math.min(connectNanos, deadline - started);
+                    while (!connection.channel.finishConnect()) { await(connection, SelectionKey.OP_CONNECT, connectDeadline); }
+                }
+                var output = ByteBuffer.allocate(payload.length + 1).put(payload).put((byte) '\n');
+                output.flip();
+                while (output.hasRemaining()) {
+                    checkDeadline(deadline);
+                    if (connection.channel.write(output) == 0) { await(connection, SelectionKey.OP_WRITE, deadline); }
+                }
+                return readLine(connection, deadline);
+            } finally { synchronized (this) { active.remove(connection); } }
+        }
     }
 
     private String readLine(Connection connection, long deadline) throws IOException {

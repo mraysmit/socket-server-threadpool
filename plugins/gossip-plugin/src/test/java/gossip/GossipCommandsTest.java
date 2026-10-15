@@ -245,6 +245,31 @@ class GossipCommandsTest {
         }
     }
 
+    @Test void versionTwoAdmissionHintsKeepLegacyReplyShapeAndExposeCommittedSkipCounts() throws Exception {
+        var config = config(32768, 4, 2);
+        var plugin = plugin(config);
+        try {
+            var wire = new GossipWire(config);
+            var peer = member("Peer", 2);
+            var first = execute(plugin, wire.parameters(peer, List.of(), 2));
+            assertEquals("ADMITTED", first.get("senderAdmission"));
+            assertEquals(2, first.get("gossipVersion"));
+            var full = execute(plugin, wire.parameters(member("Other", 3), List.of(), 2));
+            assertEquals("CAPACITY", full.get("senderAdmission"));
+            var known = execute(plugin, wire.parameters(peer, List.of(member("Forwarded", 4)), 2));
+            assertEquals("ADMITTED", known.get("senderAdmission"));
+            var legacy = execute(plugin, wire.parameters(member("Legacy", 5), List.of()));
+            assertEquals(Set.of("gossipVersion", "swarmId", "sender", "members"), legacy.keySet());
+            assertEquals(3L, ((Map<?, ?>) execute(plugin, Map.of("operation", "status")).get("capacity")).get("admissionsSkipped"));
+            var before = execute(plugin, Map.of("operation", "status"));
+            var invalid = new LinkedHashMap<>(wire.parameters(member("Bad", 6), List.of(), 2));
+            invalid.put("senderAdmission", "ADMITTED");
+            assertThrows(InvalidParametersException.class, () -> plugin.execute(invalid));
+            assertEquals(((Map<?, ?>) before.get("capacity")).get("admissionsSkipped"),
+                    ((Map<?, ?>) execute(plugin, Map.of("operation", "status")).get("capacity")).get("admissionsSkipped"));
+        } finally { plugin.stop(); }
+    }
+
     @Test void saturationRepliesSuccessfullyButVersionConflictsStillReturnTypedErrors() throws Exception {
         var config = config(32768, 4, 2);
         var plugin = plugin(config);
