@@ -18,6 +18,9 @@ package gossip;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -31,6 +34,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.stream.Stream;
 
 import static gossip.MembershipException.Reason.*;
 import static gossip.MembershipTable.Assessment.*;
@@ -177,6 +181,51 @@ class MembershipTableTest {
         assertEquals(0, table.snapshot().tombstones());
         table.merge(List.of(peer)); // Finite retention permits stale resurrection after suppression expires.
         assertEquals(CANDIDATE, view(table, peer.key()).assessment());
+    }
+
+    static Stream<Arguments> staleLocalAliveCopies() {
+        return Stream.of(false, true).flatMap(direct -> Stream.of(0L, 1L, 2L)
+                .map(heartbeat -> Arguments.of(direct, heartbeat)));
+    }
+
+    @ParameterizedTest
+    @MethodSource("staleLocalAliveCopies")
+    void departedOwnerIgnoresStaleAliveCopiesAndStillCommitsPeerUpdates(boolean direct, long heartbeat) {
+        var table = table();
+        table.advanceLocal();
+        table.advanceLocal();
+        var left = table.leaveLocal();
+        table.merge(List.of(peer));
+        clock.advance(5);
+        var localBefore = view(table, self.key());
+        var update = version(peer, 2);
+        var stale = version(self, heartbeat);
+
+        var result = direct ? table.mergeDirect(update, List.of(stale)) : table.merge(List.of(update, stale));
+
+        assertEquals(new MembershipTable.MergeResult(0, 1, 1), result);
+        assertEquals(left, table.snapshot().self());
+        assertEquals(localBefore, view(table, self.key()), "Replay must not refresh local departure timing");
+        assertEquals(update, view(table, peer.key()).record());
+        assertEquals(0, view(table, peer.key()).advanceAgeNanos());
+        assertEquals(direct, view(table, peer.key()).endpointVerified());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"ALIVE, 3", "LEFT, 2", "LEFT, 3"})
+    void departedOwnerStillRejectsForgedRecordsAndRollsBackTheWholeExchange(MemberRecord.State state, long heartbeat) {
+        var table = table();
+        table.advanceLocal();
+        table.advanceLocal();
+        table.leaveLocal();
+        table.mergeDirect(peer, List.of());
+        clock.advance(5);
+        var before = table.snapshot();
+        var forged = new MemberRecord(self.key(), "forged.invalid", 9010, heartbeat, state, Map.of("forged", true));
+
+        assertReason(CONFLICT, () -> table.mergeDirect(version(peer, 2), List.of(forged)));
+
+        assertEquals(before, table.snapshot(), "Neither the peer update nor its direct-success time may commit");
     }
 
     @Test void inactiveSuppressionBlocksStaleForwardingButAllowsDirectOrNewerRecovery() {

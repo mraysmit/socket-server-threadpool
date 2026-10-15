@@ -139,7 +139,11 @@ public final class MembershipTable {
             Entry old = proposed.get(key);
             boolean directRecord = direct != null && direct.key().equals(key);
             if (key.equals(localKey)) {
-                if (!incoming.equals(old.record()) && incoming.heartbeat() >= old.record().heartbeat()) {
+                MemberRecord local = old.record();
+                // Peers can still forward the last ALIVE version after this owner publishes LEFT.
+                boolean staleAlive = local.state() == LEFT && incoming.state() == ALIVE
+                        && incoming.heartbeat() <= local.heartbeat();
+                if (!staleAlive && !incoming.equals(local) && incoming.heartbeat() >= local.heartbeat()) {
                     throw conflict(key);
                 }
                 ignored++;

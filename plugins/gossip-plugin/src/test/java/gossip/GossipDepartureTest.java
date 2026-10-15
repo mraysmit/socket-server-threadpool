@@ -177,6 +177,38 @@ class GossipDepartureTest {
         }
     }
 
+    @Test void departedOriginAcceptsPeerExchangeForwardingItsLastAliveRecord() throws Exception {
+        var config = GossipSwarmTest.config("");
+        var departing = new GossipPlugin(config, false);
+        var peer = new GossipPlugin(config, false);
+        try (var origin = GossipServerFixture.start("Departing", departing);
+             var remote = GossipServerFixture.start("Peer", peer)) {
+            var stale = MemberRecord.fromWire(GossipSwarmTest.status(departing).get("self"));
+            var sender = MemberRecord.fromWire(GossipSwarmTest.status(peer).get("self"));
+            var wire = new GossipWire(config);
+            // The peer learns ALIVE without introducing itself to the origin, so leave has no outbound targets.
+            peer.execute(wire.parameters(stale, List.of()));
+            var client = new TextMessageClient("127.0.0.1", origin.getPort(), "Departing");
+            client.execute("gossip", Map.of("operation", "leave"));
+            GossipDnsResolverTest.await(() -> {
+                try { return "QUIESCED".equals(GossipSwarmTest.status(departing).get("workerState")); }
+                catch (Exception e) { throw new RuntimeException(e); }
+            });
+            assertFalse(hasLeft(peer, stale.key()), "Peer must still carry the pre-departure ALIVE record");
+
+            var reply = peer.exchangeWith(new GossipConfig.Seed("Departing", "127.0.0.1", origin.getPort()));
+
+            assertEquals(stale.key(), reply.sender().key());
+            assertEquals(stale.heartbeat(), reply.sender().heartbeat());
+            assertEquals(MemberRecord.State.LEFT, reply.sender().state());
+            assertTrue(hasLeft(peer, stale.key()), "The successful reply must teach the stale peer LEFT");
+            assertTrue(GossipSwarmTest.members(departing).stream()
+                    .anyMatch(row -> sender.key().bootId().toString().equals(row.get("bootId"))));
+            assertEquals(0L, ((Number) ((Map<?, ?>) GossipSwarmTest.status(departing).get("exchanges")).get("rejected")).longValue());
+            System.out.println("Departure replay test PASSED | origin=Departing | peer=Peer | stale=ALIVE | reply=LEFT");
+        }
+    }
+
     @Test void actualStalledTcpDepartureIsCancelledAtTheDocumentedDeadline() throws Exception {
         try (var peer = new GossipSwarmTest.StalledPeer()) {
             // Disable ordinary rounds so the first wire request must carry LEFT.
