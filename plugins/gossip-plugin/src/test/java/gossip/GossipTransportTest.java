@@ -102,6 +102,50 @@ class GossipTransportTest {
         }
     }
 
+    @Test void outgoingIdentityMismatchLogsItsPeerAndMessageIdWithoutChangingTheFailure() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        var lines = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, lines::add));
+        var correlation = new CompletableFuture<UUID>();
+        try (var transport = new GossipTransport(config, table, metrics);
+             var peer = new ProtocolPeer((socket, port, request) -> {
+                 correlation.complete(request.messageId());
+                 socket.getOutputStream().write(badReply(config, port, request, Failure.SERVER_ID));
+             })) {
+            var failure = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+            assertEquals("Gossip server ID mismatch", failure.getMessage());
+            assertEquals(1, table.snapshot().retainedIdentities());
+            assertEquals(0, transport.inflight());
+            assertEquals(1, metrics.outboundFailures.get());
+            assertEquals(1, lines.size());
+            for (var field : List.of("event=IDENTITY_CONFLICT", "direction=outbound", "peerServerId=Peer",
+                    "peerPort=" + peer.endpoint().port(), "messageId=" + correlation.get(2, TimeUnit.SECONDS))) {
+                assertTrue(lines.getFirst().contains(field), lines.getFirst());
+            }
+        }
+    }
+
+    @Test void reachableDuplicateLogicalIdsAreLoggedAfterSuccessfulValidatedExchanges() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        var lines = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, lines::add));
+        try (var transport = new GossipTransport(config, table, metrics)) {
+            for (int boot = 2; boot <= 3; boot++) {
+                int identity = boot;
+                try (var peer = new ProtocolPeer((socket, port, request) ->
+                        socket.getOutputStream().write(reply(config, request, responder(port, identity))))) {
+                    transport.exchange(peer.endpoint());
+                }
+            }
+            assertEquals(java.util.Set.of("Peer"), table.snapshot().identityConflicts());
+            assertEquals(2, metrics.outbound.get());
+            assertEquals(1, lines.size());
+            assertTrue(lines.getFirst().contains("Reachable duplicate server IDs: [Peer]"));
+        }
+    }
+
     private static byte[] badReply(GossipConfig config, int port, CommandRequest request, Failure failure) {
         if (failure == Failure.MALFORMED_JSON) { return "{\n".getBytes(StandardCharsets.UTF_8); }
         if (failure == Failure.EMPTY_REPLY) { return new byte[0]; }

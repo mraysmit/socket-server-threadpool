@@ -35,8 +35,17 @@ final class GossipMetrics {
     volatile int retryingPeers;
     volatile Long lastRound;
     private volatile Long lastSuccess;
+    private GossipLog log;
 
-    GossipMetrics() { for (var kind : Failure.values()) { failures.put(kind, new AtomicLong()); } }
+    GossipMetrics() { this(null); }
+    GossipMetrics(GossipLog log) {
+        this.log = log;
+        for (var kind : Failure.values()) { failures.put(kind, new AtomicLong()); }
+    }
+    synchronized GossipLog log(GossipConfig config, MemberRecord self) {
+        if (log == null) { log = new GossipLog(config, self); }
+        return log;
+    }
     void failure(Failure kind) { failures.get(kind).incrementAndGet(); }
     Map<String, Object> runtime() {
         var kinds = new LinkedHashMap<String, Long>();

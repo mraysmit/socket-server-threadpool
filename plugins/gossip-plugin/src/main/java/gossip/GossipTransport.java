@@ -49,6 +49,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final MembershipTable table;
     private final GossipWire wire;
     private final GossipMetrics metrics;
+    private final GossipLog log;
     private final GossipBatchSelector requests = new GossipBatchSelector();
     private final Semaphore permits;
     private final Set<Connection> active = new HashSet<>();
@@ -75,6 +76,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
         this.metrics = metrics;
+        log = metrics.log(config, table.snapshot().self());
         wire = new GossipWire(config);
         permits = new Semaphore(config.maxInflight());
         connectNanos = positiveNanos(connectTimeout);
@@ -85,6 +87,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
         synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed"); } }
         if (!permits.tryAcquire()) { throw new BusyException(); }
+        UUID messageId = null;
         try {
             var snapshot = table.snapshot();
             if (peer.serverId().equals(snapshot.self().key().serverId())
@@ -93,7 +96,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             }
             var members = requests.select(snapshot, config.maxBatchMembers(), batch ->
                     wire.requestBytes(wire.parameters(snapshot.self(), batch)).length <= config.maxExchangeBytes());
-            UUID messageId = UUID.randomUUID();
+            messageId = UUID.randomUUID();
             byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members)));
             if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
             String response;
@@ -136,15 +139,21 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 table.mergeDirect(result.sender(), result.members());
                 metrics.success(true);
             }
+            var merged = table.snapshot();
+            if (!merged.identityConflicts().isEmpty()) {
+                log.identity("outbound", peer, messageId, "Reachable duplicate server IDs: " + merged.identityConflicts());
+            }
             return result;
         } catch (MembershipException e) {
             metrics.outboundFailures.incrementAndGet();
+            if (e.reason() == MembershipException.Reason.CONFLICT) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw new IOException("Gossip " + e.reason() + ": " + e.getMessage(), e);
         } catch (CancelledKeyException | ClosedSelectorException | UnresolvedAddressException e) {
             metrics.outboundFailures.incrementAndGet();
             throw new IOException("Gossip connection closed or endpoint unresolved", e);
         } catch (IOException e) {
             metrics.outboundFailures.incrementAndGet();
+            if (GossipRuntime.classify(e) == GossipMetrics.Failure.IDENTITY) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw e;
         } finally { permits.release(); }
     }

@@ -88,7 +88,7 @@ public final class GossipPlugin implements CommandPlugin {
     @Override public Object execute(Map<String, Object> parameters) throws InvalidParametersException {
         Started local = started;
         if (local == null) { throw new IllegalStateException("Gossip plugin has not started successfully"); }
-        return local.commands().execute(parameters, stopped);
+        return local.commands().execute(parameters);
     }
 
     private record Started(GossipTransport transport, GossipCommands commands, GossipRuntime runtime) { }

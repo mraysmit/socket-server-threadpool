@@ -51,6 +51,7 @@ final class GossipRuntime implements AutoCloseable {
     private final GossipMetrics metrics;
     private final LongSupplier clock;
     private final PeerSelector selector;
+    private final GossipLog log;
     private final Map<GossipConfig.Seed, Thread> workers = new HashMap<>();
     private final Set<Thread> ownedWorkers = new HashSet<>();
     private final Set<String> resolvedInFlight = new HashSet<>();
@@ -73,6 +74,7 @@ final class GossipRuntime implements AutoCloseable {
     private int departureFailures;
     private int departureSkipped;
     private int departureCancelled;
+    private boolean departureLogged;
 
     GossipRuntime(GossipConfig config, MembershipTable table, GossipTransport transport, GossipMetrics metrics) throws IOException {
         this(config, table, transport, metrics, System::nanoTime, new Random(),
@@ -90,6 +92,7 @@ final class GossipRuntime implements AutoCloseable {
         this.table = table;
         this.transport = transport;
         this.metrics = metrics;
+        log = metrics.log(config, table.snapshot().self());
         this.clock = clock;
         this.resolver = resolver;
         if (departureTimeout.isNegative() || departureTimeout.isZero()) { throw new IllegalArgumentException("Positive departure timeout required"); }
@@ -129,7 +132,7 @@ final class GossipRuntime implements AutoCloseable {
                     if (stopped) { break; }
                 }
                 try { round(); }
-                catch (RuntimeException e) { metrics.roundFailures.incrementAndGet(); }
+                catch (RuntimeException e) { metrics.roundFailures.incrementAndGet(); log.roundFailure(e); }
                 first = false;
             }
         } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -290,7 +293,7 @@ final class GossipRuntime implements AutoCloseable {
         }
     }
 
-    private static GossipMetrics.Failure classify(Exception failure) {
+    static GossipMetrics.Failure classify(Exception failure) {
         for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
             if (cause instanceof SocketTimeoutException) { return GossipMetrics.Failure.TIMEOUT; }
             if (cause instanceof java.nio.charset.CharacterCodingException) { return GossipMetrics.Failure.PROTOCOL; }
@@ -341,12 +344,16 @@ final class GossipRuntime implements AutoCloseable {
         long deadline = System.nanoTime() + STOP_TIMEOUT.toNanos();
         boolean interrupted = Thread.interrupted();
         IOException failure = null;
+        var cleanupProblems = new java.util.ArrayList<CleanupProblem>();
         for (Thread thread : owned) { if (thread != Thread.currentThread()) { thread.interrupt(); } }
         try {
             try { transport.close(); }
-            catch (IOException e) { failure = e; }
+            catch (IOException e) { failure = e; cleanupProblems.add(new CleanupProblem("transport", e)); }
             try { resolver.close(); }
-            catch (IOException e) { if (failure == null) { failure = e; } else { failure.addSuppressed(e); } }
+            catch (IOException e) {
+                cleanupProblems.add(new CleanupProblem("dnsResolver", e));
+                if (failure == null) { failure = e; } else { failure.addSuppressed(e); }
+            }
             for (Thread thread : owned) {
                 if (thread == Thread.currentThread()) { continue; }
                 while (thread.isAlive() && thread != Thread.currentThread() && deadline - System.nanoTime() > 0) {
@@ -355,18 +362,25 @@ final class GossipRuntime implements AutoCloseable {
                 }
                 if (thread.isAlive()) {
                     var error = new IOException("Gossip worker did not stop within " + STOP_TIMEOUT + ": " + thread.getName());
+                    cleanupProblems.add(new CleanupProblem(thread.getName(), error));
                     if (failure == null) { failure = error; } else { failure.addSuppressed(error); }
                 }
             }
         } finally {
+            Map<String, Object> outcome = null;
             synchronized (this) {
                 metrics.workerState = failure == null ? departed ? "QUIESCED" : "STOPPED" : "CLEANUP_FAILED";
                 if (leaving) { departureState = failure == null ? departureOutcome : "FAILED"; }
                 departurePending.clear();
                 stopFailure = failure;
+                if (leaving && !departureLogged) { departureLogged = true; outcome = departure(); }
             }
             if (interrupted) { Thread.currentThread().interrupt(); }
+            for (var problem : cleanupProblems) { log.cleanupFailure(problem.resource(), problem.failure()); }
+            if (outcome != null) { log.departure(outcome); }
         }
         if (failure != null) { throw failure; }
     }
+
+    private record CleanupProblem(String resource, Throwable failure) { }
 }

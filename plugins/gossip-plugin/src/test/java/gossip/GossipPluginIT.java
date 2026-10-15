@@ -247,6 +247,13 @@ class GossipPluginIT {
             assertEquals("RUNNING", status(clients.getFirst()).get("workerState"));
             servers.send("close-all");
             servers.allClosed.get(5, TimeUnit.SECONDS);
+            var departureLogs = servers.diagnostics.stream()
+                    .filter(line -> line.contains("event=DEPARTURE_FINISHED") && line.contains("bootId=" + departingBoot)).toList();
+            assertEquals(1, departureLogs.size(), "Packaged provider must log one outcome despite repeated leave and host close");
+            for (var field : List.of("serverId=Server-B", "swarmId=automatic", "state=COMPLETED", "attempts=", "successes=")) {
+                assertTrue(departureLogs.getFirst().contains(field), departureLogs.getFirst());
+            }
+            System.out.println("Gossip logging test PASSED | " + departureLogs.getFirst());
             assertTrue(servers.process.isAlive());
             Files.delete(directory.resolve(pluginJar().getFileName()));
         }
@@ -341,6 +348,7 @@ class GossipPluginIT {
         private final CompletableFuture<Void> allClosed = new CompletableFuture<>();
         private final CompletableFuture<String> startupFailure = new CompletableFuture<>();
         private final Future<String> output;
+        private final List<String> diagnostics = new java.util.concurrent.CopyOnWriteArrayList<>();
 
         ServerProcess(Path directory, Path config, boolean checkStartupFailure) throws IOException {
             this(directory, config, checkStartupFailure, 0);
@@ -361,6 +369,7 @@ class GossipPluginIT {
                     String line;
                     while ((line = lines.readLine()) != null) {
                         captured.append(line).append('\n');
+                        if (line.contains(" | plugin=gossip | ")) { diagnostics.add(line); }
                         var match = pattern.matcher(line);
                         if (match.matches()) {
                             ready.complete(new Ready(Integer.parseInt(match.group(1)), Integer.parseInt(match.group(2))));

@@ -138,13 +138,14 @@ class GossipRuntimeTest {
 
     @Test void coldHostnameAliasCannotDialTheSameEndpointTwiceEvenAfterTheFirstCallFinishes() throws Exception {
         var config = config("Peer@wait.test:9010");
-        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        var clock = new AtomicLong();
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000), clock::get);
         table.mergeDirect(PeerSelectorTest.record("Peer", 2, 9010), List.of());
         var metrics = new GossipMetrics();
         var client = new Client(false, false);
         var release = temporary.resolve("release-dns");
         var helpers = new CopyOnWriteArrayList<Process>();
-        try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
+        try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get,
                 new Random(5), controlledResolver(release, helpers))) {
             runtime.round();
             GossipDnsResolverTest.await(() -> client.calls.size() == 1 && metrics.workers == 1);
@@ -166,7 +167,8 @@ class GossipRuntimeTest {
 
     @Test void aSuccessfulHostnameBootstrapBecomesOneOrdinaryTargetOnLaterRounds() throws Exception {
         var config = config("Peer@wait.test:9010");
-        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        var clock = new AtomicLong();
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000), clock::get);
         var metrics = new GossipMetrics();
         var calls = new CopyOnWriteArrayList<GossipConfig.Seed>();
         var threads = new CopyOnWriteArrayList<Thread>();
@@ -182,7 +184,7 @@ class GossipRuntimeTest {
         };
         var release = Files.createFile(temporary.resolve("release-dns"));
         var helpers = new CopyOnWriteArrayList<Process>();
-        try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
+        try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get,
                 new Random(6), controlledResolver(release, helpers))) {
             for (int round = 1; round <= 3; round++) {
                 runtime.round();
@@ -193,6 +195,29 @@ class GossipRuntimeTest {
             assertEquals(0, metrics.skipped.get());
         }
         assertTrue(helpers.stream().noneMatch(Process::isAlive));
+    }
+
+    @Test void repeatedSchedulerFailuresAreVisibleAndRateLimitedWithoutStoppingCleanup() throws Exception {
+        var config = config("");
+        var clock = new AtomicLong();
+        var base = PeerSelectorTest.record("Self", 1, 9000);
+        var exhausted = new MemberRecord(base.key(), base.host(), base.port(), Long.MAX_VALUE, base.state(), Map.of());
+        var table = new MembershipTable(config, exhausted, clock::get);
+        var lines = new CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, exhausted, clock::get, lines::add));
+        var client = new Client(false, false);
+        try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get, new Random(7), new GossipDnsResolver(8, 2))) {
+            clock.set(TimeUnit.MILLISECONDS.toNanos(20));
+            runtime.start();
+            GossipDnsResolverTest.await(() -> metrics.roundFailures.get() >= 3);
+            assertEquals(1, lines.size());
+            assertTrue(lines.getFirst().contains("event=ROUND_FAILED"));
+            assertTrue(lines.getFirst().contains("Owner heartbeat is exhausted"));
+            runtime.close();
+            assertEquals("STOPPED", metrics.workerState);
+            assertTrue(client.closed);
+            assertEquals(1, lines.size(), "Ordinary successful close must not invent departure or failure logs");
+        }
     }
 
     private GossipDnsResolver controlledResolver(Path release, List<Process> helpers) {

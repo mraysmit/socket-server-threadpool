@@ -39,7 +39,8 @@ class GossipDepartureTest {
     @Test void concurrentLeavePublishesOnceAndAttemptsEachBoundedTargetOnce() throws Exception {
         var config = GossipSwarmTest.config("Good@127.0.0.1:9010,Bad@127.0.0.1:9020,Self@127.0.0.1:9000");
         var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
-        var metrics = new GossipMetrics();
+        var logs = new CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, logs::add));
         var client = new DepartureClient(table, false);
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
                 new Random(1), new GossipDnsResolver(8, 2));
@@ -52,6 +53,7 @@ class GossipDepartureTest {
             gate.countDown();
             for (var request : requests) { assertEquals(2, request.get(2, TimeUnit.SECONDS).get("targets")); }
             GossipDnsResolverTest.await(() -> "QUIESCED".equals(metrics.workerState));
+            GossipDnsResolverTest.await(() -> logs.size() == 1);
             var departure = runtime.departure();
             assertEquals("COMPLETED", departure.get("state"));
             assertEquals(2, departure.get("attempts"));
@@ -67,6 +69,10 @@ class GossipDepartureTest {
             assertThrows(IOException.class, runtime::requireActiveExchange);
             runtime.close();
             assertEquals(departure, runtime.departure());
+            assertEquals(1, logs.size(), "Repeated leave/close must not duplicate the outcome log");
+            for (var field : List.of("event=DEPARTURE_FINISHED", "state=COMPLETED", "targets=2", "attempts=2", "successes=1", "failures=1")) {
+                assertTrue(logs.getFirst().contains(field), logs.getFirst());
+            }
         }
     }
 
@@ -259,7 +265,8 @@ class GossipDepartureTest {
     @Test void cleanupFailureIsReportedAndPreservedForRepeatedStop() throws Exception {
         var config = GossipSwarmTest.config("");
         var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
-        var metrics = new GossipMetrics();
+        var logs = new CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, logs::add));
         var expected = new IOException("Fixture cleanup failure");
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
@@ -270,9 +277,38 @@ class GossipDepartureTest {
         try {
             runtime.leave();
             GossipDnsResolverTest.await(() -> "FAILED".equals(runtime.departure().get("state")));
+            GossipDnsResolverTest.await(() -> logs.size() == 2);
             assertEquals("CLEANUP_FAILED", metrics.workerState);
             assertSame(expected, assertThrows(IOException.class, runtime::close));
+            assertEquals(1, logs.stream().filter(line -> line.contains("event=CLEANUP_FAILED")).count());
+            assertTrue(logs.getFirst().contains("resource=transport"));
+            assertTrue(logs.getFirst().contains("IOException: Fixture cleanup failure"));
+            assertTrue(logs.getLast().contains("event=DEPARTURE_FINISHED"));
+            assertTrue(logs.getLast().contains("state=FAILED"));
+            assertEquals(2, logs.size());
         } finally { assertSame(expected, assertThrows(IOException.class, runtime::close)); }
+    }
+
+    @Test void aBrokenLogSinkCannotMaskCleanupFailureOrRepeatItOnLaterClose() throws Exception {
+        var config = GossipSwarmTest.config("");
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        var attemptedLogs = new java.util.concurrent.atomic.AtomicInteger();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, line -> {
+            attemptedLogs.incrementAndGet();
+            throw new IllegalStateException("Broken diagnostic sink");
+        }));
+        var expected = new IOException("Cleanup must remain the primary failure");
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
+            @Override public void close() throws IOException { throw expected; }
+        };
+        var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
+                new Random(7), new GossipDnsResolver(8, 2));
+        assertSame(expected, assertThrows(IOException.class, runtime::close));
+        assertSame(expected, assertThrows(IOException.class, runtime::close));
+        assertEquals("CLEANUP_FAILED", metrics.workerState);
+        assertEquals("NOT_REQUESTED", runtime.departure().get("state"));
+        assertEquals(1, attemptedLogs.get());
     }
 
     @Test void administrativeShutdownCancelsAnActiveDepartureWithoutWaitingForItsBudget() throws Exception {

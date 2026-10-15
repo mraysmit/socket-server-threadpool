@@ -34,6 +34,7 @@ final class GossipCommands {
     private final GossipMetrics metrics;
     private final GossipTransport transport;
     private final GossipRuntime runtime;
+    private final GossipLog log;
     private final GossipBatchSelector responses = new GossipBatchSelector();
 
     GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport, GossipRuntime runtime) {
@@ -44,14 +45,15 @@ final class GossipCommands {
         this.runtime = runtime;
         wire = new GossipWire(config);
         var snapshot = table.snapshot();
+        log = metrics.log(config, snapshot.self());
         wire.requireForwardable(snapshot.self(), List.of(snapshot.self()));
         wire.requireReplyFits(snapshot.self().key().serverId(), wire.result(snapshot.self(), List.of()));
-        wire.requireReplyFits(snapshot.self().key().serverId(), status(false));
+        wire.requireReplyFits(snapshot.self().key().serverId(), status());
         wire.requireReplyFits(snapshot.self().key().serverId(), pageResult(snapshot,
                 List.of(GossipWire.memberView(snapshot.members().getFirst())), null));
     }
 
-    Object execute(Map<String, Object> parameters, boolean stopped) throws InvalidParametersException {
+    Object execute(Map<String, Object> parameters) throws InvalidParametersException {
         String operation = PluginParameters.string(parameters, "operation");
         try {
             return switch (operation) {
@@ -65,7 +67,7 @@ final class GossipCommands {
                 }
                 case "status" -> {
                     PluginParameters.requireKeys(parameters, "operation");
-                    var result = status(stopped);
+                    var result = status();
                     wire.requireReplyFits(table.snapshot().self().key().serverId(), result);
                     yield result;
                 }
@@ -80,11 +82,19 @@ final class GossipCommands {
     private Object exchange(Map<String, Object> parameters) {
         var incoming = wire.decode(parameters, true);
         var self = table.snapshot().self();
-        if (incoming.sender().key().equals(self.key())) {
-            throw new MembershipException(MembershipException.Reason.CONFLICT, "Exchange sender must not be the local process");
+        try {
+            if (incoming.sender().key().equals(self.key())) {
+                throw new MembershipException(MembershipException.Reason.CONFLICT, "Exchange sender must not be the local process");
+            }
+            wire.requireForwardable(self, incoming.records());
+            table.merge(incoming.records());
+        } catch (MembershipException failure) {
+            if (failure.reason() == MembershipException.Reason.CONFLICT) {
+                var peer = incoming.sender();
+                log.identity("inbound", new GossipConfig.Seed(peer.key().serverId(), peer.host(), peer.port()), null, failure.getMessage());
+            }
+            throw failure;
         }
-        wire.requireForwardable(self, incoming.records());
-        table.merge(incoming.records());
         var snapshot = table.snapshot();
         var batch = responses.select(snapshot, config.maxBatchMembers(), members ->
                 wire.replyFits(snapshot.self().key().serverId(), wire.result(snapshot.self(), members)));
@@ -123,7 +133,7 @@ final class GossipCommands {
         return wire.page(snapshot.self(), selected, cursor, capacity(snapshot));
     }
 
-    private Map<String, Object> status(boolean stopped) {
+    private Map<String, Object> status() {
         var snapshot = table.snapshot();
         var assessments = new LinkedHashMap<String, Integer>();
         for (var assessment : MembershipTable.Assessment.values()) { assessments.put(assessment.name(), 0); }
@@ -132,7 +142,7 @@ final class GossipCommands {
         result.put("gossipVersion", 1);
         result.put("swarmId", config.swarmId());
         result.put("self", snapshot.self().toWire());
-        result.put("workerState", stopped ? metrics.workerState.equals("CLEANUP_FAILED") ? "CLEANUP_FAILED" : "STOPPED" : metrics.workerState);
+        result.put("workerState", metrics.workerState);
         result.put("isolated", metrics.isolated());
         result.put("implementationStage", "departure-runtime");
         result.put("supportedOperations", List.of("exchange", "members", "status", "leave"));

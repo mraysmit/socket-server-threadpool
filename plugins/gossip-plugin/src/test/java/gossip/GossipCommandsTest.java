@@ -185,6 +185,66 @@ class GossipCommandsTest {
         } finally { plugin.stop(); }
     }
 
+    @Test void inboundConflictIsLoggedOnceWhileTheOriginalErrorAndAtomicRollbackArePreserved() throws Exception {
+        var config = config(32768, 4, 8);
+        var clock = new java.util.concurrent.atomic.AtomicLong();
+        var table = new MembershipTable(config, member("Self", 1), clock::get);
+        var lines = new ArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), clock::get, lines::add));
+        var transport = new GossipTransport(config, table, metrics);
+        try (var runtime = new GossipRuntime(config, table, transport, metrics)) {
+            var commands = new GossipCommands(config, table, metrics, transport, runtime);
+            var wire = new GossipWire(config);
+            var peer = member("Peer", 2);
+            commands.execute(wire.parameters(peer, List.of()));
+            var before = table.snapshot();
+            var changed = new MemberRecord(peer.key(), "changed.invalid", 9010, peer.heartbeat(), peer.state(), Map.of());
+            for (int attempt = 0; attempt < 3; attempt++) {
+                var failure = assertThrows(InvalidParametersException.class,
+                        () -> commands.execute(wire.parameters(changed, List.of(member("Uncommitted", 3)))));
+                assertTrue(failure.getMessage().startsWith("CONFLICT:"));
+                assertEquals(before, table.snapshot());
+            }
+            assertEquals(3, metrics.rejectedExchanges.get());
+            assertEquals(1, lines.size());
+            assertTrue(lines.getFirst().contains("event=IDENTITY_CONFLICT"));
+            assertTrue(lines.getFirst().contains("direction=inbound"));
+            assertTrue(lines.getFirst().contains("peerServerId=Peer"));
+        }
+    }
+
+    @Test void statusRemainsStoppingUntilOwnedResourceCleanupActuallyCompletes() throws Exception {
+        var config = config(32768, 4, 8);
+        var table = new MembershipTable(config, member("Self", 1));
+        var metrics = new GossipMetrics();
+        var entered = new java.util.concurrent.CountDownLatch(1);
+        var release = new java.util.concurrent.CountDownLatch(1);
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
+            @Override public void close() throws java.io.IOException {
+                entered.countDown();
+                try { release.await(); }
+                catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new java.io.InterruptedIOException("Cleanup interrupted"); }
+            }
+        };
+        try (var transport = new GossipTransport(config, table, metrics);
+             var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime, new java.util.Random(1), new GossipDnsResolver(8, 2));
+             var callers = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            try {
+                var commands = new GossipCommands(config, table, metrics, transport, runtime);
+                var stopping = callers.submit(() -> { runtime.close(); return null; });
+                try {
+                    assertTrue(entered.await(2, java.util.concurrent.TimeUnit.SECONDS));
+                    var status = (Map<?, ?>) commands.execute(Map.of("operation", "status"));
+                    assertEquals("STOPPING", status.get("workerState"));
+                    assertFalse(stopping.isDone());
+                } finally { release.countDown(); }
+                stopping.get(2, java.util.concurrent.TimeUnit.SECONDS);
+                assertEquals("STOPPED", ((Map<?, ?>) commands.execute(Map.of("operation", "status"))).get("workerState"));
+            } finally { release.countDown(); }
+        }
+    }
+
     @Test void saturationRepliesSuccessfullyButVersionConflictsStillReturnTypedErrors() throws Exception {
         var config = config(32768, 4, 2);
         var plugin = plugin(config);

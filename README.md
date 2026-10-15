@@ -525,6 +525,19 @@ mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=MembershipTableTest,GossipCapa
 
 The socket capacity cases print `Capacity test PASSED` after verifying the results.
 
+Gossip also writes one-line diagnostics to standard error for identity conflicts,
+scheduler failures, cleanup failures, and final departure outcomes. Entries include
+server ID, boot ID, swarm ID, and relevant peer/attempt details. Repeated identity
+and scheduler warnings are limited to one entry per category per 30 seconds per
+instance; the next entry reports the suppressed count. See
+[operational logging](docs/GOSSIP_PLUGIN.md#operational-logging) for the format.
+
+Run the logging and lifecycle regression tests with terminal output:
+
+```powershell
+mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=GossipLogTest,GossipCommandsTest,GossipTransportTest,GossipRuntimeTest,GossipDepartureTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
 #### Loading Plugins from Runtime Folders
 
 Supply the folder list at launch by repeating `--plugins-dir`, once per folder.

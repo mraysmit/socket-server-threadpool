@@ -4,7 +4,7 @@
 | --- | --- |
 | Author | Mark Andrew Ray-Smith, Cityline Ltd |
 | Status | Seed runtime, departure, and bounded capacity/fairness/partition/load validation complete; optional UDP discovery pending |
-| Last updated | 2026-10-14 |
+| Last updated | 2026-10-15 |
 
 ## Purpose and scope
 
@@ -273,6 +273,38 @@ The host now bounds each request and HTTP header line at `WorkerRunnable.MAX_LIN
 
 Gossip responses now have a raw byte-counted limit before JSON parsing and strict UTF-8 decoding in the plugin transport. The general-purpose `TextMessageClient` still has an unbounded reply reader and is used for manual inspection, not the plugin's outbound exchanges. Before deployment beyond a trusted environment, add a raw request byte limit before host JSON parsing and cap aggregate HTTP header bytes; harden the general-purpose client too if it will contact untrusted servers. These remaining host/client transport tasks are separate from the gossip merge algorithm.
 
+## Operational logging
+
+The plugin writes diagnostic entries to standard error by default, so they appear in the server's terminal alongside host request logs. Each entry is one line with a UTC timestamp, severity, `plugin=gossip`, event name, local `serverId`, `bootId`, and `swarmId`. State and counters remain available through `status` independently of logging.
+
+During shutdown, `status` retains `workerState="STOPPING"` until owned resource cleanup completes. Requesting stop alone no longer reports `STOPPED` while workers are still exiting. A deterministic regression holds cleanup open and verifies both states before and after release.
+
+| Event | Severity | Details |
+|---|---|---|
+| `IDENTITY_CONFLICT` | WARN | Inbound owner-record conflicts, outbound correlation/identity failures, and reachable duplicate logical IDs. Includes direction, expected peer server ID, peer host/port, reason, and outbound message ID when available. |
+| `ROUND_FAILED` | WARN | Unexpected scheduler exceptions, including the exception type and message. The round failure counter still advances for every failure. |
+| `CLEANUP_FAILED` | ERROR | One entry per failed transport, DNS-resolver, or worker cleanup, with resource and exception details. The original aggregated cleanup failure still propagates. Repeated close does not log the same retained failure again. |
+| `DEPARTURE_FINISHED` | INFO or WARN | One final entry per requested departure after cleanup, including state, targets, attempts, successes, failures, skipped, and cancelled counts. Successful completion without failed attempts and cancellation use INFO; other outcomes use WARN. Repeated `leave`/close calls do not duplicate it. Ordinary shutdown without a departure request emits no departure entry. |
+
+Identity warnings share one 30-second monotonic-time window per plugin instance, across inbound/outbound peers; scheduler warnings have their own window. The first warning is immediate. Repeated warnings are suppressed, and the next permitted entry includes `suppressed=<count>` for the previous window. The limiter has constant-size state, with no per-peer log cache or queue. Cleanup and final departure entries bypass these warning windows. Neither successful rounds nor ordinary DNS/network failures produce per-round logs; their counts remain in `status`.
+
+Message/error fields are bounded and escape control characters and delimiters to preserve one-line formatting. Raw requests, replies, and member metadata are not included. Inbound SPI calls do not expose the host message ID, so inbound entries use `messageId=-`; the host request log supplies that correlation. Diagnostic sink failures do not replace protocol or cleanup exceptions. Logging creates no threads and does not write while holding membership locks or the runtime state monitor.
+
+Example entries (abbreviated context):
+
+```text
+[2026-10-15T09:00:00Z] WARN | plugin=gossip | event=IDENTITY_CONFLICT | serverId=Server-001 | bootId=<uuid> | swarmId=demo | direction=outbound | peerServerId=Server-002 | peerHost=127.0.0.1 | peerPort=9010 | messageId=<uuid> | reason=Gossip server ID mismatch | suppressed=0
+[2026-10-15T09:00:01Z] INFO | plugin=gossip | event=DEPARTURE_FINISHED | serverId=Server-001 | bootId=<uuid> | swarmId=demo | state=COMPLETED | targets=2 | attempts=2 | successes=2 | failures=0 | skipped=0 | cancelled=0
+```
+
+Run logging, protocol, scheduler, and lifecycle coverage with terminal output:
+
+```powershell
+mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=GossipLogTest,GossipCommandsTest,GossipTransportTest,GossipRuntimeTest,GossipDepartureTest" "-Dmaven.test.redirectTestOutputToFile=false"
+```
+
+The packaged-JAR suite additionally captures real child-JVM standard error, verifies one departure outcome after repeated `leave` and host close, and prints `Gossip logging test PASSED` with the verified entry. Run it through the standalone project's `mvn verify` workflow below.
+
 ## Asynchronous departure (implemented)
 
 `leave` accepts only the `operation` parameter. Under the runtime lock it publishes local terminal `LEFT` once, stops heartbeats and ordinary peer selection, interrupts existing ordinary workers, and wakes the scheduler. The handler performs no DNS, outbound socket work, or joining. Concurrent/repeated requests share this transition and return the current `departure` snapshot; they never create a second dissemination attempt. A stopped instance that never requested departure rejects `leave` with `INVALID_PARAMETERS`.
@@ -411,7 +443,7 @@ Use JUnit and the existing real-socket/external-JAR approach. Mockito and replac
 
 Use fake elapsed time for precise expiry tests and eventual assertions with bounded deadlines for live convergence. Record observed convergence times rather than promising logarithmic timing from the general gossip model. Verify startup rollback after a later provider fails, so cleanup covers gossip workers that were already scheduled.
 
-The plugin currently has 186 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml clean verify "-Dmaven.test.redirectTestOutputToFile=true"` after the capacity and seed-selection changes. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
+The plugin currently has 204 unit/real-socket tests and eight packaged-JAR integration test cases, all passing on Java 27. The latest verification on 2026-10-15 ran `mvn -B -f plugins/gossip-plugin/pom.xml clean verify "-Dmaven.test.redirectTestOutputToFile=true"` after operational logging and the shutdown-status fix. Test output from that run is under `plugins/gossip-plugin/target/surefire-reports/` and `plugins/gossip-plugin/target/failsafe-reports/`; use `false` for terminal output. The unchanged host suite previously passed all 327 tests with `mvn -o test` during departure/lifecycle completion. The rebuilt JAR contains `gossip/GossipPlugin.class`, registers `gossip.GossipPlugin`, and contains no `example` package. Root `mvn test` does not run the separate plugin project; use its `mvn verify` command above.
 
 In addition to configuration and deterministic-clock model coverage, command/transport tests verify real two-node exchanges, Unicode/null metadata, exact envelope byte boundaries, oversized UTF-8 replies, strict paging/cursors, independent rotating batches, identity/version/swarm failures, remote capacity errors, self-contact aliases, concurrency caps, read-idle and trickle deadlines, interruption, and close cancellation. Runtime tests cover jitter/backoff, fair priority/scan batches, heartbeat/maintenance while saturated, late seeds, three-node convergence, restart recovery, unchanged echo/HTTP/admin behavior, incompatible swarms, active-exchange startup rollback, and stalled TCP/DNS cleanup. Real helper processes exercise lookup caching, timeout, invalid output, and cancellation.
 
@@ -443,7 +475,7 @@ Propagation and recovery runs print `GOSSIP_MEASURE` observations; capacity case
 mvn -f plugins/gossip-plugin/pom.xml "-Dtest=GossipCapacityTest,GossipPropagationTest,GossipRecoveryLoadTest" test "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
-The successful full-suite run on 2026-10-15 produced these observations (milliseconds):
+The earlier capacity/seed-selection full-suite run on 2026-10-15 produced these observations (milliseconds):
 
 | Profile | Convergence | Recovery | Saturated cleanup | Other observations |
 |---|---:|---:|---:|---|
