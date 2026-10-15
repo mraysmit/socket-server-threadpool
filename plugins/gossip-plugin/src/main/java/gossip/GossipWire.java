@@ -90,6 +90,17 @@ public final class GossipWire {
         return bytes(new CommandRequest(1, BUDGET_ID, "gossip", parameters));
     }
 
+    /** Exact available UTF-8 bytes; the empty members array already accounts for brackets. */
+    int requestMemberBudget(MemberRecord self) {
+        return config.maxExchangeBytes() - requestBytes(parameters(self, List.of())).length;
+    }
+
+    /** Reserve the largest legal host connection ID because the handler cannot see the actual ID. */
+    int replyMemberBudget(MemberRecord self) {
+        return config.maxExchangeBytes() - bytes(new CommandReply(1, BUDGET_ID, self.key().serverId(),
+                Long.MAX_VALUE, "OK", result(self, List.of()), null)).length;
+    }
+
     /** UUIDs have fixed serialized width; Long.MAX_VALUE reserves the largest legal connection ID. */
     public boolean replyFits(String serverId, Object result) {
         return bytes(new CommandReply(1, BUDGET_ID, serverId, Long.MAX_VALUE, "OK", result, null)).length

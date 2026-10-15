@@ -16,59 +16,139 @@
 package gossip;
 
 import java.util.ArrayList;
-import java.util.List;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Map;
-import java.util.function.Predicate;
+import java.util.function.ToIntFunction;
 
-/** Each runtime direction owns its own cursor; only included records advance it. */
+/** Per-direction fair selection. JSON size calculation never holds the queue/cursor lock. */
 final class GossipBatchSelector {
+    private final RecordSizes sizes;
+    private final Map<MemberKey, Entry> entries = new HashMap<>();
+    private final ArrayList<Entry> scan = new ArrayList<>();
+    private final LinkedHashSet<Entry> departures = new LinkedHashSet<>();
+    private final LinkedHashSet<Entry> changes = new LinkedHashSet<>();
     private int cursor;
     private boolean priorityTurn = true;
-    private final Map<MemberKey, Version> seen = new HashMap<>();
-    private final LinkedHashSet<MemberKey> priority = new LinkedHashSet<>();
+    private long generation;
 
-    synchronized List<MemberRecord> select(MembershipTable.Snapshot snapshot, int maxBatch,
-                                            Predicate<List<MemberRecord>> fits) {
-        var candidates = snapshot.members().stream().map(MembershipTable.MemberView::record)
-                .filter(record -> !record.key().equals(snapshot.self().key())).toList();
-        var selected = new ArrayList<MemberRecord>();
-        var indices = new HashMap<MemberKey, Integer>();
-        for (int i = 0; i < candidates.size(); i++) { indices.put(candidates.get(i).key(), i); }
-        seen.keySet().retainAll(indices.keySet());
-        priority.retainAll(indices.keySet());
-        for (var record : candidates) {
-            var version = new Version(record.heartbeat(), record.state());
-            if (!version.equals(seen.put(record.key(), version))) { priority.remove(record.key()); priority.add(record.key()); }
+    GossipBatchSelector() { this(MemberRecord::serializedBytes); }
+
+    /** The size function encodes one immutable record, never an accumulating message. */
+    GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) { sizes = new RecordSizes(encodedSize); }
+
+    /** Budget is the complete envelope's remaining bytes after encoding it with an empty member array. */
+    List<MemberRecord> select(MembershipTable.Snapshot snapshot, int maxBatch, int memberByteBudget) {
+        if (maxBatch < 1) { throw new IllegalArgumentException("Batch limit must include the sender"); }
+        if (memberByteBudget < 0) { throw GossipWire.invalid("Local sender exceeds the exchange budget"); }
+        var prepared = sizes.prepare(snapshot);
+        if (maxBatch > 1) {
+            for (var record : prepared) { if (record.bytes < 0) { record.prepareSize(sizes.encodedSize); } }
         }
-        if (!fits.test(selected)) { throw GossipWire.invalid("Local sender exceeds the exchange budget"); }
-        if (candidates.isEmpty() || maxBatch == 1) { return List.of(); }
-        int position = Math.floorMod(cursor, candidates.size());
-        var included = new HashSet<MemberKey>();
-        while (selected.size() < maxBatch - 1 && selected.size() < candidates.size()) {
-            while (included.contains(candidates.get(position).key())) { position = (position + 1) % candidates.size(); }
-            MemberKey preferred = null;
-            if (priorityTurn) {
-                preferred = priority.stream().filter(key -> candidates.get(indices.get(key)).state() == MemberRecord.State.LEFT)
-                        .findFirst().orElseGet(() -> priority.stream().findFirst().orElse(null));
+        return selectPrepared(prepared, maxBatch, memberByteBudget);
+    }
+
+    private synchronized List<MemberRecord> selectPrepared(List<SizedRecord> prepared, int maxBatch, int remaining) {
+        refresh(prepared);
+        int limit = Math.min(maxBatch - 1, scan.size());
+        if (limit == 0) { return List.of(); }
+        var selected = new ArrayList<MemberRecord>(limit);
+        int position = Math.floorMod(cursor, scan.size());
+        while (selected.size() < limit) {
+            while (scan.get(position).included) { position = (position + 1) % scan.size(); }
+            Entry candidate = scan.get(position);
+            if (priorityTurn && (!departures.isEmpty() || !changes.isEmpty())) {
+                candidate = !departures.isEmpty() ? departures.getFirst() : changes.getFirst();
             }
-            MemberRecord candidate = preferred == null ? candidates.get(position) : candidates.get(indices.get(preferred));
-            selected.add(candidate);
-            if (!fits.test(selected)) {
-                selected.removeLast();
+            long bytes = (long) candidate.sized.bytes + (selected.isEmpty() ? 0 : 1); // JSON array commas.
+            if (bytes > remaining) {
                 if (selected.isEmpty()) { throw GossipWire.invalid("Single member cannot fit beside the local sender"); }
                 break;
             }
-            included.add(candidate.key());
-            priority.remove(candidate.key());
+            selected.add(candidate.sized.record);
+            remaining -= (int) bytes;
+            candidate.included = true;
+            departures.remove(candidate);
+            changes.remove(candidate);
             priorityTurn = !priorityTurn;
-            if (candidate.key().equals(candidates.get(position).key())) { position = (position + 1) % candidates.size(); }
+            if (candidate.index == position) { position = (position + 1) % scan.size(); }
         }
         cursor = position;
         return List.copyOf(selected);
     }
 
-    private record Version(long heartbeat, MemberRecord.State state) { }
+    private void refresh(List<SizedRecord> prepared) {
+        long current = ++generation;
+        scan.clear();
+        for (var sized : prepared) {
+            var key = sized.record.key();
+            Entry entry = entries.get(key);
+            boolean changed = entry == null || entry.sized.record.heartbeat() != sized.record.heartbeat()
+                    || entry.sized.record.state() != sized.record.state();
+            if (entry == null) { entry = new Entry(); entries.put(key, entry); }
+            entry.sized = sized;
+            entry.index = scan.size();
+            entry.included = false;
+            entry.generation = current;
+            scan.add(entry);
+            if (changed) {
+                departures.remove(entry);
+                changes.remove(entry);
+                (sized.record.state() == MemberRecord.State.LEFT ? departures : changes).add(entry);
+            }
+        }
+        var iterator = entries.values().iterator();
+        while (iterator.hasNext()) {
+            var entry = iterator.next();
+            if (entry.generation != current) { departures.remove(entry); changes.remove(entry); iterator.remove(); }
+        }
+    }
+
+    private static final class Entry {
+        SizedRecord sized;
+        int index;
+        boolean included;
+        long generation;
+    }
+
+    /** A record can be shared by concurrent prepared snapshots; encode its size only once. */
+    private static final class SizedRecord {
+        final MemberRecord record;
+        volatile int bytes = -1;
+        long generation; // Accessed only under the RecordSizes monitor.
+        SizedRecord(MemberRecord record) { this.record = record; }
+        synchronized void prepareSize(ToIntFunction<MemberRecord> encodedSize) {
+            if (bytes < 0) {
+                int measured = encodedSize.applyAsInt(record);
+                if (measured < 1) { throw new IllegalArgumentException("Encoded record size must be positive"); }
+                bytes = measured;
+            }
+        }
+    }
+
+    /** Reuses immutable records and prunes removed cache keys on every prepared snapshot. */
+    private static final class RecordSizes {
+        final ToIntFunction<MemberRecord> encodedSize;
+        private final Map<MemberKey, SizedRecord> cache = new HashMap<>();
+        private long generation;
+        RecordSizes(ToIntFunction<MemberRecord> encodedSize) { this.encodedSize = java.util.Objects.requireNonNull(encodedSize); }
+        synchronized List<SizedRecord> prepare(MembershipTable.Snapshot snapshot) {
+            long current = ++generation;
+            var prepared = new ArrayList<SizedRecord>(snapshot.members().size());
+            for (var member : snapshot.members()) {
+                var record = member.record();
+                if (record.key().equals(snapshot.self().key())) { continue; }
+                var sized = cache.get(record.key());
+                if (sized == null || (sized.record != record && !sized.record.equals(record))) {
+                    sized = new SizedRecord(record);
+                    cache.put(record.key(), sized);
+                }
+                sized.generation = current;
+                prepared.add(sized);
+            }
+            cache.values().removeIf(record -> record.generation != current);
+            return prepared;
+        }
+    }
 }

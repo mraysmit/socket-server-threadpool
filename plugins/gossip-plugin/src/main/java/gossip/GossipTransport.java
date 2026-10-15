@@ -94,8 +94,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                     && peer.port() == snapshot.self().port() && peer.host().equals(snapshot.self().host())) {
                 throw new IOException("Cannot exchange with the local endpoint");
             }
-            var members = requests.select(snapshot, config.maxBatchMembers(), batch ->
-                    wire.requestBytes(wire.parameters(snapshot.self(), batch)).length <= config.maxExchangeBytes());
+            var members = requests.select(snapshot, config.maxBatchMembers(), wire.requestMemberBudget(snapshot.self()));
             messageId = UUID.randomUUID();
             byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members)));
             if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }

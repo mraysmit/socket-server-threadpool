@@ -96,9 +96,9 @@ final class GossipCommands {
             throw failure;
         }
         var snapshot = table.snapshot();
-        var batch = responses.select(snapshot, config.maxBatchMembers(), members ->
-                wire.replyFits(snapshot.self().key().serverId(), wire.result(snapshot.self(), members)));
+        var batch = responses.select(snapshot, config.maxBatchMembers(), wire.replyMemberBudget(snapshot.self()));
         var result = wire.result(snapshot.self(), batch);
+        wire.requireReplyFits(snapshot.self().key().serverId(), result);
         metrics.success(false);
         return result;
     }
