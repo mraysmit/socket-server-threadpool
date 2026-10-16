@@ -77,6 +77,23 @@ class MembershipTableTest {
         return table.snapshot().members().stream().filter(member -> member.record().key().equals(key)).findFirst().orElseThrow();
     }
 
+    @Test void peersAreTheSnapshotRecordsWithoutTheLocalOneInTheSameOrder() {
+        var table = table();
+        java.util.function.Supplier<List<MemberRecord>> expected = () -> table.snapshot().members().stream()
+                .map(MembershipTable.MemberView::record).filter(record -> !record.key().equals(self.key())).toList();
+        assertEquals(List.of(), table.peers());
+        table.merge(List.of(peer, member("Other", 3, 1)));
+        assertEquals(2, table.peers().size());
+        assertEquals(expected.get(), table.peers());
+        table.merge(List.of(departed(version(peer, 2))));
+        table.advanceLocal();
+        assertEquals(expected.get(), table.peers());
+        clock.advance(60);
+        table.maintain();
+        assertEquals(List.of(), table.peers());
+        assertThrows(UnsupportedOperationException.class, () -> table.peers().add(peer));
+    }
+
     @Test void duplicateAndOlderHeartbeatsCannotKeepForwardedRecordsFresh() {
         var table = table();
         table.merge(List.of(peer));

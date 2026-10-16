@@ -120,11 +120,11 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         if (!permits.tryAcquire()) { throw new BusyException(); }
         UUID messageId = null;
         try {
-            var snapshot = table.snapshot();
-            if (PeerSelector.isSelf(snapshot.self(), peer)) {
+            var self = table.self();
+            if (PeerSelector.isSelf(self, peer)) {
                 throw new IOException("Cannot exchange with the local endpoint");
             }
-            var members = requests.select(snapshot, config.maxBatchMembers(), wire.requestMemberBudget(snapshot.self()));
+            var members = requests.select(table.peers(), config.maxBatchMembers(), wire.requestMemberBudget(self));
             // Resolve once; both protocol attempts and all address fallbacks share one permit and one deadline.
             var candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port())).toList();
             long deadline = System.nanoTime() + exchangeNanos;
@@ -133,7 +133,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             boolean downgraded = false;
             while (true) {
                 messageId = UUID.randomUUID();
-                byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members, version)));
+                byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(self, members, version)));
                 if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
                 var line = exchangeBytes(candidates, payload, deadline);
                 candidates = List.of(line.address()); // A version retry reuses the address that answered.

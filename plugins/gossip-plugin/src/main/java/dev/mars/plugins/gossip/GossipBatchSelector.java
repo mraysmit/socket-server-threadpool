@@ -22,7 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.ToIntFunction;
 
-/** Per-direction fair selection. Record sizes are measured before taking the queue/cursor lock. */
+/** Per-direction fair selection. Sizes are read under the lock, and only for the records a batch considers. */
 final class GossipBatchSelector {
     private final ToIntFunction<MemberRecord> encodedSize;
     private final Map<MemberKey, Entry> entries = new HashMap<>();
@@ -34,31 +34,22 @@ final class GossipBatchSelector {
     private boolean priorityTurn = true;
     private long generation;
 
-    /** MemberRecord computes its size once and caches it, so the selector keeps no size cache of its own. */
+    /** MemberRecord computes its size when it is built, so reading it is cheap and the selector caches nothing. */
     GossipBatchSelector() { this(MemberRecord::serializedBytes); }
 
     GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) { this.encodedSize = java.util.Objects.requireNonNull(encodedSize); }
 
-    /** Budget is the complete envelope's remaining bytes after encoding it with an empty member array. */
-    List<MemberRecord> select(MembershipTable.Snapshot snapshot, int maxBatch, int memberByteBudget) {
+    /**
+     * Records are the candidates in table order, without the local record, which travels as the sender. Budget is
+     * the complete envelope's remaining bytes after encoding it with an empty member array.
+     */
+    synchronized List<MemberRecord> select(List<MemberRecord> records, int maxBatch, int memberByteBudget) {
         if (maxBatch < 1) { throw new IllegalArgumentException("Batch limit must include the sender"); }
         if (memberByteBudget < 0) { throw GossipWire.invalid("Local sender exceeds the exchange budget"); }
-        var prepared = new ArrayList<Sized>(snapshot.members().size());
-        for (var member : snapshot.members()) {
-            var record = member.record();
-            if (record.key().equals(snapshot.self().key())) { continue; }
-            // A sender-only batch never needs a member's size.
-            int bytes = maxBatch > 1 ? encodedSize.applyAsInt(record) : 0;
-            if (maxBatch > 1 && bytes < 1) { throw new IllegalArgumentException("Encoded record size must be positive"); }
-            prepared.add(new Sized(record, bytes));
-        }
-        return selectPrepared(prepared, maxBatch, memberByteBudget);
-    }
-
-    private synchronized List<MemberRecord> selectPrepared(List<Sized> prepared, int maxBatch, int remaining) {
-        refresh(prepared);
+        refresh(records);
         int limit = Math.min(maxBatch - 1, scan.size());
         if (limit == 0) { return List.of(); }
+        int remaining = memberByteBudget;
         var selected = new ArrayList<MemberRecord>(limit);
         // Resume at the member that was next, wherever it now is; if it was removed, its successor took its index.
         Entry next = cursorKey == null ? null : entries.get(cursorKey);
@@ -69,12 +60,14 @@ final class GossipBatchSelector {
             if (priorityTurn && (!departures.isEmpty() || !changes.isEmpty())) {
                 candidate = !departures.isEmpty() ? departures.getFirst() : changes.getFirst();
             }
-            long bytes = (long) candidate.sized.bytes + (selected.isEmpty() ? 0 : 1); // JSON array commas.
+            int size = encodedSize.applyAsInt(candidate.record);
+            if (size < 1) { throw new IllegalArgumentException("Encoded record size must be positive"); }
+            long bytes = (long) size + (selected.isEmpty() ? 0 : 1); // JSON array commas.
             if (bytes > remaining) {
                 if (selected.isEmpty()) { throw GossipWire.invalid("Single member cannot fit beside the local sender"); }
                 break;
             }
-            selected.add(candidate.sized.record);
+            selected.add(candidate.record);
             remaining -= (int) bytes;
             candidate.included = true;
             departures.remove(candidate);
@@ -83,20 +76,20 @@ final class GossipBatchSelector {
             if (candidate.index == position) { position = (position + 1) % scan.size(); }
         }
         cursor = position;
-        cursorKey = scan.get(position).sized.record().key();
+        cursorKey = scan.get(position).record.key();
         return List.copyOf(selected);
     }
 
-    private void refresh(List<Sized> prepared) {
+    private void refresh(List<MemberRecord> records) {
         long current = ++generation;
         scan.clear();
-        for (var sized : prepared) {
-            var key = sized.record.key();
+        for (var record : records) {
+            var key = record.key();
             Entry entry = entries.get(key);
-            boolean changed = entry == null || entry.sized.record.heartbeat() != sized.record.heartbeat()
-                    || entry.sized.record.state() != sized.record.state();
+            boolean changed = entry == null || entry.record.heartbeat() != record.heartbeat()
+                    || entry.record.state() != record.state();
             if (entry == null) { entry = new Entry(); entries.put(key, entry); }
-            entry.sized = sized;
+            entry.record = record;
             entry.index = scan.size();
             entry.included = false;
             entry.generation = current;
@@ -104,9 +97,11 @@ final class GossipBatchSelector {
             if (changed) {
                 departures.remove(entry);
                 changes.remove(entry);
-                (sized.record.state() == MemberRecord.State.LEFT ? departures : changes).add(entry);
+                (record.state() == MemberRecord.State.LEFT ? departures : changes).add(entry);
             }
         }
+        // Table keys are distinct, so each record refreshed its own entry: only a shrunken table leaves stale ones.
+        if (entries.size() == scan.size()) { return; }
         var iterator = entries.values().iterator();
         while (iterator.hasNext()) {
             var entry = iterator.next();
@@ -114,10 +109,8 @@ final class GossipBatchSelector {
         }
     }
 
-    private record Sized(MemberRecord record, int bytes) { }
-
     private static final class Entry {
-        Sized sized;
+        MemberRecord record;
         int index;
         boolean included;
         long generation;

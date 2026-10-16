@@ -99,13 +99,13 @@ final class GossipCommands {
             }
             throw failure;
         }
-        var snapshot = table.snapshot();
+        self = table.self(); // A round may have advanced the local heartbeat since it was read above.
         var admission = merge.senderAdmission();
         // The batch stays within what the empty reply leaves, and sizes are additive, so the reply fits without
         // being encoded again just to check; the host encodes it once, to send it.
-        var batch = responses.select(snapshot, config.maxBatchMembers(),
-                wire.replyMemberBudget(snapshot.self(), incoming.gossipVersion(), admission));
-        var result = wire.result(snapshot.self(), batch, incoming.gossipVersion(), admission);
+        var batch = responses.select(table.peers(), config.maxBatchMembers(),
+                wire.replyMemberBudget(self, incoming.gossipVersion(), admission));
+        var result = wire.result(self, batch, incoming.gossipVersion(), admission);
         metrics.success(false);
         return result;
     }

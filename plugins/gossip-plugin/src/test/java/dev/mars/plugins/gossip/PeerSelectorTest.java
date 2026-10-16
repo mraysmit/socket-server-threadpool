@@ -19,6 +19,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -33,8 +34,10 @@ class PeerSelectorTest {
     private final AtomicLong clock = new AtomicLong();
     private final MemberRecord self = record("Self", 1, 9000);
 
-    static MemberRecord record(String id, long boot, int port) {
-        return new MemberRecord(new MemberKey(id, new UUID(0, boot)), "127.0.0.1", port, 1, MemberRecord.State.ALIVE, Map.of());
+    static MemberRecord record(String id, long boot, int port) { return at(id, boot, "127.0.0.1", port); }
+
+    private static MemberRecord at(String id, long boot, String host, int port) {
+        return new MemberRecord(new MemberKey(id, new UUID(0, boot)), host, port, 1, MemberRecord.State.ALIVE, Map.of());
     }
 
     private GossipConfig config(int fanout, String seeds) {
@@ -55,6 +58,20 @@ class PeerSelectorTest {
         assertTrue(selected.stream().noneMatch(peer -> peer.port() == 9000));
         assertEquals(1, selector.select(table.snapshot(), Set.of(selected.getFirst()), 2).size());
         assertTrue(selector.select(table.snapshot(), Set.of(), 0).isEmpty());
+    }
+
+    @Test void endpointsWrittenDifferentlyAreStillRecognisedAsSelfOrBusy() {
+        var config = config(8, "Self@[0:0:0:0:0:0:0:1]:9000,Seed@[::1]:9010");
+        var table = new MembershipTable(config, at("Self", 1, "::1", 9000), clock::get);
+        // The local address written in full, busy endpoints written differently from the busy set, and neighbours
+        // that share the local port at other addresses, as when every node listens on the same port.
+        table.merge(List.of(at("Twin", 2, "0:0:0:0:0:0:0:1", 9000), at("Busy", 3, "0:0:0:0:0:0:0:1", 9020),
+                at("Named", 4, "Node.Example", 9030), at("Free", 5, "0:0:0:0:0:0:0:1", 9040),
+                at("Neighbour", 6, "::2", 9000), at("Host", 7, "node.example", 9000)));
+        var busy = Set.of(new GossipConfig.Seed("Busy", "::1", 9020), new GossipConfig.Seed("Named", "node.example", 9030));
+        var selected = new PeerSelector(config, clock::get, new Random(12)).select(table.snapshot(), busy, 8);
+        assertEquals(Set.of("Seed", "Free", "Neighbour", "Host"),
+                selected.stream().map(GossipConfig.Seed::serverId).collect(java.util.stream.Collectors.toSet()));
     }
 
     @Test void jitteredFailureBackoffIsBoundedAndSuccessResetsIt() {
@@ -247,6 +264,35 @@ class PeerSelectorTest {
         assertNull(GossipValidation.literal("not:an:address"));
         assertTrue(PeerSelector.isSelf(record("Self", 1, 9000), new GossipConfig.Seed("Self", "127.0.0.1", 9000)));
         assertFalse(PeerSelector.isSelf(record("Self", 1, 9000), new GossipConfig.Seed("Self", "other.example", 9000)));
+    }
+
+    @Test void idValidationAcceptsExactlyTheDocumentedCharactersAndLengths() {
+        var documented = java.util.regex.Pattern.compile("[A-Za-z0-9._-]{1,128}");
+        for (int c = 0; c <= 0xFFFF; c++) {
+            for (String id : List.of(String.valueOf((char) c), "a" + (char) c + "b")) {
+                assertEquals(documented.matcher(id).matches(), GossipValidation.validId(id), "U+" + Integer.toHexString(c));
+            }
+        }
+        for (int length : new int[] {0, 1, 127, 128, 129, 1000}) {
+            String id = "Ab9._-".repeat(200).substring(0, length);
+            assertEquals(documented.matcher(id).matches(), GossipValidation.validId(id), "length " + length);
+        }
+        assertFalse(GossipValidation.validId(null));
+    }
+
+    @Test void literalAnswersExactlyAsTheAddressParserDoes() {
+        // ASCII and beyond, plus look-alikes of digits and dots that a careless character check might accept.
+        var characters = new ArrayList<Integer>();
+        for (int c = 0; c < 0x800; c++) { characters.add(c); }
+        characters.addAll(List.of(0x0966, 0x2024, 0xFF0E, 0xFF10, 0xFF19, 0xFE52));
+        for (int c : characters) {
+            char character = (char) c;
+            for (String host : List.of(String.valueOf(character), "1.2.3." + character, character + "1.2.3", "1" + character + "2", "::" + character)) {
+                java.net.InetAddress expected;
+                try { expected = java.net.InetAddress.ofLiteral(host); } catch (IllegalArgumentException notLiteral) { expected = null; }
+                assertEquals(expected, GossipValidation.literal(host), "U+" + Integer.toHexString(c));
+            }
+        }
     }
 
     @Test void aliasConfirmationTakesASnapshotOnlyForASeedWhoseAddressDiffers() {

@@ -16,6 +16,7 @@
 package dev.mars.plugins.gossip;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -202,7 +203,9 @@ public final class MembershipTable {
             (entries.containsKey(key) ? updates : admissions).put(key, old);
         }
         entries.putAll(updates);
-        long active = entries.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
+        // Only admitting new keys needs the live count, so a batch of known members skips this pass over the table.
+        long active = admissions.isEmpty() ? 0
+                : entries.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
         long identities = (long) entries.size() + suppressions.size();
         var orderedAdmissions = new ArrayList<>(admissions.entrySet());
         // Restore known retained identities before spending remaining slots on genuinely new keys.
@@ -295,6 +298,15 @@ public final class MembershipTable {
     /** Server IDs with more than one reachable boot ID; cheaper than a snapshot when only this is needed. */
     public synchronized Set<String> identityConflicts() {
         return Set.copyOf(conflicts(assessments(clock.getAsLong())));
+    }
+
+    /** Every record but the local one, in table order: what a batch can forward, without a snapshot's assessments. */
+    public synchronized List<MemberRecord> peers() {
+        var peers = new ArrayList<MemberRecord>(entries.size());
+        for (Entry entry : entries.values()) {
+            if (!entry.record().key().equals(localKey)) { peers.add(entry.record()); }
+        }
+        return Collections.unmodifiableList(peers);
     }
 
     public synchronized Snapshot snapshot() {

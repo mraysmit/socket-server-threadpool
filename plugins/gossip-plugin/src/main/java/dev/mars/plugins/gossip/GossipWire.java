@@ -42,6 +42,8 @@ public final class GossipWire {
     private volatile int requestOverhead = -1;
     private volatile int worstRowExtra = -1;
     private volatile ForwardingLimits forwarding;
+    // Empty-reply bytes besides the local record and server ID: for version 1, then version 2 with each admission.
+    private volatile int[] replyOverheads;
 
     public record Exchange(MemberRecord sender, List<MemberRecord> members, int gossipVersion,
                            MembershipTable.Admission senderAdmission) {
@@ -143,7 +145,18 @@ public final class GossipWire {
      * see the actual one.
      */
     int replyMemberBudget(MemberRecord self, int version, MembershipTable.Admission admission) {
-        return config.maxExchangeBytes() - replyBytes(self.key().serverId(), result(self, List.of(), version, admission));
+        int slot = exactInteger(version, "gossipVersion", 1, 2) == 1 ? 0 : 1 + admission.ordinal();
+        int[] overheads = replyOverheads;
+        if (overheads == null) {
+            var admissions = MembershipTable.Admission.values();
+            overheads = new int[1 + admissions.length];
+            for (int i = 0; i < overheads.length; i++) {
+                var empty = i == 0 ? result(self, List.of(), 1, null) : result(self, List.of(), 2, admissions[i - 1]);
+                overheads[i] = replyBytes(self.key().serverId(), empty) - self.serializedBytes() - self.key().serverId().length();
+            }
+            replyOverheads = overheads;
+        }
+        return config.maxExchangeBytes() - overheads[slot] - self.serializedBytes() - self.key().serverId().length();
     }
 
     /** UUIDs have fixed serialized width; Long.MAX_VALUE reserves the largest legal connection ID. */

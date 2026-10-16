@@ -95,6 +95,30 @@ class GossipSizeAccountingTest {
         }
     }
 
+    @Test void replyBudgetMatchesTheEncodedEmptyReplyExactly() {
+        var config = GossipCommandsTest.config(65536, 8, 16);
+        // One wire for every local record: whatever it measures once must not depend on the record it first saw.
+        var wire = new GossipWire(config);
+        var admissions = MembershipTable.Admission.values();
+        for (String id : List.of("S", "Self", "x".repeat(128))) {
+            for (int length = 0; length <= 600; length += 37) {
+                for (int variant = 0; variant < 6; variant++) {
+                    for (var state : MemberRecord.State.values()) {
+                        var self = new MemberRecord(new MemberKey(id, new UUID(7, 1)), "host.example", 9000, length * 1_000_003L,
+                                state, metadata(length, variant));
+                        for (int slot = 0; slot <= admissions.length; slot++) {
+                            int version = slot == 0 ? 1 : 2;
+                            var admission = slot == 0 ? null : admissions[slot - 1];
+                            int encoded = wire.replyBytes(id, wire.result(self, List.of(), version, admission));
+                            assertEquals(config.maxExchangeBytes() - encoded, wire.replyMemberBudget(self, version, admission),
+                                    "id=" + id.length() + " length=" + length + " variant=" + variant + " " + state + " admission=" + admission);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test void requireForwardableDecidesExactlyAsEncodingTheEnvelopesWould() {
         var outcomes = new HashSet<String>();
         for (int batch : List.of(1, 4)) {

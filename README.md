@@ -588,10 +588,11 @@ The socket capacity cases print `Capacity test PASSED` after verifying the resul
 
 Batch selection uses separate departure and change queues and a fair rotating
 scan. It accounts for the envelope and array commas incrementally, using each
-record's UTF-8 size, which `MemberRecord` computes once and caches. Outgoing requests
-are still checked once encoded; inbound replies fit by construction, because sizes add
-up exactly, so they are not encoded twice. Each direction has its own cursor. Record sizes are
-read outside the selector's state lock.
+record's UTF-8 size, which `MemberRecord` computes from its field lengths when it
+is built. Outgoing requests are still checked once encoded; inbound replies fit by
+construction, because sizes add up exactly, so they are not encoded twice. Each
+direction has its own cursor. Selection reads the table's records rather than a
+full snapshot, and reads sizes only for the records a batch considers.
 
 Run the selector and real TCP propagation tests with terminal output:
 

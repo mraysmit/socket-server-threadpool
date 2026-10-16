@@ -49,6 +49,12 @@ public final class MemberRecord {
      * metadata limits, the codec's number-length limit (1,000 characters by default) is the only one reachable.
      */
     static final int READ_BACK_NUMBER_LENGTH = 100;
+    /**
+     * The JSON bytes of a record besides its variable-length fields: braces, quotes, commas, colons and the seven
+     * field names ({"serverId":"","bootId":"","host":"","port":,"heartbeat":,"state":"","metadata":} is 81 bytes),
+     * plus the boot ID, which as a canonical UUID is always 36.
+     */
+    private static final int FIXED_JSON_BYTES = 81 + 36;
     private final MemberKey key;
     private final String host;
     private final int port;
@@ -56,8 +62,8 @@ public final class MemberRecord {
     private final State state;
     private final Map<String, Object> metadata;
     private final int metadataBytes; // Exact UTF-8 size of the metadata as JSON, measured once when it is checked.
+    private final int serializedBytes;
     // Computed lazily; racing threads compute the same value, so plain volatile publication is enough.
-    private volatile int serializedBytes = -1;
     private volatile String fingerprint;
 
     public MemberRecord(MemberKey key, String host, int port, long heartbeat, State state, Map<String, Object> metadata) {
@@ -74,6 +80,7 @@ public final class MemberRecord {
         this.heartbeat = heartbeat;
         this.state = state;
         this.metadata = frozen;
+        serializedBytes = jsonSize(key, host, port, heartbeat, state, metadataBytes);
     }
 
     /** The same record at another heartbeat and state. Its metadata is already frozen and checked, so it is shared. */
@@ -90,6 +97,7 @@ public final class MemberRecord {
         this.state = state;
         metadata = base.metadata;
         metadataBytes = base.metadataBytes;
+        serializedBytes = jsonSize(key, host, port, heartbeat, state, metadataBytes);
     }
 
     public MemberKey key() { return key; }
@@ -114,9 +122,7 @@ public final class MemberRecord {
                 GossipWire.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
     }
 
-    public Map<String, Object> toWire() { return wire(metadata); }
-
-    private Map<String, Object> wire(Map<String, Object> metadata) {
+    public Map<String, Object> toWire() {
         var fields = new LinkedHashMap<String, Object>();
         fields.put("serverId", key.serverId());
         fields.put("bootId", key.bootId().toString());
@@ -129,13 +135,7 @@ public final class MemberRecord {
     }
 
     /** Exact UTF-8 size of {@link #toWire()} encoded as JSON, identical standalone or inside an envelope. */
-    public int serializedBytes() {
-        int bytes = serializedBytes;
-        // The metadata was measured when it was checked; only the small fixed fields are encoded here.
-        // Nested JSON encodes exactly as it does standalone, and empty metadata is the two bytes {}.
-        if (bytes < 0) { bytes = jsonBytes(wire(Map.of())).length - 2 + metadataBytes; serializedBytes = bytes; }
-        return bytes;
-    }
+    public int serializedBytes() { return serializedBytes; }
 
     /** Compact retained-version comparison; metadata key order and numeric wrapper types are normalized. */
     String fingerprint() {
@@ -263,6 +263,22 @@ public final class MemberRecord {
     private static byte[] jsonBytes(Object value) {
         try { return Json.write(value).getBytes(StandardCharsets.UTF_8); }
         catch (IOException e) { throw invalid("Member data could not be serialized as JSON"); }
+    }
+
+    /**
+     * The record's JSON size from its field lengths alone. Every field but the metadata is ASCII that JSON never
+     * escapes: a validated server ID and host, a canonical UUID, integers and an enum name. The metadata was measured
+     * when it was checked.
+     */
+    private static int jsonSize(MemberKey key, String host, int port, long heartbeat, State state, int metadataBytes) {
+        return FIXED_JSON_BYTES + key.serverId().length() + host.length() + digits(port) + digits(heartbeat)
+                + state.name().length() + metadataBytes;
+    }
+
+    private static int digits(long nonnegative) {
+        int digits = 1;
+        for (long rest = nonnegative; rest >= 10; rest /= 10) { digits++; }
+        return digits;
     }
 
     private static MembershipException invalid(String message) { return new MembershipException(INVALID_RECORD, message); }

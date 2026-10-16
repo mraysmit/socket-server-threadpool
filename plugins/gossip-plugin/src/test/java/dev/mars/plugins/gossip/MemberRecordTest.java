@@ -127,6 +127,35 @@ class MemberRecordTest {
         }
     }
 
+    @Test void serializedSizeEqualsTheActualEncodingAcrossEveryFieldWidth() throws Exception {
+        // Every digit count of the port and heartbeat, every host form, the shortest and longest server IDs, and both
+        // states, for records built directly and derived from one with another heartbeat width and state.
+        var heartbeats = new ArrayList<>(List.of(0L, Long.MAX_VALUE));
+        for (long power = 10; ; power *= 10) {
+            heartbeats.add(power - 1);
+            heartbeats.add(power);
+            if (power > Long.MAX_VALUE / 10) { break; }
+        }
+        var hosts = List.of("::1", "127.0.0.1", "255.255.255.255", "fe80::1%eth0", "2001:db8:0:0:0:0:0:1", "a", "Node-7.Example.", "h".repeat(253));
+        var metadata = List.<Map<String, Object>>of(Map.of(), Map.of("text", "\"quoted\" \\ / é 节点 😀 \u0001"));
+        for (String id : List.of("P", "Peer-12345", "x".repeat(128))) {
+            for (String host : hosts) {
+                for (int port : new int[] {1, 9, 10, 99, 100, 999, 1000, 9999, 10000, 65535}) {
+                    for (var data : metadata) {
+                        var base = new MemberRecord(new MemberKey(id, KEY.bootId()), host, port, 5, ALIVE, data);
+                        for (long heartbeat : heartbeats) {
+                            for (var state : MemberRecord.State.values()) {
+                                for (var record : List.of(new MemberRecord(base.key(), host, port, heartbeat, state, data), base.with(heartbeat, state))) {
+                                    assertEquals(Json.write(record.toWire()).getBytes(StandardCharsets.UTF_8).length, record.serializedBytes(), record::toString);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @Test void unpairedUnicodeSurrogatesCannotSilentlyChangeOnUtf8Encoding() throws Exception {
         String invalid = String.valueOf((char) 0xd800);
         assertInvalid(() -> record(Map.of("value", invalid)));

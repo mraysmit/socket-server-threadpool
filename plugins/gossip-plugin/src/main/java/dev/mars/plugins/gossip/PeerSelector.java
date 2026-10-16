@@ -15,6 +15,7 @@
  */
 package dev.mars.plugins.gossip;
 
+import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -53,20 +54,23 @@ final class PeerSelector {
         aliases.values().removeIf(alias -> now - alias.verifiedAt() >= ALIAS_NANOS);
         var candidates = new LinkedHashMap<GossipConfig.Seed, Candidate>();
         var self = snapshot.self();
+        // Every candidate is checked against the local host, so it is parsed once; each candidate's host once too.
+        var selfAddress = GossipValidation.literal(self.host());
         for (var member : snapshot.members()) {
             if (member.record().key().equals(self.key()) || member.record().state() == MemberRecord.State.LEFT) { continue; }
             var record = member.record();
             var peer = new GossipConfig.Seed(record.key().serverId(), record.host(), record.port());
-            if (!isSelf(self, peer)) {
+            var address = GossipValidation.literal(peer.host());
+            if (!isSelf(self, selfAddress, peer, address)) {
                 var candidate = new Candidate(peer, member.assessment() != MembershipTable.Assessment.ALIVE);
-                candidates.merge(canonical(peer), candidate, (a, b) -> a.recovery() ? b : a);
+                candidates.merge(canonical(peer, address), candidate, (a, b) -> a.recovery() ? b : a);
             }
         }
         for (var seed : config.seeds()) {
-            var key = canonical(seed);
-            if (!isSelf(self, seed)) {
+            var address = GossipValidation.literal(seed.host());
+            if (!isSelf(self, selfAddress, seed, address)) {
                 // A verified healthy seed remains ordinary; recovering seeds retain their DNS fallback.
-                candidates.compute(key, (ignored, known) -> known != null && !known.recovery()
+                candidates.compute(canonical(seed, address), (ignored, known) -> known != null && !known.recovery()
                         ? known : new Candidate(seed, true));
             }
         }
@@ -166,23 +170,32 @@ final class PeerSelector {
     }
     synchronized int retryCount() { return retries.size(); }
 
-    private GossipConfig.Seed canonical(GossipConfig.Seed peer) {
-        var normalized = normalized(peer);
+    private GossipConfig.Seed canonical(GossipConfig.Seed peer) { return canonical(peer, GossipValidation.literal(peer.host())); }
+
+    /** {@code address} is the peer's host already parsed, or null for a hostname. */
+    private GossipConfig.Seed canonical(GossipConfig.Seed peer, InetAddress address) {
+        var normalized = normalized(peer, address);
         Alias alias = aliases.get(normalized);
         return alias != null && clock.getAsLong() - alias.verifiedAt() < ALIAS_NANOS ? alias.endpoint() : normalized;
     }
 
-    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) {
-        var address = GossipValidation.literal(peer.host());
-        return new GossipConfig.Seed(peer.serverId(),
-                address != null ? address.getHostAddress() : peer.host().toLowerCase(Locale.ROOT), peer.port());
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) { return normalized(peer, GossipValidation.literal(peer.host())); }
+
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer, InetAddress address) {
+        String host = address != null ? address.getHostAddress() : peer.host().toLowerCase(Locale.ROOT);
+        // Most hosts are already in this form; reusing the seed avoids validating an identical copy.
+        return host.equals(peer.host()) ? peer : new GossipConfig.Seed(peer.serverId(), host, peer.port());
     }
 
     static boolean isSelf(MemberRecord self, GossipConfig.Seed peer) {
+        return isSelf(self, GossipValidation.literal(self.host()), peer, GossipValidation.literal(peer.host()));
+    }
+
+    /** As above, with both hosts already parsed (null for a hostname). */
+    private static boolean isSelf(MemberRecord self, InetAddress selfAddress, GossipConfig.Seed peer, InetAddress peerAddress) {
         if (self.port() != peer.port()) { return false; }
         if (self.host().equalsIgnoreCase(peer.host())) { return true; }
-        var address = GossipValidation.literal(self.host());
-        return address != null && address.equals(GossipValidation.literal(peer.host()));
+        return selfAddress != null && selfAddress.equals(peerAddress);
     }
 
     private record Retry(int failures, long attempted, long delay) { }

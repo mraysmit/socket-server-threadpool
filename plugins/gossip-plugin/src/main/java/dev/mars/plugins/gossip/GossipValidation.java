@@ -21,11 +21,9 @@ import java.net.URISyntaxException;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.regex.Pattern;
 
 /** Shared lexical checks; never resolve advertised addresses during validation. */
 final class GossipValidation {
-    private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
     // Results by host. A swarm has few distinct hosts and every record repeats one, so URI parsing runs once per host.
     private static final Map<String, Boolean> HOSTS = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) { return size() > 1024; }
@@ -33,15 +31,31 @@ final class GossipValidation {
 
     private GossipValidation() { }
 
+    /** 1-128 ASCII letters, digits, dots, underscores or hyphens. Every received record is checked, so no regex. */
     static boolean validId(String value) {
-        return value != null && ID.matcher(value).matches();
+        if (value == null || value.isEmpty() || value.length() > 128) { return false; }
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** The address of an IP literal, or null for a hostname, which is recognised without throwing an exception. */
     static InetAddress literal(String host) {
-        if (host.indexOf(':') < 0 && !host.chars().allMatch(c -> c == '.' || (c >= '0' && c <= '9'))) { return null; }
+        if (host.indexOf(':') < 0 && !digitsAndDots(host)) { return null; }
         try { return InetAddress.ofLiteral(host); }
         catch (IllegalArgumentException notLiteral) { return null; }
+    }
+
+    private static boolean digitsAndDots(String host) {
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (c != '.' && (c < '0' || c > '9')) { return false; }
+        }
+        return true;
     }
 
     /** Hosts arrive from the network, so length is checked before anything is cached; the cache stays under 0.5 MB. */

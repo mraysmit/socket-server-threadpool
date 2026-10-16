@@ -32,7 +32,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicReference;
 
 import dev.mars.protocol.CommandReply;
 
@@ -41,15 +40,6 @@ import static org.junit.jupiter.api.Assertions.*;
 @Timeout(15)
 class GossipBatchSelectorTest {
     private static final MemberRecord SELF = GossipCommandsTest.member("Self", 1);
-
-    private static MembershipTable.Snapshot snapshot(MemberRecord... members) {
-        var views = new ArrayList<MembershipTable.MemberView>();
-        views.add(new MembershipTable.MemberView(SELF, MembershipTable.Assessment.ALIVE, 0, null, true, false));
-        for (var record : members) {
-            views.add(new MembershipTable.MemberView(record, MembershipTable.Assessment.CANDIDATE, 0, null, false, false));
-        }
-        return new MembershipTable.Snapshot(SELF, views, java.util.Set.of(), views.size(), views.size(), 0);
-    }
 
     private static MemberRecord member(String id, int boot, long heartbeat, MemberRecord.State state, Map<String, Object> metadata) {
         return new MemberRecord(new MemberKey(id, new UUID(0, boot)), "127.0.0.1", 9010 + boot, heartbeat, state, metadata);
@@ -64,7 +54,7 @@ class GossipBatchSelectorTest {
         for (int i = 0; i < 20; i++) {
             var owner = GossipCommandsTest.member("Peer-0", 2);
             table.merge(List.of(new MemberRecord(owner.key(), owner.host(), owner.port(), i + 2, owner.state(), Map.of())));
-            seen.add(selector.select(table.snapshot(), 2, Integer.MAX_VALUE).getFirst().key().serverId());
+            seen.add(selector.select(table.peers(), 2, Integer.MAX_VALUE).getFirst().key().serverId());
         }
         assertEquals(5, seen.size());
     }
@@ -74,11 +64,11 @@ class GossipBatchSelectorTest {
         var table = new MembershipTable(config, GossipCommandsTest.member("Self", 1));
         for (int i = 0; i < 5; i++) { table.merge(List.of(GossipCommandsTest.member("Peer-" + i, i + 2))); }
         var selector = new GossipBatchSelector();
-        selector.select(table.snapshot(), 2, Integer.MAX_VALUE);
+        selector.select(table.peers(), 2, Integer.MAX_VALUE);
         var peer = GossipCommandsTest.member("Peer-4", 6);
         table.merge(List.of(new MemberRecord(peer.key(), peer.host(), peer.port(), peer.heartbeat(), MemberRecord.State.LEFT, Map.of())));
         var selected = new HashSet<MemberKey>();
-        for (int i = 0; i < 2; i++) { selected.add(selector.select(table.snapshot(), 2, Integer.MAX_VALUE).getFirst().key()); }
+        for (int i = 0; i < 2; i++) { selected.add(selector.select(table.peers(), 2, Integer.MAX_VALUE).getFirst().key()); }
         assertTrue(selected.contains(peer.key()));
     }
 
@@ -87,51 +77,63 @@ class GossipBatchSelectorTest {
         var b = GossipCommandsTest.member("B", 3);
         var c = GossipCommandsTest.member("C", 4);
         var selector = new GossipBatchSelector(record -> 10);
-        var original = snapshot(a, b, c);
+        var original = List.of(a, b, c);
         assertEquals(List.of(a), selector.select(original, 4, 20), "Two members require 21 bytes including the comma");
         assertEquals(List.of(b), selector.select(original, 4, 20));
         var left = new MemberRecord(c.key(), c.host(), c.port(), c.heartbeat(), MemberRecord.State.LEFT, Map.of());
-        assertThrows(MembershipException.class, () -> selector.select(snapshot(a, b, left), 4, 9));
-        assertEquals(List.of(left), selector.select(snapshot(a, b, left), 2, 10));
+        assertThrows(MembershipException.class, () -> selector.select(List.of(a, b, left), 4, 9));
+        assertEquals(List.of(left), selector.select(List.of(a, b, left), 2, 10));
     }
 
     @Test void exactMemberBudgetIncludesEveryArrayCommaAndAvoidsIntegerOverflow() {
         var a = GossipCommandsTest.member("A", 2);
         var b = GossipCommandsTest.member("B", 3);
-        assertEquals(List.of(a, b), new GossipBatchSelector(record -> 10).select(snapshot(a, b), 3, 21));
-        assertEquals(List.of(a), new GossipBatchSelector(record -> Integer.MAX_VALUE).select(snapshot(a, b), 3, Integer.MAX_VALUE));
+        assertEquals(List.of(a, b), new GossipBatchSelector(record -> 10).select(List.of(a, b), 3, 21));
+        assertEquals(List.of(a), new GossipBatchSelector(record -> Integer.MAX_VALUE).select(List.of(a, b), 3, Integer.MAX_VALUE));
     }
 
     @Test void senderOnlyAndEmptyTablesNeedNoRecordEncodingAndRejectOversizedEnvelopes() {
         var calls = new AtomicInteger();
         var selector = new GossipBatchSelector(record -> { calls.incrementAndGet(); return 10; });
-        assertTrue(selector.select(snapshot(), 5, 0).isEmpty());
-        assertTrue(selector.select(snapshot(GossipCommandsTest.member("A", 2)), 1, 0).isEmpty());
+        assertTrue(selector.select(List.of(), 5, 0).isEmpty());
+        assertTrue(selector.select(List.of(GossipCommandsTest.member("A", 2)), 1, 0).isEmpty());
         assertEquals(0, calls.get());
-        assertThrows(MembershipException.class, () -> selector.select(snapshot(), 1, -1));
-        assertThrows(IllegalArgumentException.class, () -> selector.select(snapshot(), 0, 10));
+        assertThrows(MembershipException.class, () -> selector.select(List.of(), 1, -1));
+        assertThrows(IllegalArgumentException.class, () -> selector.select(List.of(), 0, 10));
+    }
+
+    @Test void sizesAreReadOnlyForTheRecordsABatchConsiders() {
+        var calls = new AtomicInteger();
+        var selector = new GossipBatchSelector(record -> { calls.incrementAndGet(); return 10; });
+        var members = new ArrayList<MemberRecord>();
+        for (int i = 0; i < 32; i++) { members.add(GossipCommandsTest.member("Peer-" + i, i + 2)); }
+        assertEquals(2, selector.select(members, 3, 1000).size());
+        assertEquals(2, calls.get(), "Only the two records selected are measured, not all 32");
+        calls.set(0);
+        assertEquals(1, selector.select(members, 3, 15).size());
+        assertEquals(2, calls.get(), "The record that did not fit is measured too, and nothing beyond it");
     }
 
     @Test void removingAnEarlierMemberDoesNotMakeTheScanSkipTheNextOne() {
         var selector = new GossipBatchSelector(record -> 10);
         var members = new ArrayList<MemberRecord>();
         for (String id : List.of("A", "B", "C", "D", "E", "F")) { members.add(GossipCommandsTest.member(id, members.size() + 2)); }
-        var all = snapshot(members.toArray(MemberRecord[]::new));
+        var all = List.copyOf(members);
         for (int i = 0; i < 3; i++) { selector.select(all, 3, 1000); } // Every record sent once; no changes pending.
         assertEquals(List.of(members.get(0), members.get(1)), selector.select(all, 3, 1000));
         // C is next. Removing B shifts C down one place; the scan must still resume at C, not skip to D.
         var withoutB = new ArrayList<>(members);
         withoutB.remove(1);
-        assertEquals(List.of(members.get(2), members.get(3)), selector.select(snapshot(withoutB.toArray(MemberRecord[]::new)), 3, 1000));
+        assertEquals(List.of(members.get(2), members.get(3)), selector.select(withoutB, 3, 1000));
     }
 
     @Test void removedRecordsArePrunedFromQueuesAndReappearAsNewCandidates() {
         var selector = new GossipBatchSelector(record -> 10);
         var a = GossipCommandsTest.member("A", 2);
         var b = GossipCommandsTest.member("B", 3);
-        selector.select(snapshot(a, b), 2, 10);
-        assertEquals(List.of(a), selector.select(snapshot(a), 2, 10));
-        var selected = selector.select(snapshot(b, a), 3, 21);
+        selector.select(List.of(a, b), 2, 10);
+        assertEquals(List.of(a), selector.select(List.of(a), 2, 10));
+        var selected = selector.select(List.of(b, a), 3, 21);
         assertEquals(java.util.Set.of(a, b), java.util.Set.copyOf(selected));
     }
 
@@ -139,9 +141,9 @@ class GossipBatchSelectorTest {
         var a = member("A", 2, 1, MemberRecord.State.ALIVE, Map.of());
         var larger = member("A", 2, 1, MemberRecord.State.ALIVE, Map.of("text", "雪".repeat(30)));
         var selector = new GossipBatchSelector();
-        selector.select(snapshot(a), 2, a.serializedBytes());
-        assertThrows(MembershipException.class, () -> selector.select(snapshot(larger), 2, a.serializedBytes()));
-        assertEquals(List.of(larger), selector.select(snapshot(larger), 2, larger.serializedBytes()));
+        selector.select(List.of(a), 2, a.serializedBytes());
+        assertThrows(MembershipException.class, () -> selector.select(List.of(larger), 2, a.serializedBytes()));
+        assertEquals(List.of(larger), selector.select(List.of(larger), 2, larger.serializedBytes()));
     }
 
     @ParameterizedTest @CsvSource({"false, 1", "false, 2", "true, 1", "true, 2"})
@@ -164,7 +166,7 @@ class GossipBatchSelectorTest {
             var wire = new GossipWire(GossipConfig.fromProperties(properties, "Self"));
             int budget = reply ? wire.replyMemberBudget(SELF, version, MembershipTable.Admission.CAPACITY) : wire.requestMemberBudget(SELF);
             assertEquals(a.serializedBytes() + b.serializedBytes() + 1 + difference, budget);
-            var selected = new GossipBatchSelector().select(snapshot(a, b), 3, budget);
+            var selected = new GossipBatchSelector().select(List.of(a, b), 3, budget);
             assertEquals(difference < 0 ? List.of(b) : members, selected);
             int encoded = reply ? GossipWire.bytes(new CommandReply(1, UUID.randomUUID(), "Self", Long.MAX_VALUE, "OK",
                     wire.result(SELF, selected, version, MembershipTable.Admission.CAPACITY), null)).length
@@ -177,7 +179,7 @@ class GossipBatchSelectorTest {
         var selector = new GossipBatchSelector();
         var members = new MemberRecord[32];
         for (int i = 0; i < members.length; i++) { members[i] = GossipCommandsTest.member("Peer-" + i, i + 2); }
-        var state = snapshot(members);
+        var state = List.of(members);
         var gate = new CountDownLatch(1);
         try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
             var batches = new ArrayList<java.util.concurrent.Future<List<MemberRecord>>>();
@@ -193,29 +195,6 @@ class GossipBatchSelectorTest {
                 selected.forEach(record -> covered.add(record.key()));
             }
             assertEquals(32, covered.size());
-        }
-    }
-
-    @Test void recordEncodingCannotHoldTheSelectorStateLockOrBlockAnIndependentEmptySnapshot() throws Exception {
-        var entered = new CountDownLatch(1);
-        var release = new CountDownLatch(1);
-        var reference = new AtomicReference<GossipBatchSelector>();
-        var selector = new GossipBatchSelector(record -> {
-            assertFalse(Thread.holdsLock(reference.get()));
-            entered.countDown();
-            try { assertTrue(release.await(5, TimeUnit.SECONDS)); }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new AssertionError(e); }
-            return record.serializedBytes();
-        });
-        reference.set(selector);
-        try (var workers = Executors.newVirtualThreadPerTaskExecutor()) {
-            try {
-                var blocked = workers.submit(() -> selector.select(snapshot(GossipCommandsTest.member("A", 2)), 2, 32768));
-                assertTrue(entered.await(2, TimeUnit.SECONDS));
-                assertTrue(workers.submit(() -> selector.select(snapshot(), 2, 0)).get(2, TimeUnit.SECONDS).isEmpty());
-                release.countDown();
-                assertEquals(1, blocked.get(2, TimeUnit.SECONDS).size());
-            } finally { release.countDown(); }
         }
     }
 }
