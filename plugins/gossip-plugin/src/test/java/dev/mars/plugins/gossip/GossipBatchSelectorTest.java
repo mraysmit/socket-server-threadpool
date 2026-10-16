@@ -162,7 +162,7 @@ class GossipBatchSelectorTest {
         for (int difference : List.of(-1, 0, 1)) {
             properties.setProperty("max.exchange.bytes", Integer.toString(actual + difference));
             var wire = new GossipWire(GossipConfig.fromProperties(properties, "Self"));
-            int budget = reply ? wire.replyMemberBudget(SELF, version) : wire.requestMemberBudget(SELF);
+            int budget = reply ? wire.replyMemberBudget(SELF, version, MembershipTable.Admission.CAPACITY) : wire.requestMemberBudget(SELF);
             assertEquals(a.serializedBytes() + b.serializedBytes() + 1 + difference, budget);
             var selected = new GossipBatchSelector().select(snapshot(a, b), 3, budget);
             assertEquals(difference < 0 ? List.of(b) : members, selected);

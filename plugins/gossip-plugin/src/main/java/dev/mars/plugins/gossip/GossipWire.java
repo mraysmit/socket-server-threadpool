@@ -137,14 +137,13 @@ public final class GossipWire {
         return config.maxExchangeBytes() - requestSize(self, List.of());
     }
 
-    /** Reserve the largest legal host connection ID because the handler cannot see the actual ID. */
-    int replyMemberBudget(MemberRecord self) {
-        return replyMemberBudget(self, 1);
-    }
-
-    int replyMemberBudget(MemberRecord self, int version) {
-        return config.maxExchangeBytes() - bytes(new CommandReply(1, BUDGET_ID, self.key().serverId(),
-                Long.MAX_VALUE, "OK", result(self, List.of(), version, MembershipTable.Admission.CAPACITY), null)).length;
+    /**
+     * Bytes left for members beside the complete empty reply with this admission. Reply sizes are additive, so a
+     * batch within this budget always fits. The largest legal connection ID is reserved because the handler cannot
+     * see the actual one.
+     */
+    int replyMemberBudget(MemberRecord self, int version, MembershipTable.Admission admission) {
+        return config.maxExchangeBytes() - replyBytes(self.key().serverId(), result(self, List.of(), version, admission));
     }
 
     /** UUIDs have fixed serialized width; Long.MAX_VALUE reserves the largest legal connection ID. */

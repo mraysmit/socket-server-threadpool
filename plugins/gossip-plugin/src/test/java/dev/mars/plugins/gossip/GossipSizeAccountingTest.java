@@ -170,6 +170,34 @@ class GossipSizeAccountingTest {
         assertTrue(pages.exactFitWithCursor, "Some page must fill the reply budget exactly while carrying a cursor");
     }
 
+    @Test void inboundRepliesAlwaysFitAndSomeFillTheByteLimitExactly() throws Exception {
+        // Growing the local record one byte at a time shifts the reply by one byte, so the limit is hit exactly.
+        var config = GossipCommandsTest.config(4096, 32, 64);
+        var wire = new GossipWire(config);
+        var records = new ArrayList<MemberRecord>();
+        for (int i = 1; i <= 24; i++) { records.add(record("Node-" + i, i, i, ascii(150 + i * 7))); }
+        var sender = record("Sender", 99, 1, ascii(0));
+        int exactFits = 0;
+        try (var host = new PageHost(config)) {
+            for (int length = 0; length <= 600; length++) {
+                var self = record("Self", 0, 1, ascii(length));
+                for (int version = 1; version <= 2; version++) {
+                    var reply = host.exchange(self, records, sender, version);
+                    int encoded = wire.replyBytes("Self", reply);
+                    assertTrue(encoded <= config.maxExchangeBytes(), "length=" + length + " version=" + version + " bytes=" + encoded);
+                    // The reply is exactly its empty envelope plus its members and their commas.
+                    var members = (List<?>) reply.get("members");
+                    var admission = version == 1 ? null : MembershipTable.Admission.valueOf((String) reply.get("senderAdmission"));
+                    int expected = wire.replyBytes("Self", wire.result(self, List.of(), version, admission)) + Math.max(0, members.size() - 1);
+                    for (var member : members) { expected += GossipWire.bytes(member).length; }
+                    assertEquals(expected, encoded);
+                    if (encoded == config.maxExchangeBytes()) { exactFits++; }
+                }
+            }
+        }
+        assertTrue(exactFits > 0, "Some reply must fill the byte limit exactly");
+    }
+
     @Test void aRecordTooLargeForTheReplyIsAlsoTooLargeForTheMembersPage() {
         // requireForwardable checks both; the page check is the stricter one, so the reply check never decides alone.
         for (int bytes : List.of(1024, 4096, 32768, 65536)) {
@@ -211,10 +239,20 @@ class GossipSizeAccountingTest {
             runtime = new GossipRuntime(config, unused, transport, metrics);
         }
 
-        void assertPagesMatch(MemberRecord self, List<MemberRecord> records, int limit, PageStats pages) throws Exception {
-            var clock = new AtomicLong(1_000_000_000L);
-            var table = new MembershipTable(config, self, clock::get);
+        private MembershipTable table(MemberRecord self, List<MemberRecord> records) {
+            var table = new MembershipTable(config, self, new AtomicLong(1_000_000_000L)::get);
             for (int start = 0; start < records.size(); start += 31) { table.merge(records.subList(start, Math.min(start + 31, records.size()))); }
+            return table;
+        }
+
+        /** One inbound exchange from {@code sender}, carrying no members, answered by a fresh table. */
+        Map<?, ?> exchange(MemberRecord self, List<MemberRecord> records, MemberRecord sender, int version) throws Exception {
+            var commands = new GossipCommands(config, table(self, records), metrics, transport, runtime);
+            return (Map<?, ?>) commands.execute(wire.parameters(sender, List.of(), version));
+        }
+
+        void assertPagesMatch(MemberRecord self, List<MemberRecord> records, int limit, PageStats pages) throws Exception {
+            var table = table(self, records);
             var commands = new GossipCommands(config, table, metrics, transport, runtime);
             var snapshot = table.snapshot();
             int position = 0;

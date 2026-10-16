@@ -43,7 +43,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 **Was:** each time a row was added, the code copied and encoded the entire page built so far. With 32 rows that was about 500 rows encoded per call, around 160 KB of JSON to produce a reply of about 30 KB.
 
-**Now:** [GossipCommands.java:122-136](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L122-L136) measures the empty page once and each row once, and keeps a running total. The total accounts for the comma between rows and the exact width of the next-page cursor. Paging decisions are unchanged, and `GossipSizeAccountingTest` checks every page against the original row-by-row algorithm. The finished page is still encoded once as a final safety check. Measured: a 32-row page went from about 485 µs to about 88 µs.
+**Now:** [GossipCommands.java:122-140](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L122-L140) measures the empty page once and each row once, and keeps a running total. The total accounts for the comma between rows and the exact width of the next-page cursor. Paging decisions are unchanged, and `GossipSizeAccountingTest` checks every page against the original row-by-row algorithm. The finished page is still encoded once as a final safety check. Measured: a 32-row page went from about 485 µs to about 88 µs.
 
 ### 3. Merging copies the whole table — fixed 2026-10-16
 
@@ -162,7 +162,9 @@ A probe showed that, within the metadata limits (4 KB, depth 16), the read-back 
 
 **Measured** (inbound exchanges, profiled): small metadata 121 µs → 89 µs (−26%); large metadata 733 µs → 424 µs (−42%). The read-back no longer appears in the profile, and size measurement fell to 21% and 1.8%.
 
-**Largest remaining costs:** encoding the reply once to check its size (24–29%), even though the host then encodes it again to send; the metadata deep copy (8–34%); and, for small metadata, encoding each record's fixed fields to measure it (21%).
+**Reply size check removed (2026-10-16).** Each inbound reply was encoded once just to confirm it fit, and the host then encoded it again to send it. The selector now gets exactly the space the empty reply leaves, using the reply's real admission value, so the reply fits by construction and is no longer encoded to check ([GossipCommands.java:102-108](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L102-L108)). A new test checks, across 1,202 replies in both protocol versions, that every reply fits, that its real size equals the arithmetic sum, and that some fill the limit exactly; a budget one byte too generous fails it. Measured back to back over three runs each, large-metadata exchanges took about 412 µs without the check and about 540 µs with it (about 24% faster); small-metadata exchanges went from 89 µs to 75 µs.
+
+**Largest remaining costs:** the metadata deep copy (12% small, 41% large), a defensive copy of untrusted input worth keeping; the merge (15–16%); and, for small metadata, encoding each record's fixed fields to measure it.
 
 ## Suggested order of work
 
