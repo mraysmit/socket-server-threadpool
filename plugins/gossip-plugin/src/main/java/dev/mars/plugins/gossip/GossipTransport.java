@@ -218,7 +218,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      * One blocking connection. Connects and reads have socket timeouts; a blocking write has none, so a watchdog
      * closes the socket once the overall deadline passes. An interrupt also ends the exchange: on a virtual thread it
      * closes the socket itself, and for a platform thread, which an interrupt does not wake from blocking socket I/O,
-     * the watchdog closes the socket within {@value #INTERRUPT_CHECK_MILLIS} ms.
+     * the watchdog closes the socket within {@value #INTERRUPT_CHECK_MILLIS} ms. The exchange waits for its watchdog
+     * to end before returning, so no thread outlives it.
      */
     private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
         checkDeadline(deadline);
@@ -257,6 +258,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 throw closedUnderneath;
             } finally {
                 watchdog.interrupt();
+                joinUninterruptibly(watchdog);
                 synchronized (this) { active.remove(socket); }
             }
         }
@@ -292,6 +294,16 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private static String decodeUtf8(byte[] bytes, int length) throws IOException {
         return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
                 .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes, 0, length)).toString();
+    }
+
+    /** Waits for a thread to end even if the caller is interrupted, keeping the caller's interrupt status. */
+    private static void joinUninterruptibly(Thread thread) {
+        boolean interrupted = Thread.interrupted();
+        while (thread.isAlive()) {
+            try { thread.join(); }
+            catch (InterruptedException e) { interrupted = true; }
+        }
+        if (interrupted) { Thread.currentThread().interrupt(); }
     }
 
     private static void checkDeadline(long deadline) throws IOException {

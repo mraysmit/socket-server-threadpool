@@ -16,7 +16,6 @@
 package dev.mars.plugins.gossip;
 
 import dev.mars.client.CommandExecutionException;
-import dev.mars.plugin.CommandPlugin;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -114,7 +113,6 @@ final class GossipRuntime implements AutoCloseable {
         started = true;
         metrics.workerState = "RUNNING";
         scheduler = Thread.ofVirtual().name("gossip-" + serverId + "-rounds").unstarted(this::run);
-        scheduler.setContextClassLoader(CommandPlugin.class.getClassLoader());
         scheduler.start();
     }
 
@@ -219,7 +217,6 @@ final class GossipRuntime implements AutoCloseable {
         for (var peer : peers) {
             boolean departing = leaving;
             var worker = Thread.ofVirtual().name("gossip-" + serverId + "-exchange").unstarted(() -> exchange(peer, departing, roundDestinations));
-            worker.setContextClassLoader(CommandPlugin.class.getClassLoader());
             workers.put(peer, worker);
             ownedWorkers.add(worker);
             metrics.workers = workers.size();

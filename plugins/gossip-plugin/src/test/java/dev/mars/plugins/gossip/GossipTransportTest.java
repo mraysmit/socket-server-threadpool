@@ -637,6 +637,49 @@ class GossipTransportTest {
         }
     }
 
+    @ParameterizedTest @ValueSource(booleans = {false, true})
+    void exchangeDoesNotReturnUntilItsWatchdogHasEnded(boolean interrupted) throws Exception {
+        var config = GossipCommandsTest.config(32768, 32, 128);
+        var polled = new CountDownLatch(1);
+        var release = new CountDownLatch(1);
+        try (var peer = new ProtocolPeer((socket, port, request) -> { });
+             var transport = new GossipTransport(config, table(config))) {
+            var completed = new CompletableFuture<Throwable>();
+            var interruptKept = new java.util.concurrent.atomic.AtomicBoolean();
+            // The watchdog of a platform caller polls the caller's interrupt status; this caller holds it in that poll.
+            var caller = new Thread(() -> {
+                try { transport.exchange(peer.endpoint()); completed.complete(new AssertionError("Expected the peer to hang up")); }
+                catch (Throwable failure) { interruptKept.set(Thread.currentThread().isInterrupted()); completed.complete(failure); }
+            }) {
+                @Override public boolean isInterrupted() {
+                    if (Thread.currentThread() != this) {
+                        boolean first = polled.getCount() > 0;
+                        polled.countDown();
+                        if (first && interrupted) { interrupt(); }
+                        boolean woken = false;
+                        while (release.getCount() > 0) {
+                            try { release.await(); } catch (InterruptedException e) { woken = true; }
+                        }
+                        if (woken) { Thread.currentThread().interrupt(); }
+                    }
+                    return super.isInterrupted();
+                }
+            };
+            caller.start();
+            try {
+                assertTrue(polled.await(2, TimeUnit.SECONDS));
+                peer.request.get(2, TimeUnit.SECONDS);
+                // The peer hangs up at once, so only the held watchdog can keep the exchange from returning.
+                assertThrows(java.util.concurrent.TimeoutException.class, () -> completed.get(300, TimeUnit.MILLISECONDS));
+                release.countDown();
+                assertInstanceOf(IOException.class, completed.get(2, TimeUnit.SECONDS));
+                assertEquals(interrupted, interruptKept.get());
+                assertTrue(caller.join(Duration.ofSeconds(2)));
+                assertEquals(0, transport.inflight());
+            } finally { release.countDown(); }
+        }
+    }
+
     @FunctionalInterface private interface Answer { void run(Socket socket, int port, CommandRequest request) throws Exception; }
 
     private static final class ProtocolPeer implements AutoCloseable {

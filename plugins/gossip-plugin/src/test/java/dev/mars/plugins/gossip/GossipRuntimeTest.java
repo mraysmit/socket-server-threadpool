@@ -231,6 +231,30 @@ class GossipRuntimeTest {
         }
     }
 
+    @Test void runtimeThreadsCarryTheContextClassLoaderTheHostSetWhenStartingThePlugin() throws Exception {
+        // The host calls plugin hooks with the plugin's own class loader as the context loader; threads the plugin
+        // starts must carry that loader too, not the host's.
+        var config = config("A@127.0.0.1:9010");
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
+        var seen = new java.util.concurrent.CompletableFuture<ClassLoader>();
+        var client = new GossipRuntime.ExchangeClient() {
+            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+                seen.complete(Thread.currentThread().getContextClassLoader());
+                throw new IOException("Only the exchange thread's context class loader matters here");
+            }
+            @Override public void close() { }
+        };
+        try (var pluginLoader = new java.net.URLClassLoader(new java.net.URL[0], getClass().getClassLoader());
+             var runtime = new GossipRuntime(config, table, client, new GossipMetrics(), System::nanoTime, new Random(1),
+                     new GossipDnsResolver(2, 1))) {
+            var starter = Thread.ofPlatform().unstarted(runtime::start);
+            starter.setContextClassLoader(pluginLoader);
+            starter.start();
+            starter.join();
+            assertSame(pluginLoader, seen.get(5, TimeUnit.SECONDS));
+        }
+    }
+
     @Test void coldHostnameAliasCannotDialTheSameEndpointTwiceEvenAfterTheFirstCallFinishes() throws Exception {
         var config = config("Peer@wait.test:9010");
         var clock = new AtomicLong();
