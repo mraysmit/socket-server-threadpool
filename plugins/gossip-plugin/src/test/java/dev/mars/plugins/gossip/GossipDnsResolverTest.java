@@ -16,6 +16,7 @@
 package dev.mars.plugins.gossip;
 
 import dev.mars.plugins.gossip.fixture.DnsProcessFixture;
+import dev.mars.testing.HostProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -38,11 +39,9 @@ class GossipDnsResolverTest {
     private final List<Process> helpers = new CopyOnWriteArrayList<>();
 
     private Process launch(String host) throws IOException {
-        Path java = Path.of(System.getProperty("java.home"), "bin", "java.exe");
-        if (!java.toFile().exists()) { java = Path.of(System.getProperty("java.home"), "bin", "java"); }
         try {
             var classpath = Path.of(DnsProcessFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
-            var process = new ProcessBuilder(java.toString(), "-Ddev.mars.announce=false", "-cp", classpath, DnsProcessFixture.class.getName(), host)
+            var process = new ProcessBuilder(HostProcess.javaExecutable().toString(), "-Ddev.mars.announce=false", "-cp", classpath, DnsProcessFixture.class.getName(), host)
                     .redirectErrorStream(true).start();
             helpers.add(process);
             return process;

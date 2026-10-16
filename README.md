@@ -531,7 +531,10 @@ mvn -f plugins/pom.xml clean verify
 ```
 
 Use `verify` rather than `test` here: the plugins need the host's test JAR, which
-is only created when the host is packaged.
+is only created when the host is packaged. For the same reason, install the host
+with `-DskipTests` if you want to skip its tests, never `-Dmaven.test.skip=true`:
+that skips compiling the test sources, so the test JAR is not built and plugin
+builds cannot resolve it.
 
 The separate [`plugins/gossip-plugin`](plugins/gossip-plugin/pom.xml) project provides
 the gossip provider, validated membership model, `exchange`, paginated `members`,

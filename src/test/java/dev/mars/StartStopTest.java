@@ -59,10 +59,9 @@ class StartStopTest {
                 output.closeEntry();
             }
         }
-        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
+        var result = runOnHostClasspath("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0",
                         "--plugins-dir", directory.toString()},
-                "send {\"instruction\":\"test.console\",\"parameters\":{}}\nquit\n",
-                HostProcess.hostClasspath());
+                "send {\"instruction\":\"test.console\",\"parameters\":{}}\nquit\n");
         assertEquals(0, result.exitCode(), result.output());
         if (registered) {
             assertCommandReplies(result, "Server-001", "result=\"Loaded from runtime JAR\"");
@@ -87,10 +86,9 @@ class StartStopTest {
 
     @Test
     void consoleExecutesJsonCommandsAndContinuesAfterPluginError() throws Exception {
-        var result = run("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
+        var result = runOnHostClasspath("dev.mars.StartStop", new String[]{"Server-001", "--port", "0", "--admin-port", "0"},
                 "send {\"instruction\":\"unknown\",\"parameters\":{}}\n"
-                + "send {\"instruction\":\"echo\",\"parameters\":{\"text\":\"still healthy\"}}\nquit\n",
-                HostProcess.hostClasspath());
+                + "send {\"instruction\":\"echo\",\"parameters\":{\"text\":\"still healthy\"}}\nquit\n");
         assertEquals(0, result.exitCode(), result.output());
         assertCommandReplies(result, "Server-001", "error=UNKNOWN_INSTRUCTION: Unknown instruction: unknown",
                 "result=\"Received: still healthy\"");
@@ -100,10 +98,9 @@ class StartStopTest {
     @Test
     void standaloneClientExecutesJsonCommand() throws Exception {
         try (var instance = ServerInstance.start(new ServerOptions("Server-001", 0, 0))) {
-            var result = run("dev.mars.client.TextMessageClient", new String[]{"--port", "" + instance.getPort(),
+            var result = runOnHostClasspath("dev.mars.client.TextMessageClient", new String[]{"--port", "" + instance.getPort(),
                     "--expected-server-id", "Server-001",
-                    "{\"instruction\":\"echo\",\"parameters\":{\"text\":\"hello world\"}}"}, "",
-                    HostProcess.hostClasspath());
+                    "{\"instruction\":\"echo\",\"parameters\":{\"text\":\"hello world\"}}"}, "");
             assertEquals(0, result.exitCode(), result.output());
             assertCommandReplies(result, "Server-001", "result=\"Received: hello world\"");
         }
@@ -209,12 +206,16 @@ class StartStopTest {
     }
 
     private Result run(String mainClass, String[] args, String input) throws Exception {
-        return run(mainClass, args, input,
-                System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")));
+        return run(HostProcess.of(mainClass, args)
+                .classpath(System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"))), input);
     }
 
-    private Result run(String mainClass, String[] args, String input, String classes) throws Exception {
-        try (var process = HostProcess.of(mainClass, args).classpath(classes).start()) {
+    private Result runOnHostClasspath(String mainClass, String[] args, String input) throws Exception {
+        return run(HostProcess.of(mainClass, args), input);
+    }
+
+    private Result run(HostProcess.Builder launch, String input) throws Exception {
+        try (var process = launch.start()) {
             process.input(input);
             process.closeInput();
             int exitCode = process.awaitExit(Duration.ofSeconds(10));

@@ -15,6 +15,7 @@
  */
 package dev.mars.testing;
 
+import dev.mars.client.CommandExecutionException;
 import dev.mars.client.TextMessageClient;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
@@ -27,7 +28,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Map;
 
+import static dev.mars.protocol.CommandError.Code.UNKNOWN_INSTRUCTION;
 import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(60)
@@ -75,6 +78,25 @@ class HostProcessTest {
             assertTrue(host.isAlive(), "Stopping servers must not end the JVM");
             assertEquals(0, host.stop(WAIT), host.outputText());
         }
+    }
+
+    @Test
+    void controllerChildLoadsNoHostTestClassesOrServiceRegistrations() throws Exception {
+        try (var host = HostProcess.controller().start()) {
+            var client = new TextMessageClient("localhost", host.startServer("Isolated", 0, 0).port(), "Isolated");
+            // math.add is registered only by the host's test resources.
+            var failure = assertThrows(CommandExecutionException.class, () -> client.execute("math.add", Map.of("a", 1, "b", 2)));
+            assertEquals(UNKNOWN_INSTRUCTION, failure.reply().error().code());
+            assertEquals(0, host.stop(WAIT), host.outputText());
+        }
+    }
+
+    @Test
+    void windowsArgumentsKeepQuotesAndBackslashes() {
+        assertEquals("{\\\"a\\\":1}", HostProcess.windowsArgument("{\"a\":1}"));
+        // Only the backslash run directly before a quote is doubled.
+        assertEquals("C:\\dir\\\\\\\"", HostProcess.windowsArgument("C:\\dir\\\""));
+        assertEquals("C:\\dir\\", HostProcess.windowsArgument("C:\\dir\\"));
     }
 
     @Test

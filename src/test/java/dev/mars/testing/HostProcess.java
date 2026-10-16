@@ -25,6 +25,7 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.InterruptedIOException;
+import java.io.UncheckedIOException;
 import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -32,6 +33,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,6 +55,7 @@ public final class HostProcess implements AutoCloseable {
     public record Ports(int port, int adminPort) { }
 
     private static final Duration REPLY_TIMEOUT = Duration.ofSeconds(15);
+    private static String mainClasspath;
     // Distinct instance compared by identity, so no child output can be mistaken for end of output.
     private static final String ENDED = new String("ended");
     private final Process process;
@@ -61,6 +64,7 @@ public final class HostProcess implements AutoCloseable {
     private final Thread reader;
     private boolean ended;
     private boolean inputClosed;
+    private boolean outOfStep;
 
     private HostProcess(Process process) {
         this.process = process;
@@ -76,7 +80,9 @@ public final class HostProcess implements AutoCloseable {
 
     /** Runs {@link HostProcessMain}, which starts and stops any number of servers on command. */
     public static Builder controller() {
-        return new Builder(HostProcessMain.class.getName(), List.of()).addToClasspath(HostProcessMain.class);
+        var builder = new Builder(HostProcessMain.class.getName(), List.of());
+        builder.classpath = builder.classpath + File.pathSeparator + mainClasspath();
+        return builder;
     }
 
     /** Runs any main class, for example a command-line client. */
@@ -92,6 +98,37 @@ public final class HostProcess implements AutoCloseable {
     public static Path javaExecutable() {
         Path windows = Path.of(System.getProperty("java.home"), "bin", "java.exe");
         return Files.exists(windows) ? windows : Path.of(System.getProperty("java.home"), "bin", "java");
+    }
+
+    /**
+     * {@link HostProcessMain} alone, copied out of its code source. In the host build that source is the whole
+     * test output, whose fixtures and service registrations would otherwise load in the child. HostProcessMain
+     * must therefore stay a single class with no nested classes.
+     */
+    private static synchronized String mainClasspath() {
+        if (mainClasspath == null) {
+            String resource = HostProcessMain.class.getName().replace('.', '/') + ".class";
+            try (var content = HostProcessMain.class.getClassLoader().getResourceAsStream(resource)) {
+                if (content == null) { throw new IllegalStateException("Cannot read " + resource); }
+                Path root = Files.createTempDirectory("host-process-main");
+                Path target = root.resolve(resource);
+                Files.createDirectories(target.getParent());
+                Files.copy(content, target);
+                // deleteOnExit runs in reverse registration order, so register the root first.
+                var created = new ArrayList<Path>();
+                for (Path path = target; !path.equals(root); path = path.getParent()) { created.add(path); }
+                created.add(root);
+                Collections.reverse(created);
+                created.forEach(path -> path.toFile().deleteOnExit());
+                mainClasspath = root.toString();
+            } catch (IOException e) { throw new UncheckedIOException("Cannot prepare the host process entry point", e); }
+        }
+        return mainClasspath;
+    }
+
+    /** Quotes for the Windows command-line parser: backslashes before a quote are doubled, then the quote escaped. */
+    static String windowsArgument(String argument) {
+        return argument.replaceAll("(\\\\*)\"", "$1$1\\\\\"");
     }
 
     private static String codeSources(Class<?>... types) {
@@ -137,14 +174,14 @@ public final class HostProcess implements AutoCloseable {
             if (holdUntil != null) {
                 main = HostProcessMain.class.getName();
                 mainArguments.addAll(0, List.of("--console-hold", holdUntil.toString()));
-                path = path + File.pathSeparator + codeSources(HostProcessMain.class);
+                path = path + File.pathSeparator + mainClasspath();
             }
             var command = new ArrayList<>(List.of(javaExecutable().toString(), "-Ddev.mars.announce=false"));
             properties.forEach((name, value) -> command.add("-D" + name + "=" + value));
             command.addAll(List.of("-cp", path, main));
             // Preserve embedded JSON quotes through Windows' native command-line parser.
             boolean windows = System.getProperty("os.name").startsWith("Windows");
-            command.addAll(mainArguments.stream().map(argument -> windows ? argument.replace("\"", "\\\"") : argument).toList());
+            command.addAll(mainArguments.stream().map(argument -> windows ? windowsArgument(argument) : argument).toList());
             return new HostProcess(new ProcessBuilder(command).redirectErrorStream(true).start());
         }
     }
@@ -155,7 +192,9 @@ public final class HostProcess implements AutoCloseable {
             while ((line = output.readLine()) != null) {
                 System.out.println(line);
                 synchronized (lines) { lines.add(line); lines.notifyAll(); }
-                if (line.startsWith(HostProcessMain.REPLY)) { replies.add(line.substring(HostProcessMain.REPLY.length())); }
+                // Not startsWith: the console's unterminated "> " prompt can precede a reply on the same line.
+                int marker = line.indexOf(HostProcessMain.REPLY);
+                if (marker >= 0) { replies.add(line.substring(marker + HostProcessMain.REPLY.length())); }
             }
         } catch (IOException closed) {
             // The process was destroyed; whatever was read remains available.
@@ -191,9 +230,9 @@ public final class HostProcess implements AutoCloseable {
                     if (match.find()) { return match.toMatchResult(); }
                 }
                 if (ended) { throw new IOException("Process output ended before " + pattern + ":\n" + outputText()); }
-                long remaining = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+                long remaining = deadline - System.nanoTime();
                 if (remaining <= 0) { throw new IOException("Timed out waiting for " + pattern + ":\n" + outputText()); }
-                try { lines.wait(remaining); }
+                try { TimeUnit.NANOSECONDS.timedWait(lines, remaining); }
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             }
         }
@@ -240,10 +279,15 @@ public final class HostProcess implements AutoCloseable {
     }
 
     private String[] reply(Duration timeout) throws IOException {
+        // A reply that arrives after a timeout would otherwise be read as the answer to the next command.
+        if (outOfStep) { throw new IOException("Host replies are out of step after an earlier timeout"); }
         String reply;
         try { reply = replies.poll(timeout.toNanos(), TimeUnit.NANOSECONDS); }
-        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
-        if (reply == null) { throw new IOException("Timed out waiting for a host reply:\n" + outputText()); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); outOfStep = true; throw new InterruptedIOException(); }
+        if (reply == null) {
+            outOfStep = true;
+            throw new IOException("Timed out waiting for a host reply:\n" + outputText());
+        }
         if (reply == ENDED) { replies.add(ENDED); throw new IOException("Host process ended:\n" + outputText()); }
         return reply.split("\t", -1);
     }

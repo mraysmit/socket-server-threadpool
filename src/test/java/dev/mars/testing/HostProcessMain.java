@@ -38,6 +38,8 @@ import java.util.concurrent.TimeUnit;
  */
 public final class HostProcessMain {
     static final String REPLY = "@host ";
+    // Any server that failed to stop cleanly makes the controller exit non-zero, even if later commands succeed.
+    private static boolean cleanupFailed;
 
     private HostProcessMain() { }
 
@@ -77,6 +79,7 @@ public final class HostProcessMain {
                 } catch (RuntimeException e) { reply("error", describe(e)); }
             }
         } finally { stopAll(servers); }
+        if (cleanupFailed) { throw new IllegalStateException("At least one server failed to stop cleanly"); }
     }
 
     private static void start(Map<String, ServerInstance> servers, String[] fields) {
@@ -95,7 +98,8 @@ public final class HostProcessMain {
     private static void stop(Map<String, ServerInstance> servers, String[] fields) {
         var server = fields.length == 2 ? servers.remove(fields[1]) : null;
         if (server == null) { throw new IllegalArgumentException("No running server: " + String.join(" ", fields)); }
-        server.close();
+        try { server.close(); }
+        catch (RuntimeException e) { cleanupFailed = true; throw e; }
         reply("stopped", fields[1]);
     }
 
@@ -103,7 +107,10 @@ public final class HostProcessMain {
         RuntimeException failure = null;
         for (var server : servers.values()) {
             try { server.close(); }
-            catch (RuntimeException e) { if (failure == null) { failure = e; } else { failure.addSuppressed(e); } }
+            catch (RuntimeException e) {
+                cleanupFailed = true;
+                if (failure == null) { failure = e; } else { failure.addSuppressed(e); }
+            }
         }
         servers.clear();
         if (failure != null) { throw failure; }
