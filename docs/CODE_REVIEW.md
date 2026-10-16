@@ -21,6 +21,8 @@ Line numbers and links refer to the code as of 2026-10-16.
 - **Address fallback.** When a peer's hostname resolves to several addresses and connecting to one fails (refused or unreachable), the same exchange now tries the others. `GossipDnsResolver.resolveAll` returns every address, and `GossipTransport` and `GossipRuntime` use it. This affects how #4 should be fixed; see the note there.
 - **Test support moved to the host.** Plugin tests now use the host's `dev.mars.testing` library. This changes no finding below.
 
+**Open:** #10 to #13, from a second pass that measured where the remaining time goes; see [Second pass](#second-pass-efficiency-deep-dive-2026-10-16).
+
 ## High impact
 
 ### 1. Re-encoding JSON only to check sizes — fixed 2026-10-16
@@ -53,7 +55,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 **Verified by** the existing rollback tests. A deliberately introduced variant that applied each update inside the loop failed five of them.
 
-**Not done:** the active-member count is still recomputed with one pass over the table per merge, rather than kept in a field. That pass allocates nothing, and keeping a counter in step across merges, expiry and departure would add more code than it saves.
+**Not done:** the active-member count is still recomputed with one pass over the table per merge, rather than kept in a field. That pass allocates nothing, and keeping a counter in step across merges, expiry and departure would add more code than it saves. The second pass found a simpler option: count only when a batch admits new members (#11).
 
 **Measured with #9:** an inbound exchange went from about 185 µs to about 166 µs.
 
@@ -164,7 +166,87 @@ A probe showed that, within the metadata limits (4 KB, depth 16), the read-back 
 
 **Reply size check removed (2026-10-16).** Each inbound reply was encoded once just to confirm it fit, and the host then encoded it again to send it. The selector now gets exactly the space the empty reply leaves, using the reply's real admission value, so the reply fits by construction and is no longer encoded to check ([GossipCommands.java:102-108](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L102-L108)). A new test checks, across 1,202 replies in both protocol versions, that every reply fits, that its real size equals the arithmetic sum, and that some fill the limit exactly; a budget one byte too generous fails it. Measured back to back over three runs each, large-metadata exchanges took about 412 µs without the check and about 540 µs with it (about 24% faster); small-metadata exchanges went from 89 µs to 75 µs.
 
-**Largest remaining costs:** the metadata deep copy (12% small, 41% large), a defensive copy of untrusted input worth keeping; the merge (15–16%); and, for small metadata, encoding each record's fixed fields to measure it.
+**Largest remaining costs:** the metadata deep copy (12% small, 41% large), a defensive copy of untrusted input worth keeping; the merge (15–16%); and, for small metadata, encoding each record's fixed fields to measure it. For production records, whose metadata is empty, that last cost is the largest of all; see #10.
+
+## Second pass: efficiency deep dive (2026-10-16)
+
+Scope: all 16 main source files at commit `d25d08c`, looking for remaining inefficiency, weak algorithms, bloat and repeated work. Findings #10 to #13 are open; none of the changes below has been made yet.
+
+**How this was measured.** In-process timings on JDK 27, taking the best of five passes after a warm-up pass, and a Java Flight Recorder profile of peer selection. Inbound exchanges carried 32 records (the sender and 31 members) against tables of 128 and 480 members. The times cover the plugin only, not the host's JSON handling or the network.
+
+**Production records carry empty metadata.** Nothing in the plugin calls `MembershipTable.updateLocal`, so every node advertises metadata `{}`; the design intends metadata for things such as a node's supported instructions ([GOSSIP_PLUGIN.md](GOSSIP_PLUGIN.md)). In a swarm of these plugins every record is small, so fixed per-record costs dominate. Records with metadata were measured too.
+
+| Plugin time | 128 members | 480 members |
+|---|---|---|
+| Inbound exchange, empty metadata (as in production) | 34 µs | 61 µs |
+| Inbound exchange, small metadata | 57 µs | 76 µs |
+| Peer selection, once per round | 55 µs | 210 µs |
+
+### 10. Each received record is encoded to JSON just to learn its size — open
+
+`serializedBytes()` puts the six fixed fields in a map and runs the JSON encoder on it ([MemberRecord.java:132-138](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L132-L138)). The result is cached, but every received record is a new object, so the encoder runs once for every record in every exchange, inbound and outbound.
+
+**Measured:** about 0.45–0.6 µs per record, roughly twice the 0.25 µs it takes to decode and validate an empty-metadata record. A 32-record exchange spends about 14–16 µs on it, roughly 40% of an empty-metadata inbound exchange at 128 members.
+
+**Suggested fix:** add up the field lengths instead. Every fixed field is ASCII that JSON never escapes: the server ID matches `[A-Za-z0-9._-]`, the boot ID is a canonical UUID, the port and heartbeat are integers, and the state is an enum name. Host validation accepts no character that JSON escapes or encodes in more than one byte; this was checked for every Unicode character in three positions in a host. A prototype took 8 ns and matched the real encoding for IPv4 and IPv6 hosts, both states, the largest heartbeat, and empty, small and large metadata.
+
+**Risk:** the arithmetic fixes the JSON layout of these fields. A test comparing it with the real encoder across field widths would catch any drift, as `GossipSizeAccountingTest` does for envelopes.
+
+### 11. Each exchange makes three passes over the whole table — open
+
+An empty-metadata inbound exchange grows from 34 µs at 128 members to 61 µs at 480, although its batch is the same size. Three passes over the table cause this, and an outbound exchange makes the same three:
+
+- **A full snapshot where only the records are needed** ([GossipCommands.java:102](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L102), [GossipTransport.java:123](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L123)). `snapshot()` assesses every entry, builds a conflict map and a `MemberView` per entry, then copies the list ([MembershipTable.java:300-315](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L300-L315), [47-50](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L47-L50)). The batch selector reads only each member's record and the local record. At 480 members the snapshot takes about 10 µs; a plain list of the records takes about 1 µs.
+- **The batch selector rebuilds its index on every call** ([GossipBatchSelector.java:43-115](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L43-L115)). It wraps every member in a `Sized` record, walks that list again in `refresh`, then sweeps its map for removed keys: about 10 µs at 480 members. The separate sizing pass dates from when the selector measured sizes itself (#1); records now cache their size, so one pass would do.
+- **The live-member recount on every merge** ([MembershipTable.java:205](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L205)). The count is used only when a batch admits new members ([MembershipTable.java:210-224](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L210-L224)), and a stable swarm admits none. Counting only in that case removes the pass without the counter field that #3 rejected. It costs about 2–5 µs at 480 members.
+
+**Suggested fix:** a records-only view of the table for the two exchange paths, a single-pass selector, and the conditional count. Peer selection, `leave`, `members` and `status` need the full snapshot and keep it.
+
+### 12. Peer selection re-validates data that is already valid — open
+
+`PeerSelector.select` is the most expensive single call in the plugin ([PeerSelector.java:51-93](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L51-L93), [169-186](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L169-L186)). Profiled at 480 members:
+
+| Share of `PeerSelector.select` | |
+|---|---|
+| Building two `Seed` objects per member, each re-running validation | 58% |
+| …of which the server ID regex alone | 44% |
+| `isSelf` parsing the local host again for every candidate | 19% |
+| The stream-based character check in `literal()` | 13% |
+| Shuffling the candidates | 0% |
+
+It runs once per round (every second by default), so even at 480 members it uses about 0.02% of a core. The fixes are small, and the first also speeds up decoding:
+
+- Check server IDs with a character loop instead of a regex ([GossipValidation.java:28-38](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L28-L38)): about 60 ns down to about 4 ns. Every received record's server ID goes through this check, so it also saves about 2 µs per 32-record exchange.
+- Use a plain loop instead of a stream in `literal()` ([GossipValidation.java:42](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L42)): about 11 ns down to 1–2 ns.
+- Parse the local host once, and each member's address once.
+
+### 13. The reply budget encodes an empty reply on every inbound exchange — open
+
+`replyMemberBudget` encodes a complete empty reply, including the local record, for every inbound exchange ([GossipWire.java:145-147](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L145-L147)). This costs about 1 µs with the empty local metadata used in production, and about 10 µs with large local metadata. It could be added up the way request sizes already are: a cached overhead for each protocol version and admission value (four in all), plus the local record's cached size.
+
+### Bloat and repeated checks
+
+These cost little at run time; the cost is in reading the code.
+
+- **Repeated checks on each inbound exchange.** Duplicate keys are checked twice ([GossipWire.java:68-75](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L68-L75), [MembershipTable.java:119-123](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L119-L123)), the batch limit four times ([GossipWire.java:64](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L64), [MembershipTable.java:108-118](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L108-L118)), and each record's size twice. The member list is copied four times. The table's checks protect its public methods and the wire checks protect the protocol, so some of the overlap is deliberate.
+- **Maps built three times.** `GossipWire.parameters` and the version-2 `GossipWire.result` build each map three times: `Map.of`, then a `LinkedHashMap`, then `Map.copyOf` ([GossipWire.java:93-112](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L93-L112)). That costs about 0.2 µs per reply; most of the time spent building a reply goes to each record's `toWire()`. Building one map is a clarity fix.
+- **About 30 lines used only by tests.** `MembershipTable.mergeEncoded`, the six-argument `Snapshot` constructor, the two-argument `Exchange` constructor, `PeerSelector.success(Seed)` and `PeerSelector.resolved(…, Snapshot)`, `GossipDnsResolver.resolve`, and four of the five `GossipTransport` constructors. Removing them means rewriting the tests that call them.
+
+### Checked and not worth changing
+
+- **Per-connection costs in the transport:** a watchdog thread, a fresh read buffer and a new decoder for each exchange. These are estimated at microseconds, against a loopback round trip of about 2 ms (#6).
+- **`identityConflicts()` after each outbound exchange:** 1–4 µs, also small against the network.
+- **The `members` command:** it still encodes each row, and a cursor per row, to size the page, but only operators call it.
+- **Copying and comparing metadata:** needed because metadata comes from untrusted peers.
+- **Expiry once per round (`maintain()`):** 0.3–1.8 µs.
+
+### Outside the plugin
+
+The host passes every plugin result through `Json.normalizeResult`, which encodes and then parses it, and then encodes the reply again to send it ([PluginRegistry.java:222](../src/main/java/dev/mars/plugin/PluginRegistry.java#L222)). Encoding a 31-record reply with small metadata takes about 20 µs, so this costs more than anything left inside the plugin. It belongs in a review of the host.
+
+### Expected effect
+
+Estimated from the measured parts, #10 to #13 together would take an empty-metadata inbound exchange from 34 µs to about 14 µs at 128 members and from 61 µs to about 27 µs at 480, and make peer selection two to three times faster. Each change should be measured before and after, as the first review's changes were.
 
 ## Suggested order of work
 
@@ -172,5 +254,10 @@ A probe showed that, within the metadata limits (4 KB, depth 16), the read-back 
 2. ~~**#5:** quick, low-risk cleanup of unneeded snapshots.~~ Done 2026-10-16.
 3. ~~**#7, #8 and the low-impact items:** small, local changes.~~ Done 2026-10-16.
 4. ~~**#3, #4 and #6:** larger refactors. Each needs its own change and careful testing of rollback, cancellation and timeout behaviour.~~ Done 2026-10-16.
+5. **#10:** the largest gain, in one method and its size test.
+6. **The recount in #11:** a one-line change.
+7. **#12:** small, local changes to validation and peer selection.
+8. **The rest of #11:** changes the batch selector and the table's interface.
+9. **#13:** a small change in `GossipWire`.
 
 The module's existing tests (`MembershipTableTest`, `GossipBatchSelectorTest`, `PeerSelectorTest`, `GossipTransportTest`, `GossipCommandsTest`, `GossipDnsResolverTest` and others) cover these areas and should be run after each change.
