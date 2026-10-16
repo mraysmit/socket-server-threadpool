@@ -91,6 +91,42 @@ class MemberRecordTest {
         assertInvalid(() -> record(Map.of("number", BigInteger.TEN.pow(1000))));
     }
 
+    @Test void everyAcceptedRecordReadsBackThroughTheHostCodecAcrossTheReadBackGate() throws Exception {
+        // The read-back runs only for long numbers, so sweep number lengths across that gate and the codec's limit.
+        int accepted = 0;
+        int rejected = 0;
+        for (int digits = 1; digits <= 1200; digits += digits < 150 ? 1 : 7) {
+            String nines = "9".repeat(digits);
+            for (Object number : List.of(new BigInteger(nines), new BigInteger("-" + nines), new BigDecimal("0." + nines),
+                    new BigDecimal("1" + nines + "E-" + (digits + 5)), new BigDecimal(nines + ".5"))) {
+                MemberRecord record;
+                try { record = record(Map.of("n", number, "list", List.of(number))); }
+                catch (MembershipException e) { rejected++; continue; }
+                accepted++;
+                String json = Json.write(record.metadata());
+                assertDoesNotThrow(() -> Json.read(json), () -> "Accepted metadata the host cannot read: " + json.length() + " chars");
+            }
+        }
+        assertTrue(accepted > 0 && rejected > 0, "The sweep must cross the codec's limit");
+        assertEquals(100, MemberRecord.READ_BACK_NUMBER_LENGTH);
+        assertInvalid(() -> record(Map.of("number", BigInteger.TEN.pow(1000))));
+        assertInvalid(() -> record(Map.of("number", new BigDecimal("0." + "9".repeat(1999)))));
+    }
+
+    @Test void serializedSizeEqualsTheActualEncodingForBuiltDerivedAndDecodedRecords() throws Exception {
+        var samples = List.<Map<String, Object>>of(Map.of(), Map.of("text", "\"quoted\" \\ / é 节点 😀 \u0001"),
+                Map.of("nested", Map.of("list", List.of(1, -2.5, true, "x")), "big", new BigInteger("123456789012345678901234567890")),
+                Map.of("long", "x".repeat(3000)));
+        for (var metadata : samples) {
+            var built = record(metadata);
+            var derived = built.with(7, MemberRecord.State.LEFT);
+            var decoded = MemberRecord.fromWire(Json.parameters(Json.read(Json.write(built.toWire()))));
+            for (var record : List.of(built, derived, decoded)) {
+                assertEquals(Json.write(record.toWire()).getBytes(StandardCharsets.UTF_8).length, record.serializedBytes(), record::toString);
+            }
+        }
+    }
+
     @Test void unpairedUnicodeSurrogatesCannotSilentlyChangeOnUtf8Encoding() throws Exception {
         String invalid = String.valueOf((char) 0xd800);
         assertInvalid(() -> record(Map.of("value", invalid)));

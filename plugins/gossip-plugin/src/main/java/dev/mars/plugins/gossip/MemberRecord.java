@@ -44,12 +44,18 @@ public final class MemberRecord {
     public static final int MAX_METADATA_BYTES = 4096;
     public static final int MAX_METADATA_DEPTH = 16;
     private static final Set<String> FIELDS = Set.of("serverId", "bootId", "host", "port", "heartbeat", "state", "metadata");
+    /**
+     * Metadata is read back through the host codec only when it holds a number at least this long. Within the
+     * metadata limits, the codec's number-length limit (1,000 characters by default) is the only one reachable.
+     */
+    static final int READ_BACK_NUMBER_LENGTH = 100;
     private final MemberKey key;
     private final String host;
     private final int port;
     private final long heartbeat;
     private final State state;
     private final Map<String, Object> metadata;
+    private final int metadataBytes; // Exact UTF-8 size of the metadata as JSON, measured once when it is checked.
     // Computed lazily; racing threads compute the same value, so plain volatile publication is enough.
     private volatile int serializedBytes = -1;
     private volatile String fingerprint;
@@ -59,8 +65,9 @@ public final class MemberRecord {
                 || heartbeat < 0 || state == null || metadata == null) {
             throw invalid("Member requires identity, host, port 1-65535, nonnegative heartbeat, state, and metadata");
         }
-        var frozen = freezeObject(metadata, 0, new Budget());
-        validateMetadata(frozen);
+        var budget = new Budget();
+        var frozen = freezeObject(metadata, 0, budget);
+        metadataBytes = validateMetadata(frozen, budget.longestNumber);
         this.key = key;
         this.host = host;
         this.port = port;
@@ -82,6 +89,7 @@ public final class MemberRecord {
         this.heartbeat = heartbeat;
         this.state = state;
         metadata = base.metadata;
+        metadataBytes = base.metadataBytes;
     }
 
     public MemberKey key() { return key; }
@@ -106,7 +114,9 @@ public final class MemberRecord {
                 GossipWire.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
     }
 
-    public Map<String, Object> toWire() {
+    public Map<String, Object> toWire() { return wire(metadata); }
+
+    private Map<String, Object> wire(Map<String, Object> metadata) {
         var fields = new LinkedHashMap<String, Object>();
         fields.put("serverId", key.serverId());
         fields.put("bootId", key.bootId().toString());
@@ -121,7 +131,9 @@ public final class MemberRecord {
     /** Exact UTF-8 size of {@link #toWire()} encoded as JSON, identical standalone or inside an envelope. */
     public int serializedBytes() {
         int bytes = serializedBytes;
-        if (bytes < 0) { bytes = jsonBytes(toWire()).length; serializedBytes = bytes; }
+        // The metadata was measured when it was checked; only the small fixed fields are encoded here.
+        // Nested JSON encodes exactly as it does standalone, and empty metadata is the two bytes {}.
+        if (bytes < 0) { bytes = jsonBytes(wire(Map.of())).length - 2 + metadataBytes; serializedBytes = bytes; }
         return bytes;
     }
 
@@ -199,7 +211,9 @@ public final class MemberRecord {
             if (!Double.isFinite(decimal)) { throw invalid("metadata numbers must be finite"); }
             number = canonicalDecimal(new BigDecimal(value.toString()));
         } else { throw invalid("metadata must contain only JSON values"); }
-        budget.take(number.toString().length());
+        String text = number.toString();
+        budget.take(text.length());
+        budget.longestNumber = Math.max(budget.longestNumber, text.length());
         return number;
     }
 
@@ -234,14 +248,15 @@ public final class MemberRecord {
         }
     }
 
-    private static void validateMetadata(Map<String, Object> metadata) {
+    /** Checks the exact UTF-8 size and that the host codec can read the metadata back; returns the size. */
+    private static int validateMetadata(Map<String, Object> metadata, int longestNumber) {
         try {
             String json = Json.write(metadata);
-            if (json.getBytes(StandardCharsets.UTF_8).length > MAX_METADATA_BYTES) {
-                throw invalid("metadata exceeds " + MAX_METADATA_BYTES + " UTF-8 bytes");
-            }
-            // Also respect the host codec's number-length and other parsing constraints.
-            Json.read(json);
+            int bytes = json.getBytes(StandardCharsets.UTF_8).length;
+            if (bytes > MAX_METADATA_BYTES) { throw invalid("metadata exceeds " + MAX_METADATA_BYTES + " UTF-8 bytes"); }
+            // Reading back is the costliest step, and only a long number can fail it within these limits.
+            if (longestNumber >= READ_BACK_NUMBER_LENGTH) { Json.read(json); }
+            return bytes;
         } catch (IOException e) { throw invalid("metadata cannot round trip through the host JSON codec"); }
     }
 
@@ -255,6 +270,7 @@ public final class MemberRecord {
     /** Cheap allocation bound before exact UTF-8 serialization (escaping can use more bytes). */
     private static final class Budget {
         private long remaining = MAX_METADATA_BYTES;
+        int longestNumber;
         void take(long count) {
             remaining -= count;
             if (remaining < 0) { throw invalid("metadata exceeds " + MAX_METADATA_BYTES + " bytes"); }

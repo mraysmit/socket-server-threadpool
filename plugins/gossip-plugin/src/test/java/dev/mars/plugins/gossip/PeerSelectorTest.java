@@ -219,6 +219,24 @@ class PeerSelectorTest {
         assertEquals("E", selector.select(unverified.apply(withoutB), Set.of(), 1).getFirst().serverId());
     }
 
+    @Test void hostValidationGivesTheSameAnswerWhenCachedAndAcrossEviction() {
+        for (int pass = 0; pass < 2; pass++) {
+            // The second pass is answered from the cache, and must agree with the first.
+            assertTrue(GossipValidation.validHost("node-1.example.test"));
+            assertTrue(GossipValidation.validHost("10.0.0.1"));
+            assertTrue(GossipValidation.validHost("fe80::1"));
+            assertTrue(GossipValidation.validHost("a".repeat(253)));
+            for (String bad : List.of("", " ", "[::1]", "host/path", "user@host", "host:80", "a".repeat(254))) {
+                assertFalse(GossipValidation.validHost(bad), bad);
+            }
+            assertFalse(GossipValidation.validHost(null));
+        }
+        // More distinct hosts than the cache keeps: evicted hosts are simply parsed again.
+        for (int i = 0; i < 2000; i++) { assertTrue(GossipValidation.validHost("host-" + i + ".example.test")); }
+        assertTrue(GossipValidation.validHost("host-0.example.test"));
+        assertFalse(GossipValidation.validHost("host-0.example.test/path"));
+    }
+
     @Test void ipLiteralsAreParsedAndHostnamesAreRecognisedWithoutParsing() throws Exception {
         assertEquals(java.net.InetAddress.ofLiteral("127.0.0.1"), GossipValidation.literal("127.0.0.1"));
         assertEquals(java.net.InetAddress.ofLiteral("::1"), GossipValidation.literal("0:0:0:0:0:0:0:1"));

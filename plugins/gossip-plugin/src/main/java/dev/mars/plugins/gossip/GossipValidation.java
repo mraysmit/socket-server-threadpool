@@ -18,11 +18,18 @@ package dev.mars.plugins.gossip;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.regex.Pattern;
 
 /** Shared lexical checks; never resolve advertised addresses during validation. */
 final class GossipValidation {
     private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
+    // Results by host. A swarm has few distinct hosts and every record repeats one, so URI parsing runs once per host.
+    private static final Map<String, Boolean> HOSTS = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+        @Override protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) { return size() > 1024; }
+    });
 
     private GossipValidation() { }
 
@@ -37,8 +44,13 @@ final class GossipValidation {
         catch (IllegalArgumentException notLiteral) { return null; }
     }
 
+    /** Hosts arrive from the network, so length is checked before anything is cached; the cache stays under 0.5 MB. */
     static boolean validHost(String host) {
-        if (host == null || host.isBlank() || host.length() > 253 || host.contains("[") || host.contains("]")) {
+        return host != null && host.length() <= 253 && HOSTS.computeIfAbsent(host, GossipValidation::parseHost);
+    }
+
+    private static boolean parseHost(String host) {
+        if (host.isBlank() || host.contains("[") || host.contains("]")) {
             return false;
         }
         try {

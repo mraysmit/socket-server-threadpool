@@ -16,7 +16,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 ## Status (2026-10-16)
 
-**Fixed:** every finding, #1 to #9 and all six low-impact items, with two small parts deliberately left (noted under #3 and the regex item). Two related changes have also landed since the review:
+**Fixed:** every finding, #1 to #9 and all six low-impact items, with one small part deliberately left (noted under #3). Two related changes have also landed since the review:
 
 - **Address fallback.** When a peer's hostname resolves to several addresses and connecting to one fails (refused or unreachable), the same exchange now tries the others. `GossipDnsResolver.resolveAll` returns every address, and `GossipTransport` and `GossipRuntime` use it. This affects how #4 should be fixed; see the note there.
 - **Test support moved to the host.** Plugin tests now use the host's `dev.mars.testing` library. This changes no finding below.
@@ -136,11 +136,33 @@ The snapshots that remain are the ones that need the member list: peer selection
 ## Low impact and readability
 
 - ~~**Exceptions used for normal control flow.**~~ Fixed 2026-10-16: `GossipValidation.literal` recognises a hostname by its characters before calling `InetAddress.ofLiteral`, so hostnames no longer cost an exception ([GossipValidation.java:34-38](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L34-L38)). It replaces the try/catch in `PeerSelector.normalized`, `PeerSelector.isSelf` and the resolver, with the same results.
-- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the ID and cursor patterns are compiled once ([GossipValidation.java:25](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L25), [GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)). `validHost` still builds a `URI` per record.
+- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the ID and cursor patterns are compiled once ([GossipValidation.java:25](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L25), [GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)). `validHost` now remembers its answer for up to 1,024 hosts, checking length before caching so network input cannot inflate the cache; it went from about 360 ns to about 17 ns per call.
 - ~~**Convoluted recovery-fill loop.**~~ Fixed 2026-10-16: a bounded loop that relies on the cursor yielding each recovery peer once per cycle ([PeerSelector.java:88-91](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L88-L91)); the hand-written shuffle is now `Collections.shuffle`.
 - ~~**Rotation that isn't actually fair (a correctness problem).**~~ Fixed 2026-10-16: both rotations now remember the member that is due next, not just its index ([GossipBatchSelector.java:64-65, 86](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L64-L65), [PeerSelector.java:95-101](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L95-L101)). If that member was removed, its successor has taken its index, so resuming there is still right. Two new tests reproduced the skipped member before the fix and pass after it.
 - ~~**Clock inconsistency.**~~ Fixed 2026-10-16: departure timing uses the injected clock ([GossipRuntime.java:170, 209](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L209)).
 - ~~**Duplicated self-detection logic.**~~ Fixed 2026-10-16: the transport now uses the shared `PeerSelector.isSelf` ([GossipTransport.java:124](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L124)).
+
+## After the review: measured decoding costs (2026-10-16)
+
+Profiling inbound exchanges with Java Flight Recorder showed that the metadata check, which writes each record's metadata to JSON and reads it back, was the largest single cost of an exchange, and that measuring each new record's size encoded the metadata a second time.
+
+| Share of an inbound exchange | Small metadata | Large metadata |
+|---|---|---|
+| Metadata check: JSON read | 17% | 24% |
+| Metadata check: JSON write | 10% | 13% |
+| Measuring each new record's size | 29% | 15% |
+
+A probe showed that, within the metadata limits (4 KB, depth 16), the read-back only ever rejects numbers of about 1,000 digits or more, the codec's default number-length limit.
+
+**Changes** ([MemberRecord.java](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java)):
+- The read-back runs only when the metadata holds a number of 100 characters or more. Anything that could reach the codec's limit is still checked by the real codec, so validation is unchanged unless the host's number limit is set below 100 characters.
+- The metadata's byte count from that check is kept, and a record's size is computed as the record with empty metadata plus that count, so the metadata is encoded once.
+
+**Verified by** two new tests: every accepted record reads back through the host codec across a sweep of integer and decimal lengths through the gate and the codec's limit, and `serializedBytes` equals the real encoding for built, derived and decoded records. Four deliberately introduced errors were each caught: a gate threshold far too high, the longest number never recorded, an off-by-one in the size arithmetic, and `with()` dropping the measured size.
+
+**Measured** (inbound exchanges, profiled): small metadata 121 µs → 89 µs (−26%); large metadata 733 µs → 424 µs (−42%). The read-back no longer appears in the profile, and size measurement fell to 21% and 1.8%.
+
+**Largest remaining costs:** encoding the reply once to check its size (24–29%), even though the host then encodes it again to send; the metadata deep copy (8–34%); and, for small metadata, encoding each record's fixed fields to measure it (21%).
 
 ## Suggested order of work
 
