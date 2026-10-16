@@ -16,7 +16,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 ## Status (2026-10-16)
 
-**Fixed:** every finding, #1 to #9 and all six low-impact items, with one small part deliberately left (noted under #3). Two related changes have also landed since the review:
+**Fixed:** every finding, #1 to #9 and all six low-impact items, with one small part deliberately left (noted under #3). A later profiling pass cut decoding costs further; see [After the review](#after-the-review-measured-decoding-costs-2026-10-16). Two related changes have also landed since the review:
 
 - **Address fallback.** When a peer's hostname resolves to several addresses and connecting to one fails (refused or unreachable), the same exchange now tries the others. `GossipDnsResolver.resolveAll` returns every address, and `GossipTransport` and `GossipRuntime` use it. This affects how #4 should be fixed; see the note there.
 - **Test support moved to the host.** Plugin tests now use the host's `dev.mars.testing` library. This changes no finding below.
@@ -28,7 +28,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 **Was:** for every record in every exchange, `requireForwardable` built and encoded three complete envelopes: a request with the record as sender, a reply holding the record, and a members page holding the record. It also rebuilt a Base64 cursor that never changed, once per record. A reply carrying 31 records needed about 94 envelope encodings, roughly 10× the bytes actually sent. The same record was encoded again by `GossipWire.decode`'s request-size check, by `MembershipTable.checkRecordSize`, and by every call to `MemberRecord.serializedBytes()` or `fingerprint()`.
 
 **Now:**
-- [`MemberRecord`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L122-L137) is a final class that computes its encoded size and fingerprint once, then reuses them.
+- [`MemberRecord`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L132-L149) is a final class that computes its encoded size and fingerprint once, then reuses them.
 - [`GossipWire`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L119-L123) adds sizes up instead of encoding envelopes. A record's JSON is identical standalone or nested, so an envelope is a fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
 - [`requireForwardable`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L165-L180) needs no envelope encoding per record. Its two local-record overheads are recomputed only when the local record changes in more than its heartbeat.
 - The request-size check in `decode` ([GossipWire.java:83](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L83)) no longer re-encodes the request.
@@ -131,12 +131,12 @@ The snapshots that remain are the ones that need the member list: peer selection
 
 **Was:** `fromWire` deep-copied the metadata and the constructor copied it again, then encoded and re-parsed it. The same happened on every heartbeat and departure, although that metadata was already frozen.
 
-**Now:** `fromWire` hands the metadata straight to the constructor, which copies and checks it once ([MemberRecord.java:95-106](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L95-L106)). A record built from an existing one, for a heartbeat, departure, local update or the widest-heartbeat stand-in, uses `with(heartbeat, state)`, which shares the already-checked metadata ([MemberRecord.java:73-85](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L73-L85)).
+**Now:** `fromWire` hands the metadata straight to the constructor, which copies and checks it once ([MemberRecord.java:103-114](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L103-L114)). A record built from an existing one, for a heartbeat, departure, local update or the widest-heartbeat stand-in, uses `with(heartbeat, state)`, which shares the already-checked metadata ([MemberRecord.java:80-93](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L80-L93)).
 
 ## Low impact and readability
 
-- ~~**Exceptions used for normal control flow.**~~ Fixed 2026-10-16: `GossipValidation.literal` recognises a hostname by its characters before calling `InetAddress.ofLiteral`, so hostnames no longer cost an exception ([GossipValidation.java:34-38](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L34-L38)). It replaces the try/catch in `PeerSelector.normalized`, `PeerSelector.isSelf` and the resolver, with the same results.
-- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the ID and cursor patterns are compiled once ([GossipValidation.java:25](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L25), [GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)). `validHost` now remembers its answer for up to 1,024 hosts, checking length before caching so network input cannot inflate the cache; it went from about 360 ns to about 17 ns per call.
+- ~~**Exceptions used for normal control flow.**~~ Fixed 2026-10-16: `GossipValidation.literal` recognises a hostname by its characters before calling `InetAddress.ofLiteral`, so hostnames no longer cost an exception ([GossipValidation.java:41-45](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L41-L45)). It replaces the try/catch in `PeerSelector.normalized`, `PeerSelector.isSelf` and the resolver, with the same results.
+- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the ID and cursor patterns are compiled once ([GossipValidation.java:28](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L28), [GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)). `validHost` now remembers its answer for up to 1,024 hosts, checking length before caching so network input cannot inflate the cache; it went from about 360 ns to about 17 ns per call.
 - ~~**Convoluted recovery-fill loop.**~~ Fixed 2026-10-16: a bounded loop that relies on the cursor yielding each recovery peer once per cycle ([PeerSelector.java:88-91](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L88-L91)); the hand-written shuffle is now `Collections.shuffle`.
 - ~~**Rotation that isn't actually fair (a correctness problem).**~~ Fixed 2026-10-16: both rotations now remember the member that is due next, not just its index ([GossipBatchSelector.java:64-65, 86](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L64-L65), [PeerSelector.java:95-101](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L95-L101)). If that member was removed, its successor has taken its index, so resuming there is still right. Two new tests reproduced the skipped member before the fix and pass after it.
 - ~~**Clock inconsistency.**~~ Fixed 2026-10-16: departure timing uses the injected clock ([GossipRuntime.java:170, 209](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L209)).
@@ -154,7 +154,7 @@ Profiling inbound exchanges with Java Flight Recorder showed that the metadata c
 
 A probe showed that, within the metadata limits (4 KB, depth 16), the read-back only ever rejects numbers of about 1,000 digits or more, the codec's default number-length limit.
 
-**Changes** ([MemberRecord.java](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java)):
+**Changes** ([MemberRecord.java:252-261](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L252-L261), [132-138](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L132-L138)):
 - The read-back runs only when the metadata holds a number of 100 characters or more. Anything that could reach the codec's limit is still checked by the real codec, so validation is unchanged unless the host's number limit is set below 100 characters.
 - The metadata's byte count from that check is kept, and a record's size is computed as the record with empty metadata plus that count, so the metadata is encoded once.
 
