@@ -59,8 +59,8 @@ public final class MembershipTable {
     private final long suspectNanos;
     private final long deadNanos;
     private final long retentionNanos;
-    private Map<MemberKey, Entry> entries = new LinkedHashMap<>();
-    private Map<MemberKey, Suppression> suppressions = new LinkedHashMap<>();
+    private final Map<MemberKey, Entry> entries = new LinkedHashMap<>();
+    private final Map<MemberKey, Suppression> suppressions = new LinkedHashMap<>();
     private long admissionsSkipped;
 
     public MembershipTable(GossipConfig config, MemberRecord self) { this(config, self, System::nanoTime); }
@@ -142,9 +142,9 @@ public final class MembershipTable {
             throw new MembershipException(CONFLICT, "A direct peer must not be the local process");
         }
         long now = clock.getAsLong();
-        // Validate conflicts and plan known updates before spending capacity on admissions.
-        var proposed = new LinkedHashMap<>(entries);
-        var retained = new LinkedHashMap<>(suppressions);
+        // The loop only reads the table and may throw on a conflict; every change is applied after it, so a
+        // rejected batch leaves the table untouched without copying it. Batch keys are unique, so no key is read twice.
+        var updates = new LinkedHashMap<MemberKey, Entry>();
         var admissions = new LinkedHashMap<MemberKey, Entry>();
         int admitted = 0;
         int advanced = 0;
@@ -153,7 +153,7 @@ public final class MembershipTable {
         boolean senderSkipped = false;
         for (MemberRecord incoming : records) {
             MemberKey key = incoming.key();
-            Entry old = proposed.get(key);
+            Entry old = entries.get(key);
             boolean directRecord = direct != null && direct.key().equals(key);
             if (key.equals(localKey)) {
                 MemberRecord local = old.record();
@@ -181,7 +181,7 @@ public final class MembershipTable {
                     ignored++;
                 }
             } else {
-                Suppression suppressed = retained.get(key);
+                Suppression suppressed = suppressions.get(key);
                 if (suppressed != null) {
                     boolean sameVersion = incoming.heartbeat() == suppressed.heartbeat();
                     if (sameVersion && incoming.state() == suppressed.state()
@@ -199,33 +199,31 @@ public final class MembershipTable {
             if (directRecord && old.record().state() == ALIVE && old.record().sameEndpoint(incoming)) {
                 old = new Entry(old.record(), old.lastAdvance(), now, true, old.stateSince());
             }
-            if (entries.containsKey(key)) { proposed.put(key, old); }
-            else { admissions.put(key, old); }
+            (entries.containsKey(key) ? updates : admissions).put(key, old);
         }
-        long active = proposed.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
-        long identities = (long) proposed.size() + retained.size();
+        entries.putAll(updates);
+        long active = entries.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
+        long identities = (long) entries.size() + suppressions.size();
         var orderedAdmissions = new ArrayList<>(admissions.entrySet());
         // Restore known retained identities before spending remaining slots on genuinely new keys.
-        orderedAdmissions.sort(Comparator.comparing(entry -> !retained.containsKey(entry.getKey())));
+        orderedAdmissions.sort(Comparator.comparing(entry -> !suppressions.containsKey(entry.getKey())));
         for (var admission : orderedAdmissions) {
             boolean alive = admission.getValue().record().state() == ALIVE;
-            boolean newIdentity = !retained.containsKey(admission.getKey());
+            boolean newIdentity = !suppressions.containsKey(admission.getKey());
             if ((alive && active >= config.maxMembers()) || (newIdentity && identities >= config.maxRecords())) {
                 ignored++;
                 skipped++;
                 senderSkipped |= admission.getKey().equals(sender);
                 continue;
             }
-            proposed.put(admission.getKey(), admission.getValue());
-            retained.remove(admission.getKey());
+            entries.put(admission.getKey(), admission.getValue());
+            suppressions.remove(admission.getKey());
             admitted++;
             if (alive) { active++; }
             if (newIdentity) { identities++; }
         }
-        entries = proposed;
-        suppressions = retained;
         admissionsSkipped += Math.min(skipped, Long.MAX_VALUE - admissionsSkipped);
-        var admission = proposed.containsKey(sender) ? Admission.ADMITTED
+        var admission = entries.containsKey(sender) ? Admission.ADMITTED
                 : senderSkipped ? Admission.CAPACITY : Admission.IGNORED;
         return new ExchangeMerge(new MergeResult(admitted, advanced, ignored), admission);
     }
@@ -254,8 +252,7 @@ public final class MembershipTable {
     public synchronized MemberRecord advanceLocal() {
         MemberRecord current = entries.get(localKey).record();
         requireLocalAlive(current);
-        return replaceLocal(new MemberRecord(localKey, current.host(), current.port(), nextHeartbeat(current),
-                ALIVE, current.metadata()));
+        return replaceLocal(current.with(nextHeartbeat(current), ALIVE));
     }
 
     public synchronized MemberRecord updateLocal(String host, int port, Map<String, Object> metadata) {
@@ -263,14 +260,14 @@ public final class MembershipTable {
         requireLocalAlive(current);
         MemberRecord candidate = new MemberRecord(localKey, host, port, current.heartbeat(), ALIVE, metadata);
         if (candidate.equals(current)) { return current; }
-        return replaceLocal(new MemberRecord(localKey, host, port, nextHeartbeat(current), ALIVE, candidate.metadata()));
+        return replaceLocal(candidate.with(nextHeartbeat(current), ALIVE));
     }
 
     /** Terminal departure uses the current version; terminal state dominates ALIVE even at that heartbeat. */
     public synchronized MemberRecord leaveLocal() {
         MemberRecord current = entries.get(localKey).record();
         if (current.state() == LEFT) { return current; }
-        return replaceLocal(new MemberRecord(localKey, current.host(), current.port(), current.heartbeat(), LEFT, current.metadata()));
+        return replaceLocal(current.with(current.heartbeat(), LEFT));
     }
 
     private MemberRecord replaceLocal(MemberRecord record) {

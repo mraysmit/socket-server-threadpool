@@ -25,9 +25,12 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 /** Handlers validate, merge, inspect, or request asynchronous departure. Never dial peers here. */
 final class GossipCommands {
+    private static final Pattern CURSOR = Pattern.compile("[A-Za-z0-9_-]+");
+    private static final Pattern OFFSET = Pattern.compile("[0-9]{1,10}");
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -175,14 +178,14 @@ final class GossipCommands {
     }
 
     private int decodeCursor(Object value, MemberKey self) {
-        if (!(value instanceof String text) || text.length() > 128 || !text.matches("[A-Za-z0-9_-]+")) {
+        if (!(value instanceof String text) || text.length() > 128 || !CURSOR.matcher(text).matches()) {
             throw GossipWire.invalid("Invalid membership cursor");
         }
         String decoded;
         try { decoded = new String(Base64.getUrlDecoder().decode(text), StandardCharsets.UTF_8); }
         catch (IllegalArgumentException e) { throw GossipWire.invalid("Invalid membership cursor"); }
         String[] fields = decoded.split("/", -1);
-        if (fields.length != 2 || !fields[0].equals(self.bootId().toString()) || !fields[1].matches("[0-9]{1,10}")) {
+        if (fields.length != 2 || !fields[0].equals(self.bootId().toString()) || !OFFSET.matcher(fields[1]).matches()) {
             throw GossipWire.invalid("Membership cursor belongs to another instance or is malformed");
         }
         // At most ten digits, so parsing cannot overflow a long.

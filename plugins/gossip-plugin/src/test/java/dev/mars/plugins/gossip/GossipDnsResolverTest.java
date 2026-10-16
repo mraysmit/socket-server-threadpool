@@ -105,6 +105,25 @@ class GossipDnsResolverTest {
         }
     }
 
+    @Test void concurrentRequestsForOneHostShareASingleLookup(@org.junit.jupiter.api.io.TempDir Path temporary) throws Exception {
+        Path release = temporary.resolve("release");
+        try (var resolver = new GossipDnsResolver(4, 1, Duration.ofSeconds(5), System::nanoTime, host -> {
+                 lookups.add(Thread.currentThread());
+                 return fixtureLookup(host, release);
+             });
+             var callers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var first = callers.submit(() -> resolver.resolve(new GossipConfig.Seed("Peer", "wait.test", 9000)));
+            await(() -> resolver.activeHelpers() == 1);
+            // With one lookup allowed, a second host is refused but the same host joins the lookup in flight.
+            assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "other.test", 9000)));
+            var second = callers.submit(() -> resolver.resolve(new GossipConfig.Seed("Peer", "WAIT.test", 9010)));
+            java.nio.file.Files.createFile(release);
+            assertEquals(new GossipConfig.Seed("Peer", "127.0.0.1", 9000), first.get(5, TimeUnit.SECONDS));
+            assertEquals(new GossipConfig.Seed("Peer", "127.0.0.1", 9010), second.get(5, TimeUnit.SECONDS));
+            assertEquals(1, lookups.size(), "Both requests must be served by one lookup");
+        }
+    }
+
     @Test void timeoutAndInvalidRepliesLeaveNoHelpersOrPoisonedCacheEntries() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 2, Duration.ofMillis(150), System::nanoTime, this::launch)) {
             assertThrows(SocketTimeoutException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "stall.test", 9000)));

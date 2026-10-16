@@ -198,6 +198,39 @@ class PeerSelectorTest {
         assertEquals(Set.of("127.0.0.1", "127.0.0.2"), selected.stream().map(GossipConfig.Seed::host).collect(java.util.stream.Collectors.toSet()));
     }
 
+    @Test void removingAnEarlierRecoveryPeerDoesNotMakeTheRotationSkipTheNextOne() {
+        var config = config(1, "");
+        var selector = new PeerSelector(config, clock::get, new Random(1));
+        var members = new java.util.ArrayList<MemberRecord>();
+        for (String id : List.of("A", "B", "C", "D", "E")) { members.add(record(id, members.size() + 2, 9101 + members.size())); }
+        java.util.function.Function<List<MemberRecord>, MembershipTable.Snapshot> unverified = records -> {
+            var views = new java.util.ArrayList<MembershipTable.MemberView>();
+            views.add(new MembershipTable.MemberView(self, MembershipTable.Assessment.ALIVE, 0, null, true, false));
+            for (var record : records) { views.add(new MembershipTable.MemberView(record, MembershipTable.Assessment.CANDIDATE, 0, null, false, false)); }
+            return new MembershipTable.Snapshot(self, views, Set.of(), views.size(), views.size(), 0);
+        };
+        for (String expected : List.of("A", "B", "C")) {
+            assertEquals(expected, selector.select(unverified.apply(members), Set.of(), 1).getFirst().serverId());
+        }
+        // D is next. Removing B shifts D down one place; the rotation must still offer D, not skip to E.
+        var withoutB = new java.util.ArrayList<>(members);
+        withoutB.remove(1);
+        assertEquals("D", selector.select(unverified.apply(withoutB), Set.of(), 1).getFirst().serverId());
+        assertEquals("E", selector.select(unverified.apply(withoutB), Set.of(), 1).getFirst().serverId());
+    }
+
+    @Test void ipLiteralsAreParsedAndHostnamesAreRecognisedWithoutParsing() throws Exception {
+        assertEquals(java.net.InetAddress.ofLiteral("127.0.0.1"), GossipValidation.literal("127.0.0.1"));
+        assertEquals(java.net.InetAddress.ofLiteral("::1"), GossipValidation.literal("0:0:0:0:0:0:0:1"));
+        assertEquals(java.net.InetAddress.ofLiteral("::1"), GossipValidation.literal("::1"));
+        for (String host : List.of("peer.example.test", "localhost", "Node-7", "1.2.3.example")) { assertNull(GossipValidation.literal(host), host); }
+        // Digits and dots alone, or anything with a colon, still go to the real parser.
+        assertNull(GossipValidation.literal("1.2.3.4.5"));
+        assertNull(GossipValidation.literal("not:an:address"));
+        assertTrue(PeerSelector.isSelf(record("Self", 1, 9000), new GossipConfig.Seed("Self", "127.0.0.1", 9000)));
+        assertFalse(PeerSelector.isSelf(record("Self", 1, 9000), new GossipConfig.Seed("Self", "other.example", 9000)));
+    }
+
     @Test void aliasConfirmationTakesASnapshotOnlyForASeedWhoseAddressDiffers() {
         var config = config(2, "Peer@peer.example.test:9010");
         var table = new MembershipTable(config, self, clock::get);

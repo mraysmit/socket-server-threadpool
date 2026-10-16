@@ -47,7 +47,8 @@ final class GossipDnsResolver implements AutoCloseable {
     private final long timeoutNanos;
     private final LongSupplier clock;
     private final Lookup lookup;
-    private final Map<Thread, CompletableFuture<List<InetAddress>>> active = new LinkedHashMap<>();
+    // Lookups in flight by hostname; a concurrent request for the same host shares the one already running.
+    private final Map<String, InFlight> active = new LinkedHashMap<>();
     private final LinkedHashMap<String, Cached> cache = new LinkedHashMap<>(16, 0.75f, true);
     private boolean closed;
 
@@ -72,28 +73,31 @@ final class GossipDnsResolver implements AutoCloseable {
      */
     List<GossipConfig.Seed> resolveAll(GossipConfig.Seed peer) throws IOException {
         String host = peer.host().toLowerCase(Locale.ROOT);
-        var result = new CompletableFuture<List<InetAddress>>();
-        Thread thread;
+        InFlight lookup;
         synchronized (this) {
             if (closed) { throw new IOException("Gossip resolver is closed"); }
-            try { return List.of(numeric(peer, InetAddress.ofLiteral(host))); }
-            catch (IllegalArgumentException notLiteral) { /* Names are looked up below. */ }
+            var literal = GossipValidation.literal(host);
+            if (literal != null) { return List.of(numeric(peer, literal)); }
             Cached previous = cache.get(host);
             if (previous != null && clock.getAsLong() - previous.created < CACHE_NANOS) { return numeric(peer, previous.rotation()); }
-            if (active.size() >= maxHelpers) { throw new IOException("Gossip resolver capacity is full"); }
-            thread = Thread.ofPlatform().daemon().name("gossip-dns-lookup").unstarted(() -> {
-                try { result.complete(addresses(host)); }
-                catch (Throwable failure) { result.completeExceptionally(failure); }
-                finally { synchronized (this) { active.remove(Thread.currentThread()); } }
-            });
-            active.put(thread, result);
-            thread.start();
+            lookup = active.get(host);
+            if (lookup == null) {
+                if (active.size() >= maxHelpers) { throw new IOException("Gossip resolver capacity is full"); }
+                var result = new CompletableFuture<List<InetAddress>>();
+                lookup = new InFlight(Thread.ofPlatform().daemon().name("gossip-dns-lookup").unstarted(() -> {
+                    try { result.complete(addresses(host)); }
+                    catch (Throwable failure) { result.completeExceptionally(failure); }
+                    finally { synchronized (this) { active.remove(host); } }
+                }), result);
+                active.put(host, lookup);
+                lookup.thread().start();
+            }
         }
         List<InetAddress> addresses;
-        try { addresses = result.get(timeoutNanos, TimeUnit.NANOSECONDS); }
-        catch (TimeoutException e) { thread.interrupt(); throw new SocketTimeoutException("Gossip DNS lookup timed out"); }
+        try { addresses = lookup.result().get(timeoutNanos, TimeUnit.NANOSECONDS); }
+        catch (TimeoutException e) { lookup.thread().interrupt(); throw new SocketTimeoutException("Gossip DNS lookup timed out"); }
         catch (InterruptedException e) {
-            thread.interrupt();
+            lookup.thread().interrupt();
             Thread.currentThread().interrupt();
             throw new InterruptedIOException("Gossip DNS lookup interrupted");
         } catch (ExecutionException e) {
@@ -129,19 +133,21 @@ final class GossipDnsResolver implements AutoCloseable {
 
     /** Releases waiting callers at once, then gives interruptible lookups a moment to end. */
     @Override public void close() {
-        List<Map.Entry<Thread, CompletableFuture<List<InetAddress>>>> lookups;
+        List<InFlight> lookups;
         synchronized (this) {
             closed = true;
             cache.clear();
-            lookups = List.copyOf(active.entrySet());
+            lookups = List.copyOf(active.values());
         }
-        for (var entry : lookups) {
-            entry.getValue().completeExceptionally(new IOException("Gossip resolver is closed"));
-            entry.getKey().interrupt();
+        for (var lookup : lookups) {
+            lookup.result().completeExceptionally(new IOException("Gossip resolver is closed"));
+            lookup.thread().interrupt();
         }
-        try { for (var entry : lookups) { entry.getKey().join(Duration.ofSeconds(1)); } }
+        try { for (var lookup : lookups) { lookup.thread().join(Duration.ofSeconds(1)); } }
         catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
+
+    private record InFlight(Thread thread, CompletableFuture<List<InetAddress>> result) { }
 
     private static final class Cached {
         final List<InetAddress> addresses;

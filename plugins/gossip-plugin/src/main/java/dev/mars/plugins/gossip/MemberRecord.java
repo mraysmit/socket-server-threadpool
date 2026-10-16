@@ -69,6 +69,21 @@ public final class MemberRecord {
         this.metadata = frozen;
     }
 
+    /** The same record at another heartbeat and state. Its metadata is already frozen and checked, so it is shared. */
+    MemberRecord with(long heartbeat, State state) {
+        if (heartbeat < 0 || state == null) { throw invalid("Member requires a nonnegative heartbeat and a state"); }
+        return new MemberRecord(this, heartbeat, state);
+    }
+
+    private MemberRecord(MemberRecord base, long heartbeat, State state) {
+        key = base.key;
+        host = base.host;
+        port = base.port;
+        this.heartbeat = heartbeat;
+        this.state = state;
+        metadata = base.metadata;
+    }
+
     public MemberKey key() { return key; }
     public String host() { return host; }
     public int port() { return port; }

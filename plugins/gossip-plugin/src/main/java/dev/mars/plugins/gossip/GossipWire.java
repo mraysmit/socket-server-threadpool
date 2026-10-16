@@ -198,7 +198,7 @@ public final class GossipWire {
         var limits = forwarding;
         if (limits != null && limits.matches(self)) { return limits; }
         // The widest heartbeat stands in for every future local heartbeat.
-        var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
+        var budgetSelf = self.with(Long.MAX_VALUE, self.state());
         String serverId = self.key().serverId();
         String cursor = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
                 (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));

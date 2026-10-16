@@ -167,7 +167,7 @@ final class GossipRuntime implements AutoCloseable {
         for (var seed : config.seeds()) { addDepartureTarget(seed, snapshot.self(), cap); }
         table.leaveLocal();
         leaving = true;
-        departureStarted = System.nanoTime();
+        departureStarted = clock.getAsLong();
         departureState = "DISSEMINATING";
         departureTargets = departurePending.size();
         metrics.workerState = "LEAVING";
@@ -206,7 +206,7 @@ final class GossipRuntime implements AutoCloseable {
         ownedWorkers.removeIf(thread -> !thread.isAlive());
         if (leaving) {
             if (departurePending.isEmpty() && ownedWorkers.isEmpty()) { departureOutcome = "COMPLETED"; return; }
-            if (System.nanoTime() - departureStarted >= departureNanos) { departureOutcome = "EXHAUSTED"; return; }
+            if (clock.getAsLong() - departureStarted >= departureNanos) { departureOutcome = "EXHAUSTED"; return; }
         }
         int slots = config.maxInflight() - Math.max(ownedWorkers.size(), transport.inflight());
         if (slots <= 0) { metrics.skipped.incrementAndGet(); return; }

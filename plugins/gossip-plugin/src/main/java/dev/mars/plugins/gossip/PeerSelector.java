@@ -15,7 +15,6 @@
  */
 package dev.mars.plugins.gossip;
 
-import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -39,6 +38,7 @@ final class PeerSelector {
     private final Map<GossipConfig.Seed, Retry> retries = new LinkedHashMap<>();
     private final Map<GossipConfig.Seed, Alias> aliases = new LinkedHashMap<>();
     private int recoveryCursor;
+    private GossipConfig.Seed recoveryNext; // The recovery peer due next, whose index can shift between rounds.
     private long selections;
 
     PeerSelector(GossipConfig config, LongSupplier clock, RandomGenerator random) {
@@ -93,9 +93,12 @@ final class PeerSelector {
     }
 
     private GossipConfig.Seed nextRecovery(List<GossipConfig.Seed> recovery) {
-        var peer = recovery.get(Math.floorMod(recoveryCursor, recovery.size()));
-        recoveryCursor = (recoveryCursor + 1) % recovery.size();
-        return peer;
+        // Resume at the peer that was due, wherever it now is; if it was removed, its successor took its index.
+        int index = recoveryNext == null ? -1 : recovery.indexOf(recoveryNext);
+        if (index < 0) { index = Math.floorMod(recoveryCursor, recovery.size()); }
+        recoveryCursor = (index + 1) % recovery.size();
+        recoveryNext = recovery.get(recoveryCursor);
+        return recovery.get(index);
     }
 
     synchronized void success(GossipConfig.Seed peer) { retries.remove(canonical(peer)); }
@@ -170,17 +173,16 @@ final class PeerSelector {
     }
 
     private static GossipConfig.Seed normalized(GossipConfig.Seed peer) {
-        String host;
-        try { host = InetAddress.ofLiteral(peer.host()).getHostAddress(); }
-        catch (IllegalArgumentException notLiteral) { host = peer.host().toLowerCase(Locale.ROOT); }
-        return new GossipConfig.Seed(peer.serverId(), host, peer.port());
+        var address = GossipValidation.literal(peer.host());
+        return new GossipConfig.Seed(peer.serverId(),
+                address != null ? address.getHostAddress() : peer.host().toLowerCase(Locale.ROOT), peer.port());
     }
 
     static boolean isSelf(MemberRecord self, GossipConfig.Seed peer) {
         if (self.port() != peer.port()) { return false; }
         if (self.host().equalsIgnoreCase(peer.host())) { return true; }
-        try { return InetAddress.ofLiteral(self.host()).equals(InetAddress.ofLiteral(peer.host())); }
-        catch (IllegalArgumentException notLiteral) { return false; }
+        var address = GossipValidation.literal(self.host());
+        return address != null && address.equals(GossipValidation.literal(peer.host()));
     }
 
     private record Retry(int failures, long attempted, long delay) { }

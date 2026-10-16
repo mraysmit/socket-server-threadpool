@@ -112,6 +112,19 @@ class GossipBatchSelectorTest {
         assertThrows(IllegalArgumentException.class, () -> selector.select(snapshot(), 0, 10));
     }
 
+    @Test void removingAnEarlierMemberDoesNotMakeTheScanSkipTheNextOne() {
+        var selector = new GossipBatchSelector(record -> 10);
+        var members = new ArrayList<MemberRecord>();
+        for (String id : List.of("A", "B", "C", "D", "E", "F")) { members.add(GossipCommandsTest.member(id, members.size() + 2)); }
+        var all = snapshot(members.toArray(MemberRecord[]::new));
+        for (int i = 0; i < 3; i++) { selector.select(all, 3, 1000); } // Every record sent once; no changes pending.
+        assertEquals(List.of(members.get(0), members.get(1)), selector.select(all, 3, 1000));
+        // C is next. Removing B shifts C down one place; the scan must still resume at C, not skip to D.
+        var withoutB = new ArrayList<>(members);
+        withoutB.remove(1);
+        assertEquals(List.of(members.get(2), members.get(3)), selector.select(snapshot(withoutB.toArray(MemberRecord[]::new)), 3, 1000));
+    }
+
     @Test void removedRecordsArePrunedFromQueuesAndReappearAsNewCandidates() {
         var selector = new GossipBatchSelector(record -> 10);
         var a = GossipCommandsTest.member("A", 2);

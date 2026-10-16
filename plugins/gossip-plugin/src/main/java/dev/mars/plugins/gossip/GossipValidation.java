@@ -15,15 +15,26 @@
  */
 package dev.mars.plugins.gossip;
 
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.util.regex.Pattern;
 
 /** Shared lexical checks; never resolve advertised addresses during validation. */
 final class GossipValidation {
+    private static final Pattern ID = Pattern.compile("[A-Za-z0-9._-]{1,128}");
+
     private GossipValidation() { }
 
     static boolean validId(String value) {
-        return value != null && value.matches("[A-Za-z0-9._-]{1,128}");
+        return value != null && ID.matcher(value).matches();
+    }
+
+    /** The address of an IP literal, or null for a hostname, which is recognised without throwing an exception. */
+    static InetAddress literal(String host) {
+        if (host.indexOf(':') < 0 && !host.chars().allMatch(c -> c == '.' || (c >= '0' && c <= '9'))) { return null; }
+        try { return InetAddress.ofLiteral(host); }
+        catch (IllegalArgumentException notLiteral) { return null; }
     }
 
     static boolean validHost(String host) {

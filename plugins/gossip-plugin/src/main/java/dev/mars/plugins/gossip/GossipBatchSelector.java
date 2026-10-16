@@ -30,6 +30,7 @@ final class GossipBatchSelector {
     private final LinkedHashSet<Entry> departures = new LinkedHashSet<>();
     private final LinkedHashSet<Entry> changes = new LinkedHashSet<>();
     private int cursor;
+    private MemberKey cursorKey; // The member the scan resumes at, whose index can shift between snapshots.
     private boolean priorityTurn = true;
     private long generation;
 
@@ -59,7 +60,9 @@ final class GossipBatchSelector {
         int limit = Math.min(maxBatch - 1, scan.size());
         if (limit == 0) { return List.of(); }
         var selected = new ArrayList<MemberRecord>(limit);
-        int position = Math.floorMod(cursor, scan.size());
+        // Resume at the member that was next, wherever it now is; if it was removed, its successor took its index.
+        Entry next = cursorKey == null ? null : entries.get(cursorKey);
+        int position = next != null ? next.index : Math.floorMod(cursor, scan.size());
         while (selected.size() < limit) {
             while (scan.get(position).included) { position = (position + 1) % scan.size(); }
             Entry candidate = scan.get(position);
@@ -80,6 +83,7 @@ final class GossipBatchSelector {
             if (candidate.index == position) { position = (position + 1) % scan.size(); }
         }
         cursor = position;
+        cursorKey = scan.get(position).sized.record().key();
         return List.copyOf(selected);
     }
 
