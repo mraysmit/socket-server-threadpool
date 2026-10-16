@@ -76,21 +76,19 @@ public final class MemberRecord {
     public State state() { return state; }
     public Map<String, Object> metadata() { return metadata; }
 
+    @SuppressWarnings("unchecked")
     public static MemberRecord fromWire(Object value) {
         if (!(value instanceof Map<?, ?> fields) || !fields.keySet().equals(FIELDS)) {
             throw invalid("Member record requires exactly: " + FIELDS);
         }
         MemberKey key = MemberKey.fromWire(string(fields, "serverId"), string(fields, "bootId"));
-        long port = exactNonnegativeLong(fields.get("port"), "port");
-        if (port < 1 || port > 65535) { throw invalid("port must be between 1 and 65535"); }
         State state;
         try { state = State.valueOf(string(fields, "state")); }
         catch (IllegalArgumentException e) { throw invalid("state must be ALIVE or LEFT"); }
         if (!(fields.get("metadata") instanceof Map<?, ?> metadata)) { throw invalid("metadata must be an object"); }
-        // Bound and check keys before passing to the typed constructor; no unchecked input-map casts.
-        var copy = freezeObject(metadata, 0, new Budget());
-        return new MemberRecord(key, string(fields, "host"), (int) port,
-                exactNonnegativeLong(fields.get("heartbeat"), "heartbeat"), state, copy);
+        // The constructor copies the metadata and checks every key and value, so the cast is never trusted.
+        return new MemberRecord(key, string(fields, "host"), (int) GossipWire.exactLong(fields.get("port"), "port", 1, 65535),
+                GossipWire.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
     }
 
     public Map<String, Object> toWire() {
@@ -140,18 +138,6 @@ public final class MemberRecord {
     private static String string(Map<?, ?> fields, String name) {
         if (!(fields.get(name) instanceof String text)) { throw invalid(name + " must be a string"); }
         return text;
-    }
-
-    private static long exactNonnegativeLong(Object value, String name) {
-        long result;
-        if (value instanceof BigInteger integer) {
-            try { result = integer.longValueExact(); }
-            catch (ArithmeticException e) { throw invalid(name + " is outside the signed 64-bit integer range"); }
-        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
-            result = ((Number) value).longValue();
-        } else { throw invalid(name + " must be an integer, without fractions or coercion"); }
-        if (result < 0) { throw invalid(name + " must be nonnegative"); }
-        return result;
     }
 
     private static Map<String, Object> freezeObject(Map<?, ?> source, int depth, Budget budget) {

@@ -22,9 +22,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.ToIntFunction;
 
-/** Per-direction fair selection. JSON size calculation never holds the queue/cursor lock. */
+/** Per-direction fair selection. Record sizes are measured before taking the queue/cursor lock. */
 final class GossipBatchSelector {
-    private final RecordSizes sizes;
+    private final ToIntFunction<MemberRecord> encodedSize;
     private final Map<MemberKey, Entry> entries = new HashMap<>();
     private final ArrayList<Entry> scan = new ArrayList<>();
     private final LinkedHashSet<Entry> departures = new LinkedHashSet<>();
@@ -33,23 +33,28 @@ final class GossipBatchSelector {
     private boolean priorityTurn = true;
     private long generation;
 
+    /** MemberRecord computes its size once and caches it, so the selector keeps no size cache of its own. */
     GossipBatchSelector() { this(MemberRecord::serializedBytes); }
 
-    /** The size function encodes one immutable record, never an accumulating message. */
-    GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) { sizes = new RecordSizes(encodedSize); }
+    GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) { this.encodedSize = java.util.Objects.requireNonNull(encodedSize); }
 
     /** Budget is the complete envelope's remaining bytes after encoding it with an empty member array. */
     List<MemberRecord> select(MembershipTable.Snapshot snapshot, int maxBatch, int memberByteBudget) {
         if (maxBatch < 1) { throw new IllegalArgumentException("Batch limit must include the sender"); }
         if (memberByteBudget < 0) { throw GossipWire.invalid("Local sender exceeds the exchange budget"); }
-        var prepared = sizes.prepare(snapshot);
-        if (maxBatch > 1) {
-            for (var record : prepared) { if (record.bytes < 0) { record.prepareSize(sizes.encodedSize); } }
+        var prepared = new ArrayList<Sized>(snapshot.members().size());
+        for (var member : snapshot.members()) {
+            var record = member.record();
+            if (record.key().equals(snapshot.self().key())) { continue; }
+            // A sender-only batch never needs a member's size.
+            int bytes = maxBatch > 1 ? encodedSize.applyAsInt(record) : 0;
+            if (maxBatch > 1 && bytes < 1) { throw new IllegalArgumentException("Encoded record size must be positive"); }
+            prepared.add(new Sized(record, bytes));
         }
         return selectPrepared(prepared, maxBatch, memberByteBudget);
     }
 
-    private synchronized List<MemberRecord> selectPrepared(List<SizedRecord> prepared, int maxBatch, int remaining) {
+    private synchronized List<MemberRecord> selectPrepared(List<Sized> prepared, int maxBatch, int remaining) {
         refresh(prepared);
         int limit = Math.min(maxBatch - 1, scan.size());
         if (limit == 0) { return List.of(); }
@@ -78,7 +83,7 @@ final class GossipBatchSelector {
         return List.copyOf(selected);
     }
 
-    private void refresh(List<SizedRecord> prepared) {
+    private void refresh(List<Sized> prepared) {
         long current = ++generation;
         scan.clear();
         for (var sized : prepared) {
@@ -105,50 +110,12 @@ final class GossipBatchSelector {
         }
     }
 
+    private record Sized(MemberRecord record, int bytes) { }
+
     private static final class Entry {
-        SizedRecord sized;
+        Sized sized;
         int index;
         boolean included;
         long generation;
-    }
-
-    /** A record can be shared by concurrent prepared snapshots; encode its size only once. */
-    private static final class SizedRecord {
-        final MemberRecord record;
-        volatile int bytes = -1;
-        long generation; // Accessed only under the RecordSizes monitor.
-        SizedRecord(MemberRecord record) { this.record = record; }
-        synchronized void prepareSize(ToIntFunction<MemberRecord> encodedSize) {
-            if (bytes < 0) {
-                int measured = encodedSize.applyAsInt(record);
-                if (measured < 1) { throw new IllegalArgumentException("Encoded record size must be positive"); }
-                bytes = measured;
-            }
-        }
-    }
-
-    /** Reuses immutable records and prunes removed cache keys on every prepared snapshot. */
-    private static final class RecordSizes {
-        final ToIntFunction<MemberRecord> encodedSize;
-        private final Map<MemberKey, SizedRecord> cache = new HashMap<>();
-        private long generation;
-        RecordSizes(ToIntFunction<MemberRecord> encodedSize) { this.encodedSize = java.util.Objects.requireNonNull(encodedSize); }
-        synchronized List<SizedRecord> prepare(MembershipTable.Snapshot snapshot) {
-            long current = ++generation;
-            var prepared = new ArrayList<SizedRecord>(snapshot.members().size());
-            for (var member : snapshot.members()) {
-                var record = member.record();
-                if (record.key().equals(snapshot.self().key())) { continue; }
-                var sized = cache.get(record.key());
-                if (sized == null || (sized.record != record && !sized.record.equals(record))) {
-                    sized = new SizedRecord(record);
-                    cache.put(record.key(), sized);
-                }
-                sized.generation = current;
-                prepared.add(sized);
-            }
-            cache.values().removeIf(record -> record.generation != current);
-            return prepared;
-        }
     }
 }

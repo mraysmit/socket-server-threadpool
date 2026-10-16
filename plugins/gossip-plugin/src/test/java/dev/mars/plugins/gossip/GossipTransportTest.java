@@ -219,6 +219,81 @@ class GossipTransportTest {
         }
     }
 
+    /** Rejects version 2 exactly as deployed version-1 code does, unless upgraded; answers version 1 normally. */
+    private static Answer version1Peer(GossipConfig config, List<Integer> versions, java.util.function.BooleanSupplier upgraded, long boot) {
+        return (socket, port, request) -> {
+            int version = ((Number) request.parameters().get("gossipVersion")).intValue();
+            versions.add(version);
+            if (version == 2 && !upgraded.getAsBoolean()) {
+                socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
+                        CommandError.Code.INVALID_PARAMETERS, "INVALID_RECORD: Unsupported gossipVersion"))));
+            } else { socket.getOutputStream().write(reply(config, request, responder(port, boot))); }
+        };
+    }
+
+    @Test void aPeerThatRejectsVersion2IsSentVersion1DirectlyAfterwards() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        // Four connections in total: the peer fixture fails on close if the transport opens more or fewer.
+        try (var transport = new GossipTransport(config, table(config), new GossipMetrics());
+             var peer = new ProtocolPeer(4, version1Peer(config, versions, () -> false, 2))) {
+            for (int i = 0; i < 3; i++) { assertEquals(1, transport.exchange(peer.endpoint()).gossipVersion()); }
+            assertEquals(List.of(2, 1, 1, 1), versions, "Only the first exchange pays for the rejected version-2 attempt");
+            assertEquals(1, transport.version1PeerCount());
+        }
+    }
+
+    @Test void aRememberedVersion1PeerIsTriedWithVersion2AgainAfterTheRecheckInterval() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var clock = new java.util.concurrent.atomic.AtomicLong();
+        var upgraded = new java.util.concurrent.atomic.AtomicBoolean();
+        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), clock::get);
+             var peer = new ProtocolPeer(4, version1Peer(config, versions, upgraded::get, 2))) {
+            transport.exchange(peer.endpoint());
+            clock.addAndGet(GossipTransport.VERSION_1_RECHECK.toNanos() - 1);
+            assertEquals(1, transport.exchange(peer.endpoint()).gossipVersion(), "Still within the recheck interval");
+            upgraded.set(true);
+            clock.addAndGet(1);
+            var current = transport.exchange(peer.endpoint());
+            assertEquals(2, current.gossipVersion(), "The upgraded peer is offered version 2 again");
+            assertEquals(MembershipTable.Admission.ADMITTED, current.senderAdmission());
+            assertEquals(List.of(2, 1, 1, 2), versions);
+            assertEquals(0, transport.version1PeerCount());
+        }
+    }
+
+    @Test void aFailedVersion1RetryIsNotRememberedAsAVersion1Peer() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        try (var transport = new GossipTransport(config, table(config), new GossipMetrics());
+             var peer = new ProtocolPeer(4, (socket, port, request) -> {
+                 int version = ((Number) request.parameters().get("gossipVersion")).intValue();
+                 versions.add(version);
+                 socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
+                         CommandError.Code.INVALID_PARAMETERS, version == 2 ? "INVALID_RECORD: Unsupported gossipVersion" : "CAPACITY: full"))));
+             })) {
+            for (int i = 0; i < 2; i++) { assertThrows(CommandExecutionException.class, () -> transport.exchange(peer.endpoint())); }
+            assertEquals(List.of(2, 1, 2, 1), versions, "Without a completed version-1 exchange, version 2 is tried first again");
+            assertEquals(0, transport.version1PeerCount());
+        }
+    }
+
+    @Test void version1MemoryHoldsAtMostOneEntryPerMemberOrSeed() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 2);
+        assertEquals(2, config.maxMembers() + config.seeds().size());
+        try (var transport = new GossipTransport(config, table(config), new GossipMetrics())) {
+            for (int i = 0; i < 3; i++) {
+                var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+                try (var peer = new ProtocolPeer(2, version1Peer(config, versions, () -> false, 10 + i))) {
+                    transport.exchange(peer.endpoint());
+                    assertEquals(List.of(2, 1), versions);
+                }
+                assertEquals(Math.min(i + 1, 2), transport.version1PeerCount());
+            }
+        }
+    }
+
     @Test void uncorrelatedVersionErrorsAndUnsolicitedLegacySuccessCannotDowngradeTheExchange() throws Exception {
         var config = GossipCommandsTest.config(32768, 4, 8);
         for (String kind : List.of("messageId", "serverId", "errorCode", "unrelatedError", "legacySuccess")) {
@@ -327,6 +402,45 @@ class GossipTransportTest {
                 })) {
                     if (extra == 0) { transport.exchange(peer.endpoint()); }
                     else { assertThrows(IOException.class, () -> transport.exchange(peer.endpoint())); }
+                }
+            }
+        }
+    }
+
+    @Test void replyArrivingInSmallChunksKeepsTheExactByteLimitAndTerminators() throws Exception {
+        // Each chunk is a separate read, so the terminator scan must resume where the previous read stopped.
+        var config = GossipCommandsTest.config(1024, 32, 128);
+        // A short line leaves room for the bytes after its terminator to arrive in the same read.
+        for (int extra : List.of(-400, 0, 1)) {
+            for (String terminator : List.of("\n", "\r\n", "\r", "")) {
+                // A fresh table per case: each peer reuses one identity on a new port.
+                try (var transport = new GossipTransport(config, table(config));
+                     var peer = new ProtocolPeer((socket, port, request) -> {
+                    byte[] ordinary = reply(config, request, responder(port, 2));
+                    byte[] padded = new byte[1024 + extra];
+                    Arrays.fill(padded, (byte) ' ');
+                    System.arraycopy(ordinary, 0, padded, 0, ordinary.length - 1);
+                    // Bytes after the terminator belong to no reply and must be ignored.
+                    byte[] tail = (terminator + (terminator.isEmpty() ? "" : "trailing garbage")).getBytes(StandardCharsets.UTF_8);
+                    byte[] framed = Arrays.copyOf(padded, padded.length + tail.length);
+                    System.arraycopy(tail, 0, framed, padded.length, tail.length);
+                    var output = socket.getOutputStream();
+                    for (int offset = 0; offset < framed.length; offset += 37) {
+                        output.write(framed, offset, Math.min(37, framed.length - offset));
+                        output.flush();
+                        TimeUnit.MILLISECONDS.sleep(1);
+                    }
+                    // No terminator at all: the peer closing the connection ends the reply.
+                    if (terminator.isEmpty()) { socket.shutdownOutput(); }
+                })) {
+                    if (extra <= 0) {
+                        assertEquals("Peer", transport.exchange(peer.endpoint()).sender().key().serverId(),
+                                "terminator=" + terminator.replace("\r", "\\r").replace("\n", "\\n"));
+                    } else {
+                        var failure = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+                        assertEquals("Gossip reply exceeds max.exchange.bytes before parsing", failure.getMessage());
+                    }
+                    assertEquals(0, transport.inflight());
                 }
             }
         }

@@ -18,12 +18,14 @@ package dev.mars.plugins.gossip;
 import java.net.InetAddress;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
 
 /** Bounded candidate/retry state, random ordinary fanout, and fair reserved recovery opportunities. */
@@ -78,21 +80,15 @@ final class PeerSelector {
             if (retry != null && now - retry.attempted < retry.delay) { continue; }
             (item.getValue().recovery() ? recovery : ordinary).add(item.getValue().peer());
         }
-        for (int i = ordinary.size() - 1; i > 0; i--) {
-            int swap = random.nextInt(i + 1);
-            var value = ordinary.get(i); ordinary.set(i, ordinary.get(swap)); ordinary.set(swap, value);
-        }
+        Collections.shuffle(ordinary, random);
         int count = Math.min(config.fanout(), Math.max(0, slots));
         var selected = new ArrayList<GossipConfig.Seed>();
+        int recoveryLeft = recovery.size();
         boolean reserved = ++selections % 3 == 0 || ordinary.isEmpty();
-        if (reserved && !recovery.isEmpty() && count > 0) { selected.add(nextRecovery(recovery)); }
+        if (reserved && recoveryLeft > 0 && count > 0) { selected.add(nextRecovery(recovery)); recoveryLeft--; }
         for (var peer : ordinary) { if (selected.size() == count) { break; } selected.add(peer); }
-        while (selected.size() < count && !selected.containsAll(recovery)) {
-            if (recovery.isEmpty()) { break; }
-            var peer = nextRecovery(recovery);
-            if (!selected.contains(peer)) { selected.add(peer); }
-            else if (selected.containsAll(recovery)) { break; }
-        }
+        // The cursor yields each recovery peer once per cycle, so these never repeat the reserved one.
+        while (recoveryLeft-- > 0 && selected.size() < count) { selected.add(nextRecovery(recovery)); }
         return List.copyOf(selected);
     }
 
@@ -106,8 +102,14 @@ final class PeerSelector {
 
     /** DNS may confirm an alias of an endpoint whose identity is already directly verified. */
     synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, MembershipTable.Snapshot snapshot) {
+        resolved(peer, endpoint, () -> snapshot);
+    }
+
+    /** As above; the snapshot is taken only for a configured seed whose resolved address differs from it. */
+    synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, Supplier<MembershipTable.Snapshot> snapshots) {
         var resolved = normalized(endpoint);
         if (!config.seeds().contains(peer) || normalized(peer).equals(resolved)) { return; }
+        var snapshot = snapshots.get();
         boolean verified = snapshot.members().stream().anyMatch(member -> member.endpointVerified()
                 && !member.record().key().equals(snapshot.self().key())
                 && member.assessment() == MembershipTable.Assessment.ALIVE

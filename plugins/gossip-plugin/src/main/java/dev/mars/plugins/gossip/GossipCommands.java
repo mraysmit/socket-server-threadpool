@@ -35,6 +35,7 @@ final class GossipCommands {
     private final GossipTransport transport;
     private final GossipRuntime runtime;
     private final GossipLog log;
+    private final String serverId;
     private final GossipBatchSelector responses = new GossipBatchSelector();
 
     GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport, GossipRuntime runtime) {
@@ -44,13 +45,13 @@ final class GossipCommands {
         this.transport = transport;
         this.runtime = runtime;
         wire = new GossipWire(config);
+        serverId = table.localKey().serverId();
         var snapshot = table.snapshot();
         log = metrics.log(config, snapshot.self());
         wire.requireForwardable(snapshot.self(), List.of(snapshot.self()));
-        wire.requireReplyFits(snapshot.self().key().serverId(), wire.result(snapshot.self(), List.of()));
-        wire.requireReplyFits(snapshot.self().key().serverId(), status());
-        wire.requireReplyFits(snapshot.self().key().serverId(), pageResult(snapshot,
-                List.of(GossipWire.memberView(snapshot.members().getFirst())), null));
+        wire.requireReplyFits(serverId, wire.result(snapshot.self(), List.of()));
+        wire.requireReplyFits(serverId, status());
+        wire.requireReplyFits(serverId, pageResult(snapshot, List.of(GossipWire.memberView(snapshot.members().getFirst())), null));
     }
 
     Object execute(Map<String, Object> parameters) throws InvalidParametersException {
@@ -59,18 +60,8 @@ final class GossipCommands {
             return switch (operation) {
                 case "exchange" -> exchange(parameters);
                 case "members" -> members(parameters);
-                case "leave" -> {
-                    PluginParameters.requireKeys(parameters, "operation");
-                    var result = Map.of("departure", runtime.leave());
-                    wire.requireReplyFits(table.snapshot().self().key().serverId(), result);
-                    yield result;
-                }
-                case "status" -> {
-                    PluginParameters.requireKeys(parameters, "operation");
-                    var result = status();
-                    wire.requireReplyFits(table.snapshot().self().key().serverId(), result);
-                    yield result;
-                }
+                case "leave" -> operationOnly(parameters, () -> Map.of("departure", runtime.leave()));
+                case "status" -> operationOnly(parameters, this::status);
                 default -> throw new InvalidParametersException("Supported operations: exchange, members, status, leave");
             };
         } catch (MembershipException e) {
@@ -79,9 +70,18 @@ final class GossipCommands {
         }
     }
 
+    /** For operations that take no parameters besides their name; exchange and members check their own replies. */
+    private Object operationOnly(Map<String, Object> parameters, java.util.function.Supplier<Object> result)
+            throws InvalidParametersException {
+        PluginParameters.requireKeys(parameters, "operation");
+        var reply = result.get();
+        wire.requireReplyFits(serverId, reply);
+        return reply;
+    }
+
     private Object exchange(Map<String, Object> parameters) {
         var incoming = wire.decode(parameters, true);
-        var self = table.snapshot().self();
+        var self = table.self();
         MembershipTable.ExchangeMerge merge;
         try {
             if (incoming.sender().key().equals(self.key())) {
@@ -185,7 +185,7 @@ final class GossipCommands {
         if (fields.length != 2 || !fields[0].equals(self.bootId().toString()) || !fields[1].matches("[0-9]{1,10}")) {
             throw GossipWire.invalid("Membership cursor belongs to another instance or is malformed");
         }
-        try { return GossipWire.exactInteger(new java.math.BigInteger(fields[1]), "cursor offset", 0, config.maxRecords()); }
-        catch (NumberFormatException e) { throw GossipWire.invalid("Invalid membership cursor offset"); }
+        // At most ten digits, so parsing cannot overflow a long.
+        return GossipWire.exactInteger(Long.parseLong(fields[1]), "cursor offset", 0, config.maxRecords());
     }
 }

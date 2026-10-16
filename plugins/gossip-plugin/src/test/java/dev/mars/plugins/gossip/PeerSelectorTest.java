@@ -198,6 +198,23 @@ class PeerSelectorTest {
         assertEquals(Set.of("127.0.0.1", "127.0.0.2"), selected.stream().map(GossipConfig.Seed::host).collect(java.util.stream.Collectors.toSet()));
     }
 
+    @Test void aliasConfirmationTakesASnapshotOnlyForASeedWhoseAddressDiffers() {
+        var config = config(2, "Peer@peer.example.test:9010");
+        var table = new MembershipTable(config, self, clock::get);
+        table.mergeDirect(new MemberRecord(new MemberKey("Peer", new UUID(0, 2)), "127.0.0.1", 9010, 1, MemberRecord.State.ALIVE, Map.of()), List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(13));
+        var snapshots = new java.util.concurrent.atomic.AtomicInteger();
+        java.util.function.Supplier<MembershipTable.Snapshot> counted = () -> { snapshots.incrementAndGet(); return table.snapshot(); };
+        var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9010);
+        selector.resolved(new GossipConfig.Seed("Gossiped", "127.0.0.9", 9020), numeric, counted);
+        assertEquals(0, snapshots.get(), "Members learned by gossip are not seeds and need no alias check");
+        selector.resolved(numeric, numeric, counted);
+        assertEquals(0, snapshots.get(), "An address resolving to itself needs no alias check");
+        selector.resolved(config.seeds().getFirst(), numeric, counted);
+        assertEquals(1, snapshots.get());
+        assertEquals(List.of(numeric), selector.select(table.snapshot(), Set.of(), 2), "The verified alias collapses seed and member");
+    }
+
     @Test void unverifiedHostnamesAndDifferentExpectedIdentitiesAreNotSilentlyCollapsed() {
         var config = config(2, "Other@peer.example.test:9010");
         var table = new MembershipTable(config, self, clock::get);

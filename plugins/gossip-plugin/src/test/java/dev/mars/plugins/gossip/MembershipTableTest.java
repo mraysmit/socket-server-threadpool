@@ -308,20 +308,36 @@ class MembershipTableTest {
         assertEquals(3, table.snapshot().retainedIdentities());
     }
 
+    @Test void selfAndLocalKeyFollowTheLocalRecordWithoutASnapshot() {
+        var table = table();
+        assertEquals(self.key(), table.localKey());
+        assertEquals(table.snapshot().self(), table.self());
+        var advanced = table.advanceLocal();
+        assertEquals(advanced, table.self());
+        assertEquals(self.heartbeat() + 1, table.self().heartbeat());
+        var departed = table.leaveLocal();
+        assertEquals(departed, table.self());
+        assertEquals(MemberRecord.State.LEFT, table.self().state());
+        assertEquals(self.key(), table.localKey());
+    }
+
     @Test void restartsRemainDistinctAndReachableDuplicateLogicalIdsAreReportedWithoutAWinner() {
         var table = table();
         var restart = member("Peer", 3, 0);
         table.mergeDirect(peer, List.of());
         table.mergeDirect(restart, List.of());
         assertEquals(java.util.Set.of("Peer"), table.snapshot().identityConflicts());
+        assertEquals(table.snapshot().identityConflicts(), table.identityConflicts());
         assertTrue(view(table, peer.key()).identityConflict());
         assertTrue(view(table, restart.key()).identityConflict());
         assertEquals(1, view(table, peer.key()).record().heartbeat());
         assertEquals(0, view(table, restart.key()).record().heartbeat());
         table.merge(List.of(departed(peer)));
         assertTrue(table.snapshot().identityConflicts().isEmpty());
+        assertTrue(table.identityConflicts().isEmpty());
         table.mergeDirect(member("Self", 4, 0), List.of());
         assertEquals(java.util.Set.of("Self"), table.snapshot().identityConflicts());
+        assertEquals(java.util.Set.of("Self"), table.identityConflicts());
         assertEquals(self, table.snapshot().self());
     }
 

@@ -586,12 +586,11 @@ mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=MembershipTableTest,GossipCapa
 
 The socket capacity cases print `Capacity test PASSED` after verifying the results.
 
-Batch selection uses separate departure and change queues, a fair rotating scan,
-and cached UTF-8 record sizes. It accounts for the envelope and array commas
-incrementally, then validates the complete outgoing message. Each direction has
-its own cursor and cache. Cold snapshots encode each retained peer once for size
-checks; unchanged snapshots reuse those sizes, and changed records invalidate
-their cached sizes. Record-size encoding runs outside the selector's state lock.
+Batch selection uses separate departure and change queues and a fair rotating
+scan. It accounts for the envelope and array commas incrementally, using each
+record's UTF-8 size, which `MemberRecord` computes once and caches, then validates
+the complete outgoing message. Each direction has its own cursor. Record sizes are
+read outside the selector's state lock.
 
 Run the selector and real TCP propagation tests with terminal output:
 
@@ -599,11 +598,8 @@ Run the selector and real TCP propagation tests with terminal output:
 mvn -f plugins/gossip-plugin/pom.xml test "-Dtest=GossipBatchSelectorTest,GossipPropagationTest" "-Dmaven.test.redirectTestOutputToFile=false"
 ```
 
-The selector prints `Batch selector work PASSED` with checked encoding counts:
-127 cold record encodings, zero additional encodings across 1,000 warm selections,
-and four encodings after four records change. These counts cover selection size
-checks; the completed wire message is still encoded for transmission. The elapsed
-time is an observation, with no performance threshold asserted.
+The selector tests check priority and fairness, exact byte budgets, and that
+concurrent selections never duplicate a member within a batch.
 
 Gossip also writes one-line diagnostics to standard error for identity conflicts,
 scheduler failures, cleanup failures, and final departure outcomes. Entries include

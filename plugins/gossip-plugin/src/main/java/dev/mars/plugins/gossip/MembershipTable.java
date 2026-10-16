@@ -109,23 +109,20 @@ public final class MembershipTable {
         if (forwarded.size() >= config.maxBatchMembers()) {
             throw new MembershipException(INVALID_RECORD, "Sender counts toward max.batch.members");
         }
-        var records = new ArrayList<MemberRecord>();
-        records.add(responder);
-        records.addAll(forwarded);
+        var records = new ArrayList<MemberRecord>(forwarded);
+        records.addFirst(responder);
         return validateBatch(records);
     }
 
     private List<MemberRecord> validateBatch(List<MemberRecord> records) {
         checkBatchSize(records);
-        var copy = new ArrayList<MemberRecord>();
         var keys = new HashSet<MemberKey>();
         for (MemberRecord record : records) {
             if (record == null) { throw new MembershipException(INVALID_RECORD, "Member record must not be null"); }
             if (!keys.add(record.key())) { throw new MembershipException(INVALID_RECORD, "Duplicate member key: " + record.key()); }
             checkRecordSize(record);
-            copy.add(record);
         }
-        return List.copyOf(copy);
+        return List.copyOf(records);
     }
 
     private void checkBatchSize(List<?> records) {
@@ -292,26 +289,52 @@ public final class MembershipTable {
         return current.heartbeat() + 1;
     }
 
+    /** The local process identity, which never changes; no lock or copy needed. */
+    public MemberKey localKey() { return localKey; }
+
+    /** The current local owner record, without copying the table. */
+    public synchronized MemberRecord self() { return entries.get(localKey).record(); }
+
+    /** Server IDs with more than one reachable boot ID; cheaper than a snapshot when only this is needed. */
+    public synchronized Set<String> identityConflicts() {
+        return Set.copyOf(conflicts(assessments(clock.getAsLong())));
+    }
+
     public synchronized Snapshot snapshot() {
         long now = clock.getAsLong();
-        var reachableCounts = new HashMap<String, Integer>();
-        for (Entry entry : entries.values()) {
-            if (assessment(entry, now) == Assessment.ALIVE) {
-                reachableCounts.merge(entry.record().key().serverId(), 1, Integer::sum);
-            }
-        }
-        var conflicts = new HashSet<String>();
-        reachableCounts.forEach((id, count) -> { if (count > 1) { conflicts.add(id); } });
-        var members = new ArrayList<MemberView>();
+        var assessments = assessments(now);
+        var conflicts = conflicts(assessments);
+        var members = new ArrayList<MemberView>(entries.size());
         int active = 0;
+        int index = 0;
         for (Entry entry : entries.values()) {
             if (entry.record().state() == ALIVE) { active++; }
-            members.add(new MemberView(entry.record(), assessment(entry, now), age(now, entry.lastAdvance()),
+            members.add(new MemberView(entry.record(), assessments.get(index++), age(now, entry.lastAdvance()),
                     entry.lastDirectSuccess() == null ? null : age(now, entry.lastDirectSuccess()),
                     entry.endpointVerified(), conflicts.contains(entry.record().key().serverId())));
         }
         return new Snapshot(entries.get(localKey).record(), members, conflicts, active,
                 entries.size() + suppressions.size(), suppressions.size(), admissionsSkipped);
+    }
+
+    /** Each entry's assessment at {@code now}, in table order, computed once per caller. */
+    private List<Assessment> assessments(long now) {
+        var assessments = new ArrayList<Assessment>(entries.size());
+        for (Entry entry : entries.values()) { assessments.add(assessment(entry, now)); }
+        return assessments;
+    }
+
+    private Set<String> conflicts(List<Assessment> assessments) {
+        var reachableCounts = new HashMap<String, Integer>();
+        int index = 0;
+        for (Entry entry : entries.values()) {
+            if (assessments.get(index++) == Assessment.ALIVE) {
+                reachableCounts.merge(entry.record().key().serverId(), 1, Integer::sum);
+            }
+        }
+        var conflicts = new HashSet<String>();
+        reachableCounts.forEach((id, count) -> { if (count > 1) { conflicts.add(id); } });
+        return conflicts;
     }
 
     private Assessment assessment(Entry entry, long now) {

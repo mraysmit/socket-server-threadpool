@@ -20,27 +20,24 @@ import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.CommandRequest;
 import dev.mars.protocol.CommandError;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
-import java.nio.channels.CancelledKeyException;
-import java.nio.channels.ClosedSelectorException;
-import java.nio.channels.SelectionKey;
-import java.nio.channels.Selector;
-import java.nio.channels.SocketChannel;
-import java.nio.channels.UnresolvedAddressException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
+import java.util.concurrent.TimeUnit;
+import java.util.function.LongSupplier;
 
 /** One bounded UTF-8 JSON exchange per owned connection, with no transport-created threads. */
 public final class GossipTransport implements GossipRuntime.ExchangeClient {
@@ -52,6 +49,14 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         ConnectFailure(SocketException cause) { super(cause); }
         SocketException socketError() { return (SocketException) getCause(); }
     }
+    /**
+     * Version-1 peers predate structured error codes, so these exact rejections are the only way to recognise one.
+     * Their wording is fixed by the deployed version-1 code; version-2 peers accept both versions and never send them.
+     */
+    private static final Set<String> VERSION_1_REJECTIONS = Set.of(
+            "INVALID_RECORD: gossipVersion must be between 1 and 1", "INVALID_RECORD: Unsupported gossipVersion");
+    /** How long a version-1 peer is sent version 1 directly before version 2 is tried again, in case it was upgraded. */
+    static final Duration VERSION_1_RECHECK = Duration.ofMinutes(10);
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -59,10 +64,13 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final GossipLog log;
     private final GossipBatchSelector requests = new GossipBatchSelector();
     private final Semaphore permits;
-    private final Set<Connection> active = new HashSet<>();
+    private final Set<Socket> active = new HashSet<>();
     private final long connectNanos;
     private final long idleNanos;
     private final long exchangeNanos;
+    private final LongSupplier clock;
+    // serverId:port of peers that completed a version-1 exchange after rejecting version 2, to when that was learned.
+    private final LinkedHashMap<String, Long> version1Peers = new LinkedHashMap<>();
     private boolean closed;
 
     public GossipTransport(GossipConfig config, MembershipTable table) {
@@ -71,19 +79,25 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     public GossipTransport(GossipConfig config, MembershipTable table, Duration connectTimeout,
                            Duration readIdleTimeout, Duration exchangeTimeout) {
-        this(config, table, new GossipMetrics(), connectTimeout, readIdleTimeout, exchangeTimeout);
+        this(config, table, new GossipMetrics(), connectTimeout, readIdleTimeout, exchangeTimeout, System::nanoTime);
     }
 
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics) {
-        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15));
+        this(config, table, metrics, System::nanoTime);
+    }
+
+    /** The clock times only the version-1 memory; socket deadlines always use System.nanoTime. */
+    GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics, LongSupplier clock) {
+        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15), clock);
     }
 
     private GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
-                            Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout) {
+                            Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock) {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
+        this.clock = java.util.Objects.requireNonNull(clock);
         this.metrics = metrics;
-        log = metrics.log(config, table.snapshot().self());
+        log = metrics.log(config, table.self());
         wire = new GossipWire(config);
         permits = new Semaphore(config.maxInflight());
         connectNanos = positiveNanos(connectTimeout);
@@ -107,15 +121,16 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         UUID messageId = null;
         try {
             var snapshot = table.snapshot();
-            if (peer.serverId().equals(snapshot.self().key().serverId())
-                    && peer.port() == snapshot.self().port() && peer.host().equals(snapshot.self().host())) {
+            if (PeerSelector.isSelf(snapshot.self(), peer)) {
                 throw new IOException("Cannot exchange with the local endpoint");
             }
             var members = requests.select(snapshot, config.maxBatchMembers(), wire.requestMemberBudget(snapshot.self()));
             // Resolve once; both protocol attempts and all address fallbacks share one permit and one deadline.
             var candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port())).toList();
             long deadline = System.nanoTime() + exchangeNanos;
-            int version = 2;
+            String peerKey = peer.serverId() + ":" + peer.port();
+            int version = knownVersion1(peerKey) ? 1 : 2;
+            boolean downgraded = false;
             while (true) {
                 messageId = UUID.randomUUID();
                 byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members, version)));
@@ -127,9 +142,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 if (!peer.serverId().equals(reply.serverId())) { throw new IOException("Gossip server ID mismatch"); }
                 if (reply.error() != null) {
                     if (version == 2 && reply.error().code() == CommandError.Code.INVALID_PARAMETERS
-                            && Set.of("INVALID_RECORD: gossipVersion must be between 1 and 1",
-                            "INVALID_RECORD: Unsupported gossipVersion").contains(reply.error().message())) {
+                            && VERSION_1_REJECTIONS.contains(reply.error().message())) {
                         version = 1;
+                        downgraded = true;
                         continue;
                     }
                     throw new CommandExecutionException(reply);
@@ -139,16 +154,18 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 if (!reply.serverId().equals(result.sender().key().serverId())) {
                     throw new IOException("Outer serverId disagrees with gossip sender");
                 }
-                wire.requireForwardable(table.snapshot().self(), result.records());
+                wire.requireForwardable(table.self(), result.records());
                 // Closing cancels uncommitted work as well as sockets. No merge may start after close returns.
                 synchronized (this) {
                     if (closed) { throw new IOException("Gossip transport is closed"); }
                     table.mergeDirect(result.sender(), result.members());
                     metrics.success(true);
                 }
-                var merged = table.snapshot();
-                if (!merged.identityConflicts().isEmpty()) {
-                    log.identity("outbound", peer, messageId, "Reachable duplicate server IDs: " + merged.identityConflicts());
+                // Remember only after a correlated, identity-checked version-1 exchange has fully succeeded.
+                if (downgraded) { rememberVersion1(peerKey); }
+                var conflicts = table.identityConflicts();
+                if (!conflicts.isEmpty()) {
+                    log.identity("outbound", peer, messageId, "Reachable duplicate server IDs: " + conflicts);
                 }
                 return result;
             }
@@ -156,15 +173,32 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             metrics.outboundFailures.incrementAndGet();
             if (e.reason() == MembershipException.Reason.CONFLICT) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw new IOException("Gossip " + e.reason() + ": " + e.getMessage(), e);
-        } catch (CancelledKeyException | ClosedSelectorException | UnresolvedAddressException e) {
-            metrics.outboundFailures.incrementAndGet();
-            throw new IOException("Gossip connection closed or endpoint unresolved", e);
         } catch (IOException e) {
             metrics.outboundFailures.incrementAndGet();
             if (GossipRuntime.classify(e) == GossipMetrics.Failure.IDENTITY) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw e;
         } finally { permits.release(); }
     }
+
+    private boolean knownVersion1(String peerKey) {
+        synchronized (version1Peers) {
+            Long learned = version1Peers.get(peerKey);
+            if (learned == null) { return false; }
+            if (clock.getAsLong() - learned >= VERSION_1_RECHECK.toNanos()) { version1Peers.remove(peerKey); return false; }
+            return true;
+        }
+    }
+
+    /** Bounded like the peer selector's retry state: at most one entry per member or seed. */
+    private void rememberVersion1(String peerKey) {
+        synchronized (version1Peers) {
+            version1Peers.remove(peerKey);
+            version1Peers.put(peerKey, clock.getAsLong());
+            while (version1Peers.size() > config.maxMembers() + config.seeds().size()) { version1Peers.pollFirstEntry(); }
+        }
+    }
+
+    int version1PeerCount() { synchronized (version1Peers) { return version1Peers.size(); } }
 
     private record Reply(String text, InetSocketAddress address) { }
 
@@ -181,79 +215,74 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         throw unreachable;
     }
 
+    /**
+     * One blocking connection. Connects and reads have socket timeouts; a blocking write has none, so a watchdog
+     * closes the socket once the overall deadline passes. On a virtual thread, an interrupt also closes it.
+     */
     private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
         checkDeadline(deadline);
-        try (var connection = new Connection()) {
+        try (var socket = new Socket()) {
             synchronized (this) {
                 if (closed) { throw new IOException("Gossip transport is closed"); }
-                active.add(connection);
+                active.add(socket);
             }
+            var watchdog = Thread.ofVirtual().start(() -> {
+                try { TimeUnit.NANOSECONDS.sleep(deadline - System.nanoTime()); socket.close(); }
+                catch (InterruptedException | IOException finished) { /* The exchange ended first. */ }
+            });
             try {
-                connection.channel.configureBlocking(false);
-                long started = System.nanoTime();
-                try {
-                    if (!connection.channel.connect(address)) {
-                        long connectDeadline = started + Math.min(connectNanos, deadline - started);
-                        while (!connection.channel.finishConnect()) { await(connection, SelectionKey.OP_CONNECT, connectDeadline); }
-                    }
-                } catch (SocketException refusedOrUnreachable) { throw new ConnectFailure(refusedOrUnreachable); }
-                var output = ByteBuffer.allocate(payload.length + 1).put(payload).put((byte) '\n');
-                output.flip();
-                while (output.hasRemaining()) {
+                try { socket.connect(address, millis(Math.min(connectNanos, deadline - System.nanoTime()))); }
+                catch (SocketException refusedOrUnreachable) {
                     checkDeadline(deadline);
-                    if (connection.channel.write(output) == 0) { await(connection, SelectionKey.OP_WRITE, deadline); }
+                    throw new ConnectFailure(refusedOrUnreachable);
                 }
-                return readLine(connection, deadline);
-            } finally { synchronized (this) { active.remove(connection); } }
+                var output = socket.getOutputStream();
+                output.write(payload);
+                output.write('\n');
+                output.flush();
+                return readLine(socket, deadline);
+            } catch (SocketException closedUnderneath) {
+                // Closed by the watchdog, by an interrupt, or by close(): report which, rather than a bare socket error.
+                checkDeadline(deadline);
+                synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed", closedUnderneath); } }
+                throw closedUnderneath;
+            } finally {
+                watchdog.interrupt();
+                synchronized (this) { active.remove(socket); }
+            }
         }
     }
 
-    private String readLine(Connection connection, long deadline) throws IOException {
-        var bytes = new ByteArrayOutputStream(Math.min(4096, config.maxExchangeBytes()));
-        var input = ByteBuffer.allocate(4096);
-        long idleDeadline = System.nanoTime() + idleNanos;
+    /** Reads one reply line into a bounded buffer, scanning only newly read bytes for the terminator. */
+    private String readLine(Socket socket, long deadline) throws IOException {
+        // One spare byte tells a full-length line followed by its terminator apart from an oversized line.
+        byte[] bytes = new byte[config.maxExchangeBytes() + 1];
+        var input = socket.getInputStream();
+        int length = 0;
+        int scanned = 0;
         while (true) {
             checkDeadline(deadline);
-            checkDeadline(idleDeadline);
-            input.clear();
-            int count = connection.channel.read(input);
+            // Each read waits at most the idle limit, and never past the overall deadline.
+            socket.setSoTimeout(millis(Math.min(idleNanos, deadline - System.nanoTime())));
+            int count = input.read(bytes, length, bytes.length - length);
             if (count < 0) {
-                if (bytes.size() == 0) { throw new IOException("Peer closed without a reply"); }
-                return decodeUtf8(bytes);
+                if (length == 0) { throw new IOException("Peer closed without a reply"); }
+                return decodeUtf8(bytes, length);
             }
-            if (count == 0) {
-                long now = System.nanoTime();
-                await(connection, SelectionKey.OP_READ,
-                        deadline - now < idleDeadline - now ? deadline : idleDeadline);
-                continue;
+            length += count;
+            for (; scanned < length; scanned++) {
+                if (bytes[scanned] == '\n' || bytes[scanned] == '\r') { return decodeUtf8(bytes, scanned); }
             }
-            idleDeadline = System.nanoTime() + idleNanos;
-            input.flip();
-            while (input.hasRemaining()) {
-                byte value = input.get();
-                if (value == '\n' || value == '\r') { return decodeUtf8(bytes); }
-                if (bytes.size() == config.maxExchangeBytes()) {
-                    throw new IOException("Gossip reply exceeds max.exchange.bytes before parsing");
-                }
-                bytes.write(value);
-            }
+            if (length == bytes.length) { throw new IOException("Gossip reply exceeds max.exchange.bytes before parsing"); }
         }
     }
 
-    private static String decodeUtf8(ByteArrayOutputStream bytes) throws IOException {
+    /** Socket timeouts are whole milliseconds, and zero would mean no timeout at all. */
+    private static int millis(long nanos) { return (int) Math.max(1, Math.min(Integer.MAX_VALUE, TimeUnit.NANOSECONDS.toMillis(nanos))); }
+
+    private static String decodeUtf8(byte[] bytes, int length) throws IOException {
         return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes.toByteArray())).toString();
-    }
-
-    private static void await(Connection connection, int operation, long deadline) throws IOException {
-        connection.channel.register(connection.selector, operation);
-        while (true) {
-            checkDeadline(deadline);
-            long millis = Math.max(1, (deadline - System.nanoTime()) / 1_000_000);
-            int ready = connection.selector.select(millis);
-            connection.selector.selectedKeys().clear();
-            if (ready > 0) { return; }
-        }
+                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes, 0, length)).toString();
     }
 
     private static void checkDeadline(long deadline) throws IOException {
@@ -271,31 +300,17 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     /** Close owned I/O resources synchronously; callers own their threads, and DNS may still be running. */
     @Override public void close() throws IOException {
-        List<Connection> connections;
+        List<Socket> sockets;
         synchronized (this) {
             if (closed) { return; }
             closed = true;
-            connections = List.copyOf(active);
+            sockets = List.copyOf(active);
         }
         IOException failure = null;
-        for (Connection connection : connections) {
-            try { connection.close(); }
+        for (Socket socket : sockets) {
+            try { socket.close(); }
             catch (IOException e) { if (failure == null) { failure = e; } else { failure.addSuppressed(e); } }
         }
         if (failure != null) { throw failure; }
-    }
-
-    private static final class Connection implements AutoCloseable {
-        final Selector selector;
-        final SocketChannel channel;
-        Connection() throws IOException {
-            selector = Selector.open();
-            try { channel = SocketChannel.open(); }
-            catch (IOException | RuntimeException e) { selector.close(); throw e; }
-        }
-        @Override public void close() throws IOException {
-            try { channel.close(); }
-            finally { selector.close(); }
-        }
     }
 }

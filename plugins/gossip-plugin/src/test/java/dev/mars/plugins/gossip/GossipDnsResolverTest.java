@@ -15,8 +15,6 @@
  */
 package dev.mars.plugins.gossip;
 
-import dev.mars.plugins.gossip.fixture.DnsProcessFixture;
-import dev.mars.testing.HostProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
@@ -36,16 +34,31 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @Timeout(15)
 class GossipDnsResolverTest {
-    private final List<Process> helpers = new CopyOnWriteArrayList<>();
+    /** Threads that ran a lookup, one per lookup actually performed. */
+    private final List<Thread> lookups = new CopyOnWriteArrayList<>();
 
-    private Process launch(String host) throws IOException {
-        try {
-            var classpath = Path.of(DnsProcessFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
-            var process = new ProcessBuilder(HostProcess.javaExecutable().toString(), "-Ddev.mars.announce=false", "-cp", classpath, DnsProcessFixture.class.getName(), host)
-                    .redirectErrorStream(true).start();
-            helpers.add(process);
-            return process;
-        } catch (java.net.URISyntaxException e) { throw new IOException(e); }
+    private InetAddress[] launch(String host) throws Exception {
+        lookups.add(Thread.currentThread());
+        return fixtureLookup(host, null);
+    }
+
+    /**
+     * Lookup behaviour chosen by hostname prefix: {@code stall} blocks until interrupted, {@code wait} blocks until
+     * {@code release} exists, {@code bad} returns no addresses, {@code fail} is unknown, {@code mixed} returns two
+     * ordinary addresses around a loopback one, and anything else resolves to 127.0.0.1 and ::1.
+     */
+    static InetAddress[] fixtureLookup(String host, Path release) throws Exception {
+        if (host.startsWith("stall")) { Thread.sleep(300_000); }
+        if (host.startsWith("wait")) {
+            while (!java.nio.file.Files.exists(release)) { Thread.sleep(5); }
+            return new InetAddress[] {InetAddress.ofLiteral("127.0.0.1")};
+        }
+        if (host.startsWith("bad")) { return new InetAddress[0]; }
+        if (host.startsWith("fail")) { throw new java.net.UnknownHostException(host); }
+        if (host.startsWith("mixed")) {
+            return new InetAddress[] {InetAddress.ofLiteral("192.0.2.1"), InetAddress.ofLiteral("127.0.0.1"), InetAddress.ofLiteral("192.0.2.2")};
+        }
+        return new InetAddress[] {InetAddress.ofLiteral("127.0.0.1"), InetAddress.ofLiteral("::1")};
     }
 
     @Test void actualSystemResolverHelperResolvesLocalhostAndNumericEndpointsNeedNoHelper() throws Exception {
@@ -65,16 +78,16 @@ class GossipDnsResolverTest {
             var peer = new GossipConfig.Seed("Peer", "good.test", 9000);
             assertEquals("127.0.0.1", resolver.resolve(peer).host());
             assertTrue(InetAddress.ofLiteral(resolver.resolve(peer).host()).isLoopbackAddress());
-            assertEquals(1, helpers.size());
+            assertEquals(1, lookups.size());
             clock.set(TimeUnit.SECONDS.toNanos(61));
             resolver.resolve(peer);
-            assertEquals(2, helpers.size());
+            assertEquals(2, lookups.size());
             resolver.resolve(new GossipConfig.Seed("Peer", "another.test", 9000));
             assertEquals(1, resolver.cacheSize());
             resolver.resolve(peer);
-            assertEquals(4, helpers.size());
+            assertEquals(4, lookups.size());
         }
-        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+        await(() -> lookups.stream().noneMatch(Thread::isAlive));
     }
 
     @Test void resolveAllReturnsEveryAddressAndRotatesWhichComesFirst() throws Exception {
@@ -86,7 +99,7 @@ class GossipDnsResolverTest {
             assertEquals(first.reversed(), second, "The first address rotates; the rest remain as fallbacks");
             assertTrue(first.stream().allMatch(endpoint -> endpoint.serverId().equals("Peer") && endpoint.port() == 9000));
             assertEquals(first.getFirst(), resolver.resolve(peer), "resolve returns the next first address");
-            assertEquals(1, helpers.size(), "Rotation is served from the cache");
+            assertEquals(1, lookups.size(), "Rotation is served from the cache");
             var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9000);
             assertEquals(List.of(numeric), resolver.resolveAll(numeric));
         }
@@ -98,10 +111,10 @@ class GossipDnsResolverTest {
             for (String host : List.of("bad.test", "fail.test")) {
                 assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", host, 9000)));
             }
-            assertEquals(0, resolver.activeHelpers());
+            await(() -> resolver.activeHelpers() == 0);
             assertEquals(0, resolver.cacheSize());
         }
-        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+        await(() -> lookups.stream().noneMatch(Thread::isAlive));
     }
 
     @Test void closeKillsAnActiveLookupAndUnblocksTheOwnedCaller() throws Exception {
@@ -114,7 +127,7 @@ class GossipDnsResolverTest {
             var failure = assertThrows(ExecutionException.class, () -> lookup.get(2, TimeUnit.SECONDS));
             assertInstanceOf(IOException.class, failure.getCause());
             assertEquals(0, resolver.activeHelpers());
-            assertTrue(helpers.stream().noneMatch(Process::isAlive));
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
             assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)));
         }
     }
@@ -139,7 +152,7 @@ class GossipDnsResolverTest {
             assertEquals("STOPPED", metrics.workerState);
             assertEquals(0, metrics.workers);
             assertTrue(lookupThreads.stream().noneMatch(Thread::isAlive));
-            assertTrue(helpers.stream().noneMatch(Process::isAlive));
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
         }
     }
 
@@ -165,7 +178,7 @@ class GossipDnsResolverTest {
             assertEquals(1, runtime.departure().get("cancelled"));
             assertEquals(0, resolver.activeHelpers());
             assertTrue(callers.stream().noneMatch(Thread::isAlive));
-            assertTrue(helpers.stream().noneMatch(Process::isAlive));
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
         }
     }
 

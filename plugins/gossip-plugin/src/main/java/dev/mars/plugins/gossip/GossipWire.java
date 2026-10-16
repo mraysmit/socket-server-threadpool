@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Stream;
 
 import static dev.mars.plugins.gossip.MembershipException.Reason.INVALID_RECORD;
 
@@ -46,12 +47,7 @@ public final class GossipWire {
                            MembershipTable.Admission senderAdmission) {
         public Exchange(MemberRecord sender, List<MemberRecord> members) { this(sender, members, 1, null); }
         public Exchange { members = List.copyOf(members); }
-        public List<MemberRecord> records() {
-            var records = new ArrayList<MemberRecord>();
-            records.add(sender);
-            records.addAll(members);
-            return List.copyOf(records);
-        }
+        public List<MemberRecord> records() { return Stream.concat(Stream.of(sender), members.stream()).toList(); }
     }
 
     public GossipWire(GossipConfig config) { this.config = config; }
@@ -242,7 +238,13 @@ public final class GossipWire {
         return result;
     }
 
-    static int exactInteger(Object value, String field, int min, int max) {
+    static int exactInteger(Object value, String field, int min, int max) { return (int) exactLong(value, field, min, max); }
+
+    /**
+     * An exact JSON integer in [min, max]: fractions, strings and other coercions are rejected. The range message is
+     * also what deployed version-1 peers send for an unsupported gossipVersion, so its wording must not change.
+     */
+    static long exactLong(Object value, String field, long min, long max) {
         long number;
         if (value instanceof BigInteger integer) {
             try { number = integer.longValueExact(); }
@@ -251,7 +253,7 @@ public final class GossipWire {
             number = ((Number) value).longValue();
         } else { throw invalid(field + " must be an integer"); }
         if (number < min || number > max) { throw invalid(field + " must be between " + min + " and " + max); }
-        return (int) number;
+        return number;
     }
 
     static byte[] bytes(Object value) {

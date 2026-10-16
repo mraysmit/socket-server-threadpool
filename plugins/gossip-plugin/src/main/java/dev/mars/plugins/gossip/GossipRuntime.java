@@ -56,6 +56,7 @@ final class GossipRuntime implements AutoCloseable {
     private final LongSupplier clock;
     private final PeerSelector selector;
     private final GossipLog log;
+    private final String serverId;
     private final Map<GossipConfig.Seed, Thread> workers = new HashMap<>();
     private final Set<Thread> ownedWorkers = new HashSet<>();
     private final Set<String> resolvedInFlight = new HashSet<>();
@@ -96,30 +97,23 @@ final class GossipRuntime implements AutoCloseable {
         this.table = table;
         this.transport = transport;
         this.metrics = metrics;
-        log = metrics.log(config, table.snapshot().self());
+        log = metrics.log(config, table.self());
+        serverId = table.localKey().serverId();
         this.clock = clock;
         this.resolver = resolver;
         if (departureTimeout.isNegative() || departureTimeout.isZero()) { throw new IllegalArgumentException("Positive departure timeout required"); }
         departureNanos = departureTimeout.toNanos();
         selector = new PeerSelector(config, clock, random);
         lastHeartbeat = clock.getAsLong();
-        try {
-            var interfaces = NetworkInterface.getNetworkInterfaces();
-            if (interfaces != null) {
-                while (interfaces.hasMoreElements()) {
-                    var addresses = interfaces.nextElement().getInetAddresses();
-                    while (addresses.hasMoreElements()) { localAddresses.add(addresses.nextElement()); }
-                }
-            }
-        } catch (java.net.SocketException unavailable) { /* Exact configured self endpoints still remain excluded. */ }
+        try { NetworkInterface.networkInterfaces().flatMap(NetworkInterface::inetAddresses).forEach(localAddresses::add); }
+        catch (java.net.SocketException unavailable) { /* Exact configured self endpoints still remain excluded. */ }
     }
 
     synchronized void start() {
         if (started || stopped) { throw new IllegalStateException("Gossip runtime cannot restart"); }
         started = true;
         metrics.workerState = "RUNNING";
-        String id = table.snapshot().self().key().serverId();
-        scheduler = Thread.ofVirtual().name("gossip-" + id + "-rounds").unstarted(this::run);
+        scheduler = Thread.ofVirtual().name("gossip-" + serverId + "-rounds").unstarted(this::run);
         scheduler.setContextClassLoader(CommandPlugin.class.getClassLoader());
         scheduler.start();
     }
@@ -223,9 +217,8 @@ final class GossipRuntime implements AutoCloseable {
         } else { peers = selector.select(table.snapshot(), Set.copyOf(workers.keySet()), slots); }
         var roundDestinations = new HashSet<String>();
         for (var peer : peers) {
-            String id = table.snapshot().self().key().serverId();
             boolean departing = leaving;
-            var worker = Thread.ofVirtual().name("gossip-" + id + "-exchange").unstarted(() -> exchange(peer, departing, roundDestinations));
+            var worker = Thread.ofVirtual().name("gossip-" + serverId + "-exchange").unstarted(() -> exchange(peer, departing, roundDestinations));
             worker.setContextClassLoader(CommandPlugin.class.getClassLoader());
             workers.put(peer, worker);
             ownedWorkers.add(worker);
@@ -254,9 +247,9 @@ final class GossipRuntime implements AutoCloseable {
             List<GossipConfig.Seed> attempts;
             synchronized (this) {
                 if (stopped || (!departing && leaving)) { return; }
-                var snapshot = table.snapshot();
-                selector.resolved(peer, endpoint, snapshot);
-                int selfPort = snapshot.self().port();
+                // A full snapshot is needed only to confirm a seed alias, so take it only then.
+                selector.resolved(peer, endpoint, table::snapshot);
+                int selfPort = table.self().port();
                 if (isLocal(endpoint, selfPort)) {
                     metrics.skipped.incrementAndGet();
                     outcome = "SKIPPED";
@@ -321,10 +314,9 @@ final class GossipRuntime implements AutoCloseable {
             }
             if (cause instanceof CommandExecutionException remote) { return classifyProtocol(remote.reply().error().message()); }
         }
-        String message = failure.getMessage();
-        if (message != null && (message.contains("mismatch") || message.contains("disagrees"))) { return GossipMetrics.Failure.IDENTITY; }
-        if (message != null && message.startsWith("Invalid message reply")) { return GossipMetrics.Failure.PROTOCOL; }
-        if (message != null && message.contains("exceeds max.exchange.bytes")) { return GossipMetrics.Failure.PROTOCOL; }
+        String message = java.util.Objects.toString(failure.getMessage(), "");
+        if (message.contains("mismatch") || message.contains("disagrees")) { return GossipMetrics.Failure.IDENTITY; }
+        if (message.startsWith("Invalid message reply") || message.contains("exceeds max.exchange.bytes")) { return GossipMetrics.Failure.PROTOCOL; }
         return GossipMetrics.Failure.NETWORK;
     }
 
@@ -364,26 +356,24 @@ final class GossipRuntime implements AutoCloseable {
         var cleanupProblems = new java.util.ArrayList<CleanupProblem>();
         for (Thread thread : owned) { if (thread != Thread.currentThread()) { thread.interrupt(); } }
         try {
-            try { transport.close(); }
-            catch (IOException e) { failure = e; cleanupProblems.add(new CleanupProblem("transport", e)); }
-            try { resolver.close(); }
-            catch (IOException e) {
-                cleanupProblems.add(new CleanupProblem("dnsResolver", e));
-                if (failure == null) { failure = e; } else { failure.addSuppressed(e); }
-            }
+            try { transport.close(); } catch (IOException e) { cleanupProblems.add(new CleanupProblem("transport", e)); }
+            resolver.close();
             for (Thread thread : owned) {
                 if (thread == Thread.currentThread()) { continue; }
-                while (thread.isAlive() && thread != Thread.currentThread() && deadline - System.nanoTime() > 0) {
+                while (thread.isAlive() && deadline - System.nanoTime() > 0) {
                     try { thread.join(Duration.ofNanos(Math.max(1, deadline - System.nanoTime()))); }
                     catch (InterruptedException e) { interrupted = true; }
                 }
                 if (thread.isAlive()) {
-                    var error = new IOException("Gossip worker did not stop within " + STOP_TIMEOUT + ": " + thread.getName());
-                    cleanupProblems.add(new CleanupProblem(thread.getName(), error));
-                    if (failure == null) { failure = error; } else { failure.addSuppressed(error); }
+                    cleanupProblems.add(new CleanupProblem(thread.getName(),
+                            new IOException("Gossip worker did not stop within " + STOP_TIMEOUT + ": " + thread.getName())));
                 }
             }
         } finally {
+            // The first problem is thrown, carrying the others as suppressed exceptions, in the order they occurred.
+            for (var problem : cleanupProblems) {
+                if (failure == null) { failure = problem.failure(); } else { failure.addSuppressed(problem.failure()); }
+            }
             Map<String, Object> outcome = null;
             synchronized (this) {
                 metrics.workerState = failure == null ? departed ? "QUIESCED" : "STOPPED" : "CLEANUP_FAILED";
@@ -399,5 +389,5 @@ final class GossipRuntime implements AutoCloseable {
         if (failure != null) { throw failure; }
     }
 
-    private record CleanupProblem(String resource, Throwable failure) { }
+    private record CleanupProblem(String resource, IOException failure) { }
 }

@@ -15,8 +15,6 @@
  */
 package dev.mars.plugins.gossip;
 
-import dev.mars.plugins.gossip.fixture.DnsProcessFixture;
-import dev.mars.testing.HostProcess;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -183,7 +181,7 @@ class GossipRuntimeTest {
         var metrics = new GossipMetrics();
         var offered = new CopyOnWriteArrayList<List<String>>();
         var threads = new CopyOnWriteArrayList<Thread>();
-        var helpers = new CopyOnWriteArrayList<Process>();
+        var helpers = new CopyOnWriteArrayList<Thread>();
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Fallback addresses were not offered"); }
             @Override public GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
@@ -201,7 +199,7 @@ class GossipRuntimeTest {
             assertEquals(1L, ((Map<?, ?>) metrics.runtime().get("failures")).get("NETWORK"), "One failure per exchange, not per address");
             assertEquals(1, metrics.retryingPeers);
         }
-        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+        GossipDnsResolverTest.await(() -> helpers.stream().noneMatch(Thread::isAlive));
     }
 
     @Test void legacyRemoteCapacityErrorsIncrementOnlyTheCapacityCategoryAndBackOffThePeer() throws Exception {
@@ -241,7 +239,7 @@ class GossipRuntimeTest {
         var metrics = new GossipMetrics();
         var client = new Client(false, false);
         var release = temporary.resolve("release-dns");
-        var helpers = new CopyOnWriteArrayList<Process>();
+        var helpers = new CopyOnWriteArrayList<Thread>();
         try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get,
                 new Random(5), controlledResolver(release, helpers))) {
             runtime.round();
@@ -259,7 +257,7 @@ class GossipRuntimeTest {
             assertEquals(1, metrics.skipped.get(), "Later rounds should coalesce the verified alias before creating a worker");
             assertEquals(1, helpers.size());
         }
-        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+        GossipDnsResolverTest.await(() -> helpers.stream().noneMatch(Thread::isAlive));
     }
 
     @Test void aSuccessfulHostnameBootstrapBecomesOneOrdinaryTargetOnLaterRounds() throws Exception {
@@ -280,7 +278,7 @@ class GossipRuntimeTest {
             @Override public void close() { }
         };
         var release = Files.createFile(temporary.resolve("release-dns"));
-        var helpers = new CopyOnWriteArrayList<Process>();
+        var helpers = new CopyOnWriteArrayList<Thread>();
         try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get,
                 new Random(6), controlledResolver(release, helpers))) {
             for (int round = 1; round <= 3; round++) {
@@ -291,7 +289,7 @@ class GossipRuntimeTest {
             assertEquals(1, helpers.size());
             assertEquals(0, metrics.skipped.get());
         }
-        assertTrue(helpers.stream().noneMatch(Process::isAlive));
+        GossipDnsResolverTest.await(() -> helpers.stream().noneMatch(Thread::isAlive));
     }
 
     @Test void repeatedSchedulerFailuresAreVisibleAndRateLimitedWithoutStoppingCleanup() throws Exception {
@@ -317,15 +315,11 @@ class GossipRuntimeTest {
         }
     }
 
-    private GossipDnsResolver controlledResolver(Path release, List<Process> helpers) {
+    /** Records each lookup's thread in {@code lookups}; hostnames choose the fixture behaviour. */
+    private GossipDnsResolver controlledResolver(Path release, List<Thread> lookups) {
         return new GossipDnsResolver(8, 2, Duration.ofSeconds(5), System::nanoTime, host -> {
-            try {
-                String classpath = Path.of(DnsProcessFixture.class.getProtectionDomain().getCodeSource().getLocation().toURI()).toString();
-                var process = new ProcessBuilder(HostProcess.javaExecutable().toString(), "-cp", classpath, DnsProcessFixture.class.getName(), host, release.toString())
-                        .redirectErrorStream(true).start();
-                helpers.add(process);
-                return process;
-            } catch (java.net.URISyntaxException e) { throw new IOException(e); }
+            lookups.add(Thread.currentThread());
+            return GossipDnsResolverTest.fixtureLookup(host, release);
         });
     }
 

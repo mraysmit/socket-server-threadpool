@@ -112,17 +112,14 @@ class GossipBatchSelectorTest {
         assertThrows(IllegalArgumentException.class, () -> selector.select(snapshot(), 0, 10));
     }
 
-    @Test void removedRecordsArePrunedFromQueuesAndSizeCacheAndReappearAsNewCandidates() {
-        var calls = new AtomicInteger();
-        var selector = new GossipBatchSelector(record -> { calls.incrementAndGet(); return 10; });
+    @Test void removedRecordsArePrunedFromQueuesAndReappearAsNewCandidates() {
+        var selector = new GossipBatchSelector(record -> 10);
         var a = GossipCommandsTest.member("A", 2);
         var b = GossipCommandsTest.member("B", 3);
         selector.select(snapshot(a, b), 2, 10);
         assertEquals(List.of(a), selector.select(snapshot(a), 2, 10));
-        assertEquals(2, calls.get());
         var selected = selector.select(snapshot(b, a), 3, 21);
         assertEquals(java.util.Set.of(a, b), java.util.Set.copyOf(selected));
-        assertEquals(3, calls.get(), "A removed identity must not retain its cached encoding indefinitely");
     }
 
     @Test void changingRecordContentsInvalidatesItsSizeEvenIfAnInvalidSnapshotReusesTheVersion() {
@@ -163,9 +160,8 @@ class GossipBatchSelectorTest {
         }
     }
 
-    @Test void concurrentSelectionSharesColdEncodingsAndNeverDuplicatesMembersWithinABatch() throws Exception {
-        var calls = new AtomicInteger();
-        var selector = new GossipBatchSelector(record -> { calls.incrementAndGet(); return record.serializedBytes(); });
+    @Test void concurrentSelectionNeverDuplicatesMembersWithinABatch() throws Exception {
+        var selector = new GossipBatchSelector();
         var members = new MemberRecord[32];
         for (int i = 0; i < members.length; i++) { members[i] = GossipCommandsTest.member("Peer-" + i, i + 2); }
         var state = snapshot(members);
@@ -185,7 +181,6 @@ class GossipBatchSelectorTest {
             }
             assertEquals(32, covered.size());
         }
-        assertEquals(32, calls.get(), "Concurrent cold calls must share each immutable record's size calculation");
     }
 
     @Test void recordEncodingCannotHoldTheSelectorStateLockOrBlockAnIndependentEmptySnapshot() throws Exception {
@@ -209,26 +204,5 @@ class GossipBatchSelectorTest {
                 assertEquals(1, blocked.get(2, TimeUnit.SECONDS).size());
             } finally { release.countDown(); }
         }
-    }
-
-    @Test void warmedSelectionEncodesOnlyChangedRecordsInsteadOfEveryGrowingBatch() {
-        var calls = new AtomicInteger();
-        var selector = new GossipBatchSelector(record -> { calls.incrementAndGet(); return record.serializedBytes(); });
-        var members = new MemberRecord[127];
-        for (int i = 0; i < members.length; i++) { members[i] = GossipCommandsTest.member("Peer-" + i, i + 2); }
-        var state = snapshot(members);
-        assertEquals(31, selector.select(state, 32, 32768).size());
-        assertEquals(127, calls.get());
-        long began = System.nanoTime();
-        for (int i = 0; i < 1000; i++) { assertEquals(31, selector.select(state, 32, 32768).size()); }
-        long elapsed = System.nanoTime() - began;
-        assertEquals(127, calls.get(), "Unchanged records must not be re-encoded for size checks");
-        for (int i = 0; i < 4; i++) {
-            var old = members[i];
-            members[i] = new MemberRecord(old.key(), old.host(), old.port(), 2, old.state(), old.metadata());
-        }
-        selector.select(snapshot(members), 32, 32768);
-        assertEquals(131, calls.get());
-        System.out.printf("Batch selector work PASSED | members=128 | batch=32 | coldRecordEncodes=127 | warmSelections=1000 | warmRecordEncodes=0 | changedRecordEncodes=4 | warmElapsedMs=%.3f%n", elapsed / 1_000_000.0);
     }
 }
