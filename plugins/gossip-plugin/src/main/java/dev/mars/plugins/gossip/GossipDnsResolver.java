@@ -60,15 +60,21 @@ final class GossipDnsResolver implements AutoCloseable {
         this.launcher = launcher;
     }
 
-    GossipConfig.Seed resolve(GossipConfig.Seed peer) throws IOException {
+    GossipConfig.Seed resolve(GossipConfig.Seed peer) throws IOException { return resolveAll(peer).getFirst(); }
+
+    /**
+     * Every address of the peer's host. The first address rotates between calls to spread load; the rest are
+     * connection fallbacks, so one unreachable address (for example an unrouted IPv6 record) cannot fail the peer.
+     */
+    List<GossipConfig.Seed> resolveAll(GossipConfig.Seed peer) throws IOException {
         String host = peer.host().toLowerCase(Locale.ROOT);
         Process process;
         synchronized (this) {
             if (closed) { throw new IOException("Gossip resolver is closed"); }
-            try { return numeric(peer, InetAddress.ofLiteral(host)); }
+            try { return List.of(numeric(peer, InetAddress.ofLiteral(host))); }
             catch (IllegalArgumentException notLiteral) { /* Resolve names in an owned helper. */ }
             Cached previous = cache.get(host);
-            if (previous != null && clock.getAsLong() - previous.created < CACHE_NANOS) { return numeric(peer, previous.next()); }
+            if (previous != null && clock.getAsLong() - previous.created < CACHE_NANOS) { return numeric(peer, previous.rotation()); }
             if (active.size() >= maxHelpers) { throw new IOException("Gossip resolver capacity is full"); }
             process = launcher.start(host);
             active.add(process);
@@ -93,7 +99,7 @@ final class GossipDnsResolver implements AutoCloseable {
                 var resolved = new Cached(List.copyOf(addresses), clock.getAsLong());
                 cache.put(host, resolved);
                 while (cache.size() > capacity) { cache.pollFirstEntry(); }
-                return numeric(peer, resolved.next());
+                return numeric(peer, resolved.rotation());
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -110,6 +116,10 @@ final class GossipDnsResolver implements AutoCloseable {
 
     private static GossipConfig.Seed numeric(GossipConfig.Seed peer, InetAddress address) {
         return new GossipConfig.Seed(peer.serverId(), address.getHostAddress(), peer.port());
+    }
+
+    private static List<GossipConfig.Seed> numeric(GossipConfig.Seed peer, List<InetAddress> addresses) {
+        return addresses.stream().map(address -> numeric(peer, address)).toList();
     }
 
     private static Process launch(String host) throws IOException {
@@ -161,6 +171,12 @@ final class GossipDnsResolver implements AutoCloseable {
         final long created;
         int cursor;
         Cached(List<InetAddress> addresses, long created) { this.addresses = addresses; this.created = created; }
-        InetAddress next() { InetAddress result = addresses.get(cursor); cursor = (cursor + 1) % addresses.size(); return result; }
+        /** All addresses starting at the cursor, which then advances. Callers hold the resolver monitor. */
+        List<InetAddress> rotation() {
+            var result = new ArrayList<InetAddress>(addresses.size());
+            for (int i = 0; i < addresses.size(); i++) { result.add(addresses.get((cursor + i) % addresses.size())); }
+            cursor = (cursor + 1) % addresses.size();
+            return result;
+        }
     }
 }

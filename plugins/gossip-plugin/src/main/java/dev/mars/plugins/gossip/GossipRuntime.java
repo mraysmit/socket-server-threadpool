@@ -39,6 +39,10 @@ import java.util.random.RandomGenerator;
 final class GossipRuntime implements AutoCloseable {
     interface ExchangeClient extends AutoCloseable {
         GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException;
+        /** Addresses of one host, tried in order on connection failure. Clients without fallback use the first. */
+        default GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
+            return exchange(endpoints.getFirst());
+        }
         default int inflight() { return 0; }
         @Override void close() throws IOException;
     }
@@ -243,14 +247,17 @@ final class GossipRuntime implements AutoCloseable {
         String outcome = "CANCELLED";
         try {
             metrics.dnsHelpers = resolver.activeHelpers();
-            var endpoint = resolver.resolve(peer);
+            var endpoints = resolver.resolveAll(peer);
             resolving = false;
-            InetAddress address = InetAddress.ofLiteral(endpoint.host());
+            var endpoint = endpoints.getFirst();
             resolvedKey = endpoint.host() + ":" + endpoint.port();
+            List<GossipConfig.Seed> attempts;
             synchronized (this) {
                 if (stopped || (!departing && leaving)) { return; }
-                selector.resolved(peer, endpoint, table.snapshot());
-                if (endpoint.port() == table.snapshot().self().port() && (address.isLoopbackAddress() || localAddresses.contains(address))) {
+                var snapshot = table.snapshot();
+                selector.resolved(peer, endpoint, snapshot);
+                int selfPort = snapshot.self().port();
+                if (isLocal(endpoint, selfPort)) {
                     metrics.skipped.incrementAndGet();
                     outcome = "SKIPPED";
                     return;
@@ -259,8 +266,10 @@ final class GossipRuntime implements AutoCloseable {
                     resolvedKey = null; metrics.skipped.incrementAndGet(); outcome = "SKIPPED"; return;
                 }
                 acquired = true;
+                // The host's other addresses are connection fallbacks; never reach this process through one.
+                attempts = endpoints.stream().filter(candidate -> candidate == endpoint || !isLocal(candidate, selfPort)).toList();
             }
-            var exchange = transport.exchange(endpoint);
+            var exchange = transport.exchange(attempts);
             outcome = "SUCCESS";
             if (!departing && exchange.senderAdmission() == MembershipTable.Admission.CAPACITY) {
                 selector.capacity(peer, endpoint);
@@ -294,6 +303,11 @@ final class GossipRuntime implements AutoCloseable {
                 metrics.retryingPeers = selector.retryCount();
             }
         }
+    }
+
+    private boolean isLocal(GossipConfig.Seed endpoint, int selfPort) {
+        InetAddress address = InetAddress.ofLiteral(endpoint.host());
+        return endpoint.port() == selfPort && (address.isLoopbackAddress() || localAddresses.contains(address));
     }
 
     static GossipMetrics.Failure classify(Exception failure) {

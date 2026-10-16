@@ -119,16 +119,16 @@ class ServerLifecycleTest {
         serverTask.get(5, TimeUnit.SECONDS);
         assertTrue(server.isStopped());
         assertTrue(server.requestExecutor.awaitTermination(5, TimeUnit.SECONDS));
-        assertThrows(ConnectException.class, () -> {
-            try (var _ = connect(serverPort)) {
-                fail("Main listener still accepts connections");
-            }
-        });
-        assertThrows(ConnectException.class, () -> {
-            try (var ignored = connect(monitorPort)) {
-                fail("Admin listener still accepts connections");
-            }
-        });
+        assertTrue(server.serverSocket.isClosed(), "Main listener socket must be closed");
+        assertTrue(instance.monitor().serverSocket.isClosed(), "Admin listener socket must be closed");
+        assertNotAnsweredByThisServer(serverPort, HTTP_REQUEST, HTTP_MARKER);
+        assertNotAnsweredByThisServer(monitorPort, "status\n", ADMIN_MARKER);
+    }
+
+    @Test
+    void closedListenerCheckDetectsAListenerThatIsStillOpen() {
+        assertThrows(AssertionError.class, () -> assertNotAnsweredByThisServer(serverPort, HTTP_REQUEST, HTTP_MARKER));
+        assertThrows(AssertionError.class, () -> assertNotAnsweredByThisServer(monitorPort, "status\n", ADMIN_MARKER));
     }
 
     @Test
@@ -420,6 +420,33 @@ class ServerLifecycleTest {
                 }
                 Thread.sleep(10);
             }
+        }
+    }
+
+    private static final String HTTP_REQUEST = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    private static final String HTTP_MARKER = "WorkerRunnable: ThreadPooledServer";
+    private static final String ADMIN_MARKER = "Server status:";
+
+    /**
+     * A closed listener's automatic port returns to the OS pool, so a connect can still succeed through another
+     * program's listener or a TCP self-connect (which echoes the request). Only this server's own reply proves
+     * that one of its listeners is still open.
+     */
+    private static void assertNotAnsweredByThisServer(int port, String request, String marker) throws IOException {
+        Socket client;
+        try { client = connect(port); }
+        catch (ConnectException refused) { return; }
+        try (client) {
+            client.setSoTimeout(500);
+            var reply = new java.io.ByteArrayOutputStream();
+            try {
+                client.getOutputStream().write(request.getBytes(StandardCharsets.UTF_8));
+                client.getOutputStream().flush();
+                byte[] chunk = new byte[512];
+                for (int read; reply.size() < 8192 && (read = client.getInputStream().read(chunk)) > 0; ) { reply.write(chunk, 0, read); }
+            } catch (IOException silentOrReset) { /* Whatever answered was not this server. */ }
+            assertFalse(reply.toString(StandardCharsets.UTF_8).contains(marker), "Port " + port + " is still answered by this server: local="
+                    + client.getLocalSocketAddress() + " remote=" + client.getRemoteSocketAddress());
         }
     }
 

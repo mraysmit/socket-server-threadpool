@@ -243,6 +243,58 @@ class GossipTransportTest {
         }
     }
 
+    @Test void unreachableAddressFallsBackToTheHostsNextAddressWithinOneExchange() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var metrics = new GossipMetrics();
+        try (var transport = new GossipTransport(config, table(config), metrics);
+             var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(reply(config, request, responder(port, 2))))) {
+            // The peer listens on 127.0.0.1 only, so the same port on 127.0.0.2 cannot be connected.
+            var unreachable = new GossipConfig.Seed("Peer", "127.0.0.2", peer.endpoint().port());
+            var result = transport.exchange(List.of(unreachable, peer.endpoint()));
+            assertEquals("Peer", result.sender().key().serverId());
+            assertEquals(1, metrics.outbound.get());
+            assertEquals(0, metrics.outboundFailures.get());
+            assertEquals(0, transport.inflight());
+        }
+    }
+
+    @Test void whenNoAddressConnectsTheFirstConnectionErrorIsReportedWithTheRestSuppressed() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var metrics = new GossipMetrics();
+        int closed;
+        try (var reservation = new ServerSocket(0, 1, java.net.InetAddress.ofLiteral("127.0.0.1"))) { closed = reservation.getLocalPort(); }
+        try (var transport = new GossipTransport(config, table(config), metrics)) {
+            var failure = assertThrows(java.net.SocketException.class, () -> transport.exchange(List.of(
+                    new GossipConfig.Seed("Peer", "127.0.0.1", closed), new GossipConfig.Seed("Peer", "127.0.0.2", closed))));
+            assertEquals(1, failure.getSuppressed().length);
+            assertEquals(GossipMetrics.Failure.NETWORK, GossipRuntime.classify(failure));
+            assertEquals(1, metrics.outboundFailures.get(), "One exchange failed, however many addresses it tried");
+            assertEquals(0, transport.inflight());
+        }
+    }
+
+    @Test void timeoutsDoNotFallBackToAnotherAddress() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        try (var transport = new GossipTransport(config, table(config), Duration.ofMillis(200), Duration.ofMillis(200), Duration.ofMillis(400));
+             var peer = new ProtocolPeer((socket, port, request) -> TimeUnit.MILLISECONDS.sleep(1000))) {
+            // A fallback to 127.0.0.2 would surface as a connection error instead of the timeout.
+            var unreachable = new GossipConfig.Seed("Peer", "127.0.0.2", peer.endpoint().port());
+            assertThrows(SocketTimeoutException.class, () -> transport.exchange(List.of(peer.endpoint(), unreachable)));
+            assertEquals(0, transport.inflight());
+        }
+    }
+
+    @Test void fallbackAddressesMustBelongToTheSamePeerAndPort() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        try (var transport = new GossipTransport(config, table(config))) {
+            assertThrows(IllegalArgumentException.class, () -> transport.exchange(List.of(
+                    new GossipConfig.Seed("Peer", "127.0.0.1", 9100), new GossipConfig.Seed("Other", "127.0.0.2", 9100))));
+            assertThrows(IllegalArgumentException.class, () -> transport.exchange(List.of(
+                    new GossipConfig.Seed("Peer", "127.0.0.1", 9100), new GossipConfig.Seed("Peer", "127.0.0.2", 9200))));
+            assertEquals(0, transport.inflight());
+        }
+    }
+
     @Test void versionFallbackSharesTheOriginalOverallDeadlineAndReleasesItsPermit() throws Exception {
         var config = GossipCommandsTest.config(32768, 4, 8);
         var attempts = new java.util.concurrent.atomic.AtomicInteger();

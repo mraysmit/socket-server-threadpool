@@ -26,6 +26,7 @@ public final class DnsProcessFixture {
         if (args[0].startsWith("stall")) { Thread.sleep(300_000); }
         else if (args[0].startsWith("bad")) { System.out.println("GOSSIP_DNS_V1\nnot-an-address"); }
         else if (args[0].startsWith("fail")) { System.exit(1); }
+        else if (args[0].startsWith("mixed")) { System.out.println("GOSSIP_DNS_V1\n192.0.2.1\n127.0.0.1\n192.0.2.2"); }
         else { System.out.println("GOSSIP_DNS_V1\n127.0.0.1\n::1"); }
     }
 }

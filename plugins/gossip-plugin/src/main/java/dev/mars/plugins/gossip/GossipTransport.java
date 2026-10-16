@@ -24,6 +24,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.ByteBuffer;
 import java.nio.channels.CancelledKeyException;
@@ -45,6 +46,11 @@ import java.util.concurrent.Semaphore;
 public final class GossipTransport implements GossipRuntime.ExchangeClient {
     static final class BusyException extends IOException {
         BusyException() { super("Gossip outbound capacity is full"); }
+    }
+    /** A socket error while connecting: the only failure that moves on to the host's next address. */
+    private static final class ConnectFailure extends IOException {
+        ConnectFailure(SocketException cause) { super(cause); }
+        SocketException socketError() { return (SocketException) getCause(); }
     }
     private final GossipConfig config;
     private final MembershipTable table;
@@ -85,7 +91,17 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         exchangeNanos = positiveNanos(exchangeTimeout);
     }
 
-    public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+    public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException { return exchange(List.of(peer)); }
+
+    /**
+     * Exchanges with one peer whose host has several resolved addresses, tried in order. Only a socket error while
+     * connecting moves on to the next address; timeouts, protocol and identity failures end the exchange.
+     */
+    @Override public GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
+        var peer = endpoints.getFirst();
+        if (endpoints.stream().anyMatch(endpoint -> !endpoint.serverId().equals(peer.serverId()) || endpoint.port() != peer.port())) {
+            throw new IllegalArgumentException("Fallback addresses must share the peer's server ID and port");
+        }
         synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed"); } }
         if (!permits.tryAcquire()) { throw new BusyException(); }
         UUID messageId = null;
@@ -96,15 +112,17 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 throw new IOException("Cannot exchange with the local endpoint");
             }
             var members = requests.select(snapshot, config.maxBatchMembers(), wire.requestMemberBudget(snapshot.self()));
-            // Resolve once; both protocol attempts share one permit and one socket-work deadline.
-            var address = new InetSocketAddress(peer.host(), peer.port());
+            // Resolve once; both protocol attempts and all address fallbacks share one permit and one deadline.
+            var candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port())).toList();
             long deadline = System.nanoTime() + exchangeNanos;
             int version = 2;
             while (true) {
                 messageId = UUID.randomUUID();
                 byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(snapshot.self(), members, version)));
                 if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
-                var reply = CommandProtocol.parseReply(exchangeBytes(address, payload, deadline));
+                var line = exchangeBytes(candidates, payload, deadline);
+                candidates = List.of(line.address()); // A version retry reuses the address that answered.
+                var reply = CommandProtocol.parseReply(line.text());
                 if (!messageId.equals(reply.messageId())) { throw new IOException("Gossip message ID mismatch"); }
                 if (!peer.serverId().equals(reply.serverId())) { throw new IOException("Gossip server ID mismatch"); }
                 if (reply.error() != null) {
@@ -148,6 +166,21 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         } finally { permits.release(); }
     }
 
+    private record Reply(String text, InetSocketAddress address) { }
+
+    /** Tries each address in order; if none connects, throws the first connection error with the rest suppressed. */
+    private Reply exchangeBytes(List<InetSocketAddress> candidates, byte[] payload, long deadline) throws IOException {
+        SocketException unreachable = null;
+        for (var address : candidates) {
+            try { return new Reply(exchangeBytes(address, payload, deadline), address); }
+            catch (ConnectFailure failure) {
+                if (unreachable == null) { unreachable = failure.socketError(); }
+                else { unreachable.addSuppressed(failure.socketError()); }
+            }
+        }
+        throw unreachable;
+    }
+
     private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
         checkDeadline(deadline);
         try (var connection = new Connection()) {
@@ -158,10 +191,12 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             try {
                 connection.channel.configureBlocking(false);
                 long started = System.nanoTime();
-                if (!connection.channel.connect(address)) {
-                    long connectDeadline = started + Math.min(connectNanos, deadline - started);
-                    while (!connection.channel.finishConnect()) { await(connection, SelectionKey.OP_CONNECT, connectDeadline); }
-                }
+                try {
+                    if (!connection.channel.connect(address)) {
+                        long connectDeadline = started + Math.min(connectNanos, deadline - started);
+                        while (!connection.channel.finishConnect()) { await(connection, SelectionKey.OP_CONNECT, connectDeadline); }
+                    }
+                } catch (SocketException refusedOrUnreachable) { throw new ConnectFailure(refusedOrUnreachable); }
                 var output = ByteBuffer.allocate(payload.length + 1).put(payload).put((byte) '\n');
                 output.flip();
                 while (output.hasRemaining()) {

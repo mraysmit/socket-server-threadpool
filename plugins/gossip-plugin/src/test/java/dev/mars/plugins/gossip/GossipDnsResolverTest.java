@@ -77,6 +77,21 @@ class GossipDnsResolverTest {
         assertTrue(helpers.stream().noneMatch(Process::isAlive));
     }
 
+    @Test void resolveAllReturnsEveryAddressAndRotatesWhichComesFirst() throws Exception {
+        try (var resolver = new GossipDnsResolver(4, 1, Duration.ofSeconds(2), System::nanoTime, this::launch)) {
+            var peer = new GossipConfig.Seed("Peer", "good.test", 9000);
+            var first = resolver.resolveAll(peer);
+            var second = resolver.resolveAll(peer);
+            assertEquals(List.of("127.0.0.1", "0:0:0:0:0:0:0:1"), first.stream().map(GossipConfig.Seed::host).toList());
+            assertEquals(first.reversed(), second, "The first address rotates; the rest remain as fallbacks");
+            assertTrue(first.stream().allMatch(endpoint -> endpoint.serverId().equals("Peer") && endpoint.port() == 9000));
+            assertEquals(first.getFirst(), resolver.resolve(peer), "resolve returns the next first address");
+            assertEquals(1, helpers.size(), "Rotation is served from the cache");
+            var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9000);
+            assertEquals(List.of(numeric), resolver.resolveAll(numeric));
+        }
+    }
+
     @Test void timeoutAndInvalidRepliesLeaveNoHelpersOrPoisonedCacheEntries() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 2, Duration.ofMillis(150), System::nanoTime, this::launch)) {
             assertThrows(SocketTimeoutException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "stall.test", 9000)));
