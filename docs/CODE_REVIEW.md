@@ -16,43 +16,34 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 ## Status (2026-10-16)
 
-None of the findings below has been fixed yet, except one part of #5. Two related changes have landed since the review:
+**Fixed:** #1 and #2. **Partly fixed:** #5. **Open:** everything else. Two related changes have also landed since the review:
 
 - **Address fallback.** When a peer's hostname resolves to several addresses and connecting to one fails (refused or unreachable), the same exchange now tries the others. `GossipDnsResolver.resolveAll` returns every address, and `GossipTransport` and `GossipRuntime` use it. This affects how #4 should be fixed; see the note there.
 - **Test support moved to the host.** Plugin tests now use the host's `dev.mars.testing` library. This changes no finding below.
 
 ## High impact
 
-### 1. Re-encoding JSON only to check sizes
+### 1. Re-encoding JSON only to check sizes — fixed 2026-10-16
 
-[GossipWire.java:143-163](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L143-L163)
+**Was:** for every record in every exchange, `requireForwardable` built and encoded three complete envelopes: a request with the record as sender, a reply holding the record, and a members page holding the record. It also rebuilt a Base64 cursor that never changed, once per record. A reply carrying 31 records needed about 94 envelope encodings, roughly 10× the bytes actually sent. The same record was encoded again by `GossipWire.decode`'s request-size check, by `MembershipTable.checkRecordSize`, and by every call to `MemberRecord.serializedBytes()` or `fingerprint()`.
 
-For every record in every exchange, `requireForwardable` builds and encodes three complete envelopes:
+**Now:**
+- [`MemberRecord`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L109-L126) is a final class that computes its encoded size and fingerprint once, then reuses them.
+- [`GossipWire`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L123-L127) adds sizes up instead of encoding envelopes. A record's JSON is identical standalone or nested, so an envelope is a fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
+- [`requireForwardable`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L169-L184) needs no envelope encoding per record. Its two local-record overheads are recomputed only when the local record changes in more than its heartbeat.
+- The request-size check in `decode` ([GossipWire.java:87](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L87)) no longer re-encodes the request.
 
-- a request with the record as sender ([L148](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L148));
-- a reply holding the record ([L152](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L152));
-- a members page holding the record ([L159](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L159)).
+**Verified by** `GossipSizeAccountingTest`. It keeps the original encode-everything algorithms as a reference and requires identical decisions, sweeping record sizes across every byte limit. It includes JSON-escaped and multi-byte metadata, and plain-ASCII sweeps that land on each exact limit. Six deliberately introduced one-byte errors were each caught.
 
-It also rebuilds the Base64 cursor inside the loop ([L157-158](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L157-L158)), although the cursor never changes. A reply carrying 31 records therefore needs about 94 envelope encodings, roughly 10× the bytes actually sent.
+**Measured:** an inbound exchange of 31 records into a 128-member table went from about 430 µs to about 208 µs. The remaining cost is mostly decoding records (#9), snapshots (#5) and encoding the actual reply.
 
-The same record is encoded again elsewhere:
+**Follow-up:** `GossipBatchSelector` still keeps its own per-record size cache. That cache is now redundant and could be removed.
 
-- `GossipWire.decode` re-encodes the request it has just parsed, only to check its size ([GossipWire.java:82](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L82)).
-- `MembershipTable.validateBatch` → `checkRecordSize` encodes every record again ([MembershipTable.java:125, 137-141](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L137-L141)).
-- `MemberRecord.serializedBytes()` and `fingerprint()` recompute the encoding on every call ([MemberRecord.java:83-89](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L83-L89)).
+### 2. `members()` does quadratic work — fixed 2026-10-16
 
-**Fix:**
-- Turn `MemberRecord` into a final class that computes its encoded size the first time it is needed and stores it. A Java `record` cannot hold a cached field like this.
-- Envelope sizes add up: a full envelope is a fixed overhead plus the size of each record, plus one comma between records. Each check then becomes `fixedOverhead + recordBytes <= max.exchange.bytes`.
-- Compute each fixed overhead (request, reply and members page) once per local heartbeat, not once per record.
+**Was:** each time a row was added, the code copied and encoded the entire page built so far. With 32 rows that was about 500 rows encoded per call, around 160 KB of JSON to produce a reply of about 30 KB.
 
-### 2. `members()` does quadratic work
-
-[GossipCommands.java:116-126](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L116-L126)
-
-Each time a row is added, the code copies and encodes the entire page built so far (`replyFits(pageResult(...))`). With 32 rows that is about 500 rows encoded per call, around 160 KB of JSON to produce a reply of about 30 KB.
-
-**Fix:** measure each row once and add `rowBytes + 1` to a running total. Reserve space for the longest possible cursor up front, so the page never needs to be re-encoded while it is being filled.
+**Now:** [GossipCommands.java:119-133](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L119-L133) measures the empty page once and each row once, and keeps a running total. The total accounts for the comma between rows and the exact width of the next-page cursor. Paging decisions are unchanged, and `GossipSizeAccountingTest` checks every page against the original row-by-row algorithm. The finished page is still encoded once as a final safety check. Measured: a 32-row page went from about 485 µs to about 88 µs.
 
 ### 3. Merging copies the whole table
 
@@ -127,7 +118,7 @@ Every exchange with a v1 peer first tries v2 and gets rejected. Each such exchan
 
 ### 9. Each record's metadata is copied twice and round-tripped through JSON
 
-[MemberRecord.java:50-51, 66-67](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L50-L51)
+[MemberRecord.java:62-63, 91-92](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L62-L63)
 
 `fromWire` deep-copies the metadata, then the constructor deep-copies it again. The constructor then encodes and re-parses it with `Json.write` + `Json.read`. The same happens on every heartbeat in `MembershipTable.advanceLocal`, even though the metadata it passes in is already frozen.
 
@@ -136,7 +127,7 @@ Every exchange with a v1 peer first tries v2 and gets rejected. Each such exchan
 ## Low impact and readability
 
 - **Exceptions used for normal control flow.** `InetAddress.ofLiteral` throws an exception, with a full stack trace, for every hostname that isn't an IP literal. It is called on every candidate every round: see [PeerSelector.java:170-182](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L170-L182) and [GossipDnsResolver.java:74](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L74). Normalize seed endpoints once when the config is loaded.
-- **Regex compiled on every call.** `String.matches` in `GossipValidation.validId` compiles a new pattern for every incoming `MemberKey`, and `validHost` builds a `URI` for every record ([GossipValidation.java:25-40](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L25-L40)). The same applies to `decodeCursor` ([GossipCommands.java:170, 177](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L170)). Precompile the `Pattern`s.
+- **Regex compiled on every call.** `String.matches` in `GossipValidation.validId` compiles a new pattern for every incoming `MemberKey`, and `validHost` builds a `URI` for every record ([GossipValidation.java:25-40](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L25-L40)). The same applies to `decodeCursor` ([GossipCommands.java:178, 185](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L178)). Precompile the `Pattern`s.
 - **Convoluted recovery-fill loop.** [PeerSelector.java:90-95](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L90-L95) calls `containsAll` twice per iteration. A bounded `for (i < recovery.size())` loop that adds each peer if it isn't already selected does the same thing.
 - **Rotation that isn't actually fair (a correctness problem).** In `GossipBatchSelector`, `cursor` is an index into a `scan` list that is rebuilt from the snapshot on every call ([GossipBatchSelector.java:57, 77, 81-94](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L81-L94)). `PeerSelector.recoveryCursor` has the same problem against a changing `recovery` list ([PeerSelector.java:99-103](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L99-L103)). When members expire, the indexes shift and the rotation skips or repeats peers. Track the position by `MemberKey` instead of by index.
 - **Clock inconsistency.** Departure timing uses `System.nanoTime()` instead of the injected `clock` ([GossipRuntime.java:176, 215](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L215)), which gets around the deterministic-clock hook used by tests.
@@ -144,7 +135,7 @@ Every exchange with a v1 peer first tries v2 and gets rejected. Each such exchan
 
 ## Suggested order of work
 
-1. **#1 and #2 together:** store each record's encoded size, then compute envelope and page sizes by adding them up. This removes most of the wasted CPU.
+1. ~~**#1 and #2 together:** store each record's encoded size, then compute envelope and page sizes by adding them up.~~ Done 2026-10-16.
 2. **#5:** quick, low-risk cleanup of unneeded snapshots.
 3. **#7, #8 and the low-impact items:** small, local changes.
 4. **#3, #4 and #6:** larger refactors. Each needs its own change and careful testing of rollback, cancellation and timeout behaviour.

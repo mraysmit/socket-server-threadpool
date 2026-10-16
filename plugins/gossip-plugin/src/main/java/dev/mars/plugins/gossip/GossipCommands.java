@@ -112,16 +112,24 @@ final class GossipCommands {
                 config.maxBatchMembers()) : Math.min(32, config.maxBatchMembers());
         var snapshot = table.snapshot();
         int position = parameters.containsKey("cursor") ? decodeCursor(parameters.get("cursor"), snapshot.self().key()) : 0;
+        String serverId = snapshot.self().key().serverId();
+        // Page sizes are additive (see GossipWire): measure the empty page once and each row once, instead of
+        // re-encoding the growing page per row. A cursor string replaces the four bytes of null and, being
+        // base64url, needs no JSON escaping.
+        long size = wire.replyBytes(serverId, pageResult(snapshot, List.of(), null));
         var selected = new ArrayList<Map<String, Object>>();
         while (position < snapshot.members().size() && selected.size() < limit) {
-            selected.add(GossipWire.memberView(snapshot.members().get(position)));
+            var row = GossipWire.memberView(snapshot.members().get(position));
+            int rowBytes = GossipWire.bytes(row).length + (selected.isEmpty() ? 0 : 1);
             int next = position + 1;
             String cursor = next < snapshot.members().size() ? encodeCursor(snapshot.self().key(), next) : null;
-            if (!wire.replyFits(snapshot.self().key().serverId(), pageResult(snapshot, selected, cursor))) {
-                selected.removeLast();
+            long withRow = size + rowBytes + (cursor == null ? 0 : cursor.length() + 2 - 4);
+            if (withRow > config.maxExchangeBytes()) {
                 if (selected.isEmpty()) { throw GossipWire.invalid("Single membership row exceeds the reply budget"); }
                 break;
             }
+            selected.add(row);
+            size += rowBytes;
             position = next;
         }
         String next = position < snapshot.members().size() ? encodeCursor(snapshot.self().key(), position) : null;

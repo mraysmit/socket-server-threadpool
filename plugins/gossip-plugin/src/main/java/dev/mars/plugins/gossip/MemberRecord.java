@@ -29,27 +29,52 @@ import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.TreeMap;
 
 import static dev.mars.plugins.gossip.MembershipException.Reason.INVALID_RECORD;
 
-/** Owner-published data, with deeply immutable JSON metadata and exact integral fields. */
-public record MemberRecord(MemberKey key, String host, int port, long heartbeat, State state,
-                           Map<String, Object> metadata) {
+/**
+ * Owner-published data, with deeply immutable JSON metadata and exact integral fields. A final class rather than
+ * a record so that the encoded size and fingerprint, which never change, are computed once instead of per check.
+ */
+public final class MemberRecord {
     public enum State { ALIVE, LEFT }
     public static final int MAX_METADATA_BYTES = 4096;
     public static final int MAX_METADATA_DEPTH = 16;
     private static final Set<String> FIELDS = Set.of("serverId", "bootId", "host", "port", "heartbeat", "state", "metadata");
+    private final MemberKey key;
+    private final String host;
+    private final int port;
+    private final long heartbeat;
+    private final State state;
+    private final Map<String, Object> metadata;
+    // Computed lazily; racing threads compute the same value, so plain volatile publication is enough.
+    private volatile int serializedBytes = -1;
+    private volatile String fingerprint;
 
-    public MemberRecord {
+    public MemberRecord(MemberKey key, String host, int port, long heartbeat, State state, Map<String, Object> metadata) {
         if (key == null || !GossipValidation.validHost(host) || port < 1 || port > 65535
                 || heartbeat < 0 || state == null || metadata == null) {
             throw invalid("Member requires identity, host, port 1-65535, nonnegative heartbeat, state, and metadata");
         }
-        metadata = freezeObject(metadata, 0, new Budget());
-        validateMetadata(metadata);
+        var frozen = freezeObject(metadata, 0, new Budget());
+        validateMetadata(frozen);
+        this.key = key;
+        this.host = host;
+        this.port = port;
+        this.heartbeat = heartbeat;
+        this.state = state;
+        this.metadata = frozen;
     }
+
+    public MemberKey key() { return key; }
+    public String host() { return host; }
+    public int port() { return port; }
+    public long heartbeat() { return heartbeat; }
+    public State state() { return state; }
+    public Map<String, Object> metadata() { return metadata; }
 
     public static MemberRecord fromWire(Object value) {
         if (!(value instanceof Map<?, ?> fields) || !fields.keySet().equals(FIELDS)) {
@@ -80,15 +105,37 @@ public record MemberRecord(MemberKey key, String host, int port, long heartbeat,
         return Collections.unmodifiableMap(fields);
     }
 
-    public int serializedBytes() { return jsonBytes(toWire()).length; }
+    /** Exact UTF-8 size of {@link #toWire()} encoded as JSON, identical standalone or inside an envelope. */
+    public int serializedBytes() {
+        int bytes = serializedBytes;
+        if (bytes < 0) { bytes = jsonBytes(toWire()).length; serializedBytes = bytes; }
+        return bytes;
+    }
 
     /** Compact retained-version comparison; metadata key order and numeric wrapper types are normalized. */
     String fingerprint() {
-        try { return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(jsonBytes(toWire()))); }
-        catch (NoSuchAlgorithmException e) { throw new IllegalStateException("SHA-256 is unavailable", e); }
+        String digest = fingerprint;
+        if (digest == null) {
+            try { digest = HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(jsonBytes(toWire()))); }
+            catch (NoSuchAlgorithmException e) { throw new IllegalStateException("SHA-256 is unavailable", e); }
+            fingerprint = digest;
+        }
+        return digest;
     }
 
     boolean sameEndpoint(MemberRecord other) { return host.equals(other.host) && port == other.port; }
+
+    @Override public boolean equals(Object other) {
+        return this == other || other instanceof MemberRecord record && port == record.port && heartbeat == record.heartbeat
+                && key.equals(record.key) && host.equals(record.host) && state == record.state && metadata.equals(record.metadata);
+    }
+
+    @Override public int hashCode() { return Objects.hash(key, host, port, heartbeat, state, metadata); }
+
+    @Override public String toString() {
+        return "MemberRecord[key=" + key + ", host=" + host + ", port=" + port + ", heartbeat=" + heartbeat
+                + ", state=" + state + ", metadata=" + metadata + "]";
+    }
 
     private static String string(Map<?, ?> fields, String name) {
         if (!(fields.get(name) instanceof String text)) { throw invalid(name + " must be a string"); }

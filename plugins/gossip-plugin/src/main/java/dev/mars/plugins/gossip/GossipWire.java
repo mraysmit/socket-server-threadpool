@@ -36,6 +36,11 @@ import static dev.mars.plugins.gossip.MembershipException.Reason.INVALID_RECORD;
 public final class GossipWire {
     private static final UUID BUDGET_ID = new UUID(0, 0);
     private final GossipConfig config;
+    // Encoded sizes are additive: Json.write emits a record identically standalone or nested, so an envelope is a
+    // fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
+    private volatile int requestOverhead = -1;
+    private volatile int worstRowExtra = -1;
+    private volatile ForwardingLimits forwarding;
 
     public record Exchange(MemberRecord sender, List<MemberRecord> members, int gossipVersion,
                            MembershipTable.Admission senderAdmission) {
@@ -79,7 +84,7 @@ public final class GossipWire {
             catch (IllegalArgumentException e) { throw invalid("Invalid senderAdmission"); }
         }
         var exchange = new Exchange(sender, decoded, version, admission);
-        if (request && requestBytes(parameters(sender, decoded, version)).length > config.maxExchangeBytes()) {
+        if (request && requestSize(sender, decoded) > config.maxExchangeBytes()) {
             throw invalid("Complete canonical request exceeds max.exchange.bytes");
         }
         return exchange;
@@ -114,9 +119,26 @@ public final class GossipWire {
         return bytes(new CommandRequest(1, BUDGET_ID, "gossip", parameters));
     }
 
+    /** Bytes of the canonical request for this sender and members, computed without encoding the envelope. */
+    int requestSize(MemberRecord sender, List<MemberRecord> members) {
+        long size = requestOverhead(sender) + (long) sender.serializedBytes();
+        for (int i = 0; i < members.size(); i++) { size += members.get(i).serializedBytes() + (i == 0 ? 0 : 1); }
+        return (int) Math.min(Integer.MAX_VALUE, size);
+    }
+
+    /** Request bytes besides the sender, with an empty members array; gossipVersion 1 and 2 are equally wide. */
+    private int requestOverhead(MemberRecord sample) {
+        int overhead = requestOverhead;
+        if (overhead < 0) {
+            overhead = requestBytes(parameters(sample, List.of())).length - sample.serializedBytes();
+            requestOverhead = overhead;
+        }
+        return overhead;
+    }
+
     /** Exact available UTF-8 bytes; the empty members array already accounts for brackets. */
     int requestMemberBudget(MemberRecord self) {
-        return config.maxExchangeBytes() - requestBytes(parameters(self, List.of())).length;
+        return config.maxExchangeBytes() - requestSize(self, List.of());
     }
 
     /** Reserve the largest legal host connection ID because the handler cannot see the actual ID. */
@@ -130,35 +152,73 @@ public final class GossipWire {
     }
 
     /** UUIDs have fixed serialized width; Long.MAX_VALUE reserves the largest legal connection ID. */
-    public boolean replyFits(String serverId, Object result) {
-        return bytes(new CommandReply(1, BUDGET_ID, serverId, Long.MAX_VALUE, "OK", result, null)).length
-                <= config.maxExchangeBytes();
+    int replyBytes(String serverId, Object result) {
+        return bytes(new CommandReply(1, BUDGET_ID, serverId, Long.MAX_VALUE, "OK", result, null)).length;
     }
+
+    public boolean replyFits(String serverId, Object result) { return replyBytes(serverId, result) <= config.maxExchangeBytes(); }
 
     public void requireReplyFits(String serverId, Object result) {
         if (!replyFits(serverId, result)) { throw invalid("Complete reply exceeds max.exchange.bytes"); }
     }
 
-    /** Check new records before merging, so a single unforwardable record cannot break later replies. */
+    /**
+     * Check new records before merging, so a single unforwardable record cannot break later replies. Each record
+     * must fit as a request sender, beside the local sender in a reply, and as a worst-case members-page row.
+     */
     public void requireForwardable(MemberRecord self, List<MemberRecord> records) {
-        var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
-        requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY));
+        int limit = config.maxExchangeBytes();
+        var limits = forwardingLimits(self);
+        if (limits.emptyReply() > limit) { throw invalid("Complete reply exceeds max.exchange.bytes"); }
         for (MemberRecord record : records) {
-            if (!record.key().equals(self.key())) {
-                if (requestBytes(parameters(record, List.of())).length > config.maxExchangeBytes()) {
-                    throw invalid("Single sender exceeds the complete request budget");
-                }
-                if (config.maxBatchMembers() > 1) {
-                    requireReplyFits(self.key().serverId(), result(budgetSelf, List.of(record), 2, MembershipTable.Admission.CAPACITY));
+            boolean local = record.key().equals(self.key());
+            if (!local) {
+                if (requestSize(record, List.of()) > limit) { throw invalid("Single sender exceeds the complete request budget"); }
+                if (config.maxBatchMembers() > 1 && limits.emptyReply() + record.serializedBytes() > limit) {
+                    throw invalid("Complete reply exceeds max.exchange.bytes");
                 }
             }
-            var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record, MembershipTable.Assessment.CANDIDATE,
-                    Long.MAX_VALUE, Long.MAX_VALUE, false, false);
-            String cursor = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
-                    (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
-            requireReplyFits(self.key().serverId(), page(budgetSelf, List.of(memberView(worst)), cursor,
-                    Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
-                            "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE)));
+            int row = (local ? limits.budgetSelfBytes() : record.serializedBytes()) + worstRowExtra(record);
+            if (limits.emptyPage() + row > limit) { throw invalid("Complete reply exceeds max.exchange.bytes"); }
+        }
+    }
+
+    /** Bytes a members-page row adds to its record: the local assessment fields at their widest values. */
+    private int worstRowExtra(MemberRecord sample) {
+        int extra = worstRowExtra;
+        if (extra < 0) {
+            extra = bytes(memberView(worstView(sample))).length - sample.serializedBytes();
+            worstRowExtra = extra;
+        }
+        return extra;
+    }
+
+    private static MembershipTable.MemberView worstView(MemberRecord record) {
+        return new MembershipTable.MemberView(record, MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, Long.MAX_VALUE, false, false);
+    }
+
+    /** Empty reply and members-page sizes for the local record, recomputed only when more than its heartbeat changes. */
+    private ForwardingLimits forwardingLimits(MemberRecord self) {
+        var limits = forwarding;
+        if (limits != null && limits.matches(self)) { return limits; }
+        // The widest heartbeat stands in for every future local heartbeat.
+        var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
+        String serverId = self.key().serverId();
+        String cursor = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+                (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
+        Map<String, Object> capacity = Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
+                "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE);
+        limits = new ForwardingLimits(self, budgetSelf.serializedBytes(),
+                replyBytes(serverId, result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY)),
+                replyBytes(serverId, page(budgetSelf, List.of(), cursor, capacity)));
+        forwarding = limits;
+        return limits;
+    }
+
+    private record ForwardingLimits(MemberRecord self, int budgetSelfBytes, int emptyReply, int emptyPage) {
+        boolean matches(MemberRecord other) {
+            return self.key().equals(other.key()) && self.host().equals(other.host()) && self.port() == other.port()
+                    && self.state() == other.state() && self.metadata().equals(other.metadata());
         }
     }
 
