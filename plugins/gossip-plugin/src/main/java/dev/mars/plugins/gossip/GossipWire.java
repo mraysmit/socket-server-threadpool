@@ -23,7 +23,6 @@ import java.io.IOException;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -36,6 +35,9 @@ import static dev.mars.plugins.gossip.MembershipException.Reason.INVALID_RECORD;
 /** Gossip versioning and complete canonical-envelope accounting, independent of host version 1. */
 public final class GossipWire {
     private static final UUID BUDGET_ID = new UUID(0, 0);
+    private static final Set<String> REQUEST_FIELDS = Set.of("operation", "gossipVersion", "swarmId", "sender", "members");
+    private static final Set<String> REPLY_FIELDS = Set.of("gossipVersion", "swarmId", "sender", "members");
+    private static final Set<String> REPLY_FIELDS_V2 = Set.of("gossipVersion", "swarmId", "sender", "members", "senderAdmission");
     private final GossipConfig config;
     // Encoded sizes are additive: Json.write emits a record identically standalone or nested, so an envelope is a
     // fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
@@ -47,7 +49,6 @@ public final class GossipWire {
 
     public record Exchange(MemberRecord sender, List<MemberRecord> members, int gossipVersion,
                            MembershipTable.Admission senderAdmission) {
-        public Exchange(MemberRecord sender, List<MemberRecord> members) { this(sender, members, 1, null); }
         public Exchange { members = List.copyOf(members); }
         public List<MemberRecord> records() { return Stream.concat(Stream.of(sender), members.stream()).toList(); }
     }
@@ -55,11 +56,9 @@ public final class GossipWire {
     public GossipWire(GossipConfig config) { this.config = config; }
 
     public Exchange decode(Object value, boolean request) {
-        Set<String> fields = request ? Set.of("operation", "gossipVersion", "swarmId", "sender", "members")
-                : Set.of("gossipVersion", "swarmId", "sender", "members");
         if (!(value instanceof Map<?, ?> map)) { throw invalid("Invalid exchange fields"); }
         int version = exactInteger(map.get("gossipVersion"), "gossipVersion", 1, 2);
-        if (!request && version == 2) { fields = Set.of("gossipVersion", "swarmId", "sender", "members", "senderAdmission"); }
+        var fields = request ? REQUEST_FIELDS : version == 2 ? REPLY_FIELDS_V2 : REPLY_FIELDS;
         if (!map.keySet().equals(fields)) { throw invalid("Invalid exchange fields"); }
         if (request && !"exchange".equals(map.get("operation"))) { throw invalid("operation must be exchange"); }
         if (!config.swarmId().equals(map.get("swarmId"))) { throw invalid("swarmId does not match this swarm"); }
@@ -67,14 +66,9 @@ public final class GossipWire {
             throw invalid("Sender and members exceed max.batch.members");
         }
         MemberRecord sender = MemberRecord.fromWire(map.get("sender"));
-        var keys = new HashSet<MemberKey>();
-        keys.add(sender.key());
-        var decoded = new ArrayList<MemberRecord>();
-        for (Object member : members) {
-            MemberRecord record = MemberRecord.fromWire(member);
-            if (!keys.add(record.key())) { throw invalid("Duplicate member key in exchange"); }
-            decoded.add(record);
-        }
+        // Duplicate keys are rejected once, by the table, which checks every batch it is given before merging any.
+        var decoded = new ArrayList<MemberRecord>(members.size());
+        for (Object member : members) { decoded.add(MemberRecord.fromWire(member)); }
         MembershipTable.Admission admission = null;
         if (!request && version == 2) {
             if (!(map.get("senderAdmission") instanceof String text)) { throw invalid("Invalid senderAdmission"); }
@@ -93,24 +87,22 @@ public final class GossipWire {
     }
 
     public Map<String, Object> parameters(MemberRecord self, List<MemberRecord> members, int version) {
-        var result = new LinkedHashMap<>(result(self, members));
-        result.put("gossipVersion", exactInteger(version, "gossipVersion", 1, 2));
-        result.put("operation", "exchange");
-        return Map.copyOf(result);
+        return Map.of("operation", "exchange", "gossipVersion", exactInteger(version, "gossipVersion", 1, 2),
+                "swarmId", config.swarmId(), "sender", self.toWire(), "members", wireRecords(members));
     }
 
     public Map<String, Object> result(MemberRecord self, List<MemberRecord> members) {
-        return Map.of("gossipVersion", 1, "swarmId", config.swarmId(), "sender", self.toWire(),
-                "members", members.stream().map(MemberRecord::toWire).toList());
+        return Map.of("gossipVersion", 1, "swarmId", config.swarmId(), "sender", self.toWire(), "members", wireRecords(members));
     }
 
     public Map<String, Object> result(MemberRecord self, List<MemberRecord> members, int version, MembershipTable.Admission admission) {
-        exactInteger(version, "gossipVersion", 1, 2);
-        if (version == 1) { return result(self, members); }
-        var result = new LinkedHashMap<>(result(self, members));
-        result.put("gossipVersion", version);
-        result.put("senderAdmission", java.util.Objects.requireNonNull(admission).name());
-        return Map.copyOf(result);
+        if (exactInteger(version, "gossipVersion", 1, 2) == 1) { return result(self, members); }
+        return Map.of("gossipVersion", 2, "swarmId", config.swarmId(), "sender", self.toWire(), "members", wireRecords(members),
+                "senderAdmission", java.util.Objects.requireNonNull(admission).name());
+    }
+
+    private static List<Map<String, Object>> wireRecords(List<MemberRecord> records) {
+        return records.stream().map(MemberRecord::toWire).toList();
     }
 
     public byte[] requestBytes(Map<String, Object> parameters) {

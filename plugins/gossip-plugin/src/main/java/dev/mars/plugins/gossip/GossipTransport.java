@@ -57,6 +57,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             "INVALID_RECORD: gossipVersion must be between 1 and 1", "INVALID_RECORD: Unsupported gossipVersion");
     /** How long a version-1 peer is sent version 1 directly before version 2 is tried again, in case it was upgraded. */
     static final Duration VERSION_1_RECHECK = Duration.ofMinutes(10);
+    /** How often the watchdog checks whether a caller on a platform thread has been interrupted. */
+    private static final long INTERRUPT_CHECK_MILLIS = 50;
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -73,6 +75,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final LinkedHashMap<String, Long> version1Peers = new LinkedHashMap<>();
     private boolean closed;
 
+    /** For callers that own a standalone table, as the design document describes. */
     public GossipTransport(GossipConfig config, MembershipTable table) {
         this(config, table, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15));
     }
@@ -83,16 +86,12 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     }
 
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics) {
-        this(config, table, metrics, System::nanoTime);
+        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15), System::nanoTime);
     }
 
     /** The clock times only the version-1 memory; socket deadlines always use System.nanoTime. */
-    GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics, LongSupplier clock) {
-        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15), clock);
-    }
-
-    private GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
-                            Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock) {
+    GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
+                    Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock) {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
         this.clock = java.util.Objects.requireNonNull(clock);
@@ -217,7 +216,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     /**
      * One blocking connection. Connects and reads have socket timeouts; a blocking write has none, so a watchdog
-     * closes the socket once the overall deadline passes. On a virtual thread, an interrupt also closes it.
+     * closes the socket once the overall deadline passes. An interrupt also ends the exchange: on a virtual thread it
+     * closes the socket itself, and for a platform thread, which an interrupt does not wake from blocking socket I/O,
+     * the watchdog closes the socket within {@value #INTERRUPT_CHECK_MILLIS} ms.
      */
     private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
         checkDeadline(deadline);
@@ -226,9 +227,17 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 if (closed) { throw new IOException("Gossip transport is closed"); }
                 active.add(socket);
             }
+            var caller = Thread.currentThread();
+            long check = caller.isVirtual() ? Long.MAX_VALUE : TimeUnit.MILLISECONDS.toNanos(INTERRUPT_CHECK_MILLIS);
             var watchdog = Thread.ofVirtual().start(() -> {
-                try { TimeUnit.NANOSECONDS.sleep(deadline - System.nanoTime()); socket.close(); }
-                catch (InterruptedException | IOException finished) { /* The exchange ended first. */ }
+                try {
+                    long left = deadline - System.nanoTime();
+                    while (left > 0 && !caller.isInterrupted()) {
+                        TimeUnit.NANOSECONDS.sleep(Math.min(left, check));
+                        left = deadline - System.nanoTime();
+                    }
+                    socket.close();
+                } catch (InterruptedException | IOException finished) { /* The exchange ended first. */ }
             });
             try {
                 try { socket.connect(address, millis(Math.min(connectNanos, deadline - System.nanoTime()))); }

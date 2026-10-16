@@ -87,7 +87,7 @@ class PeerSelectorTest {
         for (int i = 0; i < 50; i++) { selector.failure(peer); }
         clock.addAndGet(TimeUnit.SECONDS.toNanos(30));
         assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
-        selector.success(peer);
+        selector.success(peer, peer);
         assertEquals(0, selector.retryCount());
         assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
     }
@@ -178,7 +178,7 @@ class PeerSelectorTest {
         var selector = new PeerSelector(config, clock::get, new Random(7));
         var seed = config.seeds().getFirst();
         var numeric = new GossipConfig.Seed("Peer", address, 9010);
-        selector.resolved(seed, numeric, table.snapshot());
+        selector.resolved(seed, numeric, table::snapshot);
 
         assertEquals(List.of(numeric), selector.select(table.snapshot(), Set.of(), 2));
         assertTrue(selector.select(table.snapshot(), Set.of(seed), 2).isEmpty());
@@ -187,11 +187,11 @@ class PeerSelectorTest {
         assertTrue(selector.select(table.snapshot(), Set.of(), 2).isEmpty());
         clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
         assertEquals(List.of(numeric), selector.select(table.snapshot(), Set.of(), 2));
-        selector.success(numeric);
+        selector.success(numeric, numeric);
         assertEquals(0, selector.retryCount());
         selector.failure(numeric);
         assertTrue(selector.select(table.snapshot(), Set.of(), 2).isEmpty());
-        selector.success(seed);
+        selector.success(seed, seed);
         assertEquals(0, selector.retryCount());
     }
 
@@ -224,7 +224,7 @@ class PeerSelectorTest {
             var views = new java.util.ArrayList<MembershipTable.MemberView>();
             views.add(new MembershipTable.MemberView(self, MembershipTable.Assessment.ALIVE, 0, null, true, false));
             for (var record : records) { views.add(new MembershipTable.MemberView(record, MembershipTable.Assessment.CANDIDATE, 0, null, false, false)); }
-            return new MembershipTable.Snapshot(self, views, Set.of(), views.size(), views.size(), 0);
+            return new MembershipTable.Snapshot(self, views, Set.of(), views.size(), views.size(), 0, 0);
         };
         for (String expected : List.of("A", "B", "C")) {
             assertEquals(expected, selector.select(unverified.apply(members), Set.of(), 1).getFirst().serverId());
@@ -250,6 +250,7 @@ class PeerSelectorTest {
         }
         // More distinct hosts than the cache keeps: evicted hosts are simply parsed again.
         for (int i = 0; i < 2000; i++) { assertTrue(GossipValidation.validHost("host-" + i + ".example.test")); }
+        assertTrue(GossipValidation.cachedHosts() <= 1024, "Hosts arrive from the network, so the cache must stay bounded");
         assertTrue(GossipValidation.validHost("host-0.example.test"));
         assertFalse(GossipValidation.validHost("host-0.example.test/path"));
     }
@@ -317,7 +318,7 @@ class PeerSelectorTest {
         var table = new MembershipTable(config, self, clock::get);
         table.mergeDirect(record("Peer", 2, 9010), List.of());
         var selector = new PeerSelector(config, clock::get, new Random(9));
-        selector.resolved(config.seeds().getFirst(), new GossipConfig.Seed("Other", "127.0.0.1", 9010), table.snapshot());
+        selector.resolved(config.seeds().getFirst(), new GossipConfig.Seed("Other", "127.0.0.1", 9010), table::snapshot);
         assertEquals(2, selector.select(table.snapshot(), Set.of(), 2).size());
         selector.success(config.seeds().getFirst(), new GossipConfig.Seed("Other", "127.0.0.1", 9010));
         assertEquals(2, selector.select(table.snapshot(), Set.of(), 2).size());
@@ -328,7 +329,7 @@ class PeerSelectorTest {
         var table = new MembershipTable(config, self, clock::get);
         table.merge(List.of(record("Peer", 2, 9010)));
         var selector = new PeerSelector(config, clock::get, new Random(11));
-        selector.resolved(config.seeds().getFirst(), new GossipConfig.Seed("Peer", "127.0.0.1", 9010), table.snapshot());
+        selector.resolved(config.seeds().getFirst(), new GossipConfig.Seed("Peer", "127.0.0.1", 9010), table::snapshot);
         assertEquals(2, selector.select(table.snapshot(), Set.of(), 2).size());
     }
 

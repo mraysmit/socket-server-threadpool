@@ -41,10 +41,6 @@ public final class MembershipTable {
 
     public record Snapshot(MemberRecord self, List<MemberView> members, Set<String> identityConflicts,
                            int activeMembers, int retainedIdentities, int tombstones, long admissionsSkipped) {
-        public Snapshot(MemberRecord self, List<MemberView> members, Set<String> identityConflicts,
-                        int activeMembers, int retainedIdentities, int tombstones) {
-            this(self, members, identityConflicts, activeMembers, retainedIdentities, tombstones, 0);
-        }
         public Snapshot {
             members = List.copyOf(members);
             identityConflicts = Set.copyOf(identityConflicts);
@@ -83,13 +79,16 @@ public final class MembershipTable {
     /** Decode every record before applying any of them. Outer envelope validation belongs to the transport. */
     public MergeResult mergeEncoded(List<?> records) {
         checkBatchSize(records);
-        var decoded = new ArrayList<MemberRecord>();
+        var decoded = new ArrayList<MemberRecord>(records.size());
         for (Object record : records) { decoded.add(MemberRecord.fromWire(record)); }
-        return merge(decoded);
+        return apply(validateBatch(decoded), null, null).merge();
     }
 
     /** Forwarded owner records supply activity evidence, but do not verify their advertised endpoints. */
-    public MergeResult merge(List<MemberRecord> records) { return apply(validateBatch(records), null, null).merge(); }
+    public MergeResult merge(List<MemberRecord> records) {
+        // A private copy, so a caller changing its list cannot change the batch while it is checked and applied.
+        return apply(validateBatch(records == null ? null : new ArrayList<>(records)), null, null).merge();
+    }
 
     /** Admission of the sender is captured atomically with the committed merge, not a later snapshot. */
     public ExchangeMerge mergeExchange(MemberRecord sender, List<MemberRecord> forwarded) {
@@ -106,15 +105,15 @@ public final class MembershipTable {
 
     private List<MemberRecord> validateExchange(MemberRecord responder, List<MemberRecord> forwarded) {
         if (responder == null) { throw new MembershipException(INVALID_RECORD, "Direct responder is required"); }
-        checkBatchSize(forwarded);
-        if (forwarded.size() >= config.maxBatchMembers()) {
-            throw new MembershipException(INVALID_RECORD, "Sender counts toward max.batch.members");
-        }
-        var records = new ArrayList<MemberRecord>(forwarded);
-        records.addFirst(responder);
+        if (forwarded == null) { throw new MembershipException(INVALID_RECORD, "Forwarded records are required"); }
+        // The responder counts toward max.batch.members, which validateBatch checks for the whole batch.
+        var records = new ArrayList<MemberRecord>(forwarded.size() + 1);
+        records.add(responder);
+        records.addAll(forwarded);
         return validateBatch(records);
     }
 
+    /** Checks a batch the caller has already copied, so it is applied as it is. */
     private List<MemberRecord> validateBatch(List<MemberRecord> records) {
         checkBatchSize(records);
         var keys = new HashSet<MemberKey>();
@@ -123,7 +122,7 @@ public final class MembershipTable {
             if (!keys.add(record.key())) { throw new MembershipException(INVALID_RECORD, "Duplicate member key: " + record.key()); }
             checkRecordSize(record);
         }
-        return List.copyOf(records);
+        return records;
     }
 
     private void checkBatchSize(List<?> records) {
@@ -303,8 +302,9 @@ public final class MembershipTable {
     /** Every record but the local one, in table order: what a batch can forward, without a snapshot's assessments. */
     public synchronized List<MemberRecord> peers() {
         var peers = new ArrayList<MemberRecord>(entries.size());
-        for (Entry entry : entries.values()) {
-            if (!entry.record().key().equals(localKey)) { peers.add(entry.record()); }
+        // The local entry is only ever stored under localKey itself, so an identity check is exact.
+        for (var item : entries.entrySet()) {
+            if (item.getKey() != localKey) { peers.add(item.getValue().record()); }
         }
         return Collections.unmodifiableList(peers);
     }

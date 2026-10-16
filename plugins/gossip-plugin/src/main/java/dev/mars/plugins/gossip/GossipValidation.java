@@ -18,16 +18,15 @@ package dev.mars.plugins.gossip;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /** Shared lexical checks; never resolve advertised addresses during validation. */
 final class GossipValidation {
+    private static final int MAX_CACHED_HOSTS = 1024;
     // Results by host. A swarm has few distinct hosts and every record repeats one, so URI parsing runs once per host.
-    private static final Map<String, Boolean> HOSTS = Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
-        @Override protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) { return size() > 1024; }
-    });
+    // Every decoded record looks its host up here, so lookups take no lock; when full, the cache simply starts again.
+    private static final Map<String, Boolean> HOSTS = new ConcurrentHashMap<>();
 
     private GossipValidation() { }
 
@@ -60,8 +59,16 @@ final class GossipValidation {
 
     /** Hosts arrive from the network, so length is checked before anything is cached; the cache stays under 0.5 MB. */
     static boolean validHost(String host) {
-        return host != null && host.length() <= 253 && HOSTS.computeIfAbsent(host, GossipValidation::parseHost);
+        if (host == null || host.length() > 253) { return false; }
+        Boolean known = HOSTS.get(host);
+        if (known != null) { return known; }
+        boolean valid = parseHost(host);
+        if (HOSTS.size() >= MAX_CACHED_HOSTS) { HOSTS.clear(); }
+        HOSTS.put(host, valid);
+        return valid;
     }
+
+    static int cachedHosts() { return HOSTS.size(); }
 
     private static boolean parseHost(String host) {
         if (host.isBlank() || host.contains("[") || host.contains("]")) {

@@ -389,6 +389,7 @@ class MembershipTableTest {
         var table = new MembershipTable(config(2, 2), self, clock);
         var before = table.snapshot();
         assertReason(INVALID_RECORD, () -> table.merge(List.of(peer, peer)));
+        assertReason(INVALID_RECORD, () -> table.mergeEncoded(List.of(peer.toWire(), peer.toWire())));
         assertReason(INVALID_RECORD, () -> table.merge(Arrays.asList(peer, null)));
         assertReason(INVALID_RECORD, () -> table.merge(null));
         assertReason(INVALID_RECORD, () -> table.mergeDirect(peer, List.of(self, member("Other", 3, 0))));

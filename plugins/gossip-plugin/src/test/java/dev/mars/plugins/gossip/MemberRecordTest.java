@@ -156,6 +156,22 @@ class MemberRecordTest {
         }
     }
 
+    @Test void acceptedHostsArePlainAsciiThatJsonNeverEscapes() {
+        // serializedBytes counts a host's characters as its JSON bytes, so validation must never accept a character
+        // that JSON escapes or UTF-8 encodes in more than one byte, in any position a host can take.
+        var characters = new ArrayList<Integer>();
+        for (int c = 0; c < 0x10000; c++) { if (!Character.isSurrogate((char) c)) { characters.add(c); } }
+        for (int c = 0x10000; c <= 0x10FFFF; c += 0x1003) { characters.add(c); }
+        characters.add(0x1F600);
+        for (int c : characters) {
+            if (c >= 0x20 && c < 0x7F && c != '"' && c != '\\') { continue; }
+            String character = Character.toString(c);
+            for (String host : List.of("a" + character + "b", character + "x.com", "fe80::1" + character, "fe80::1%" + character)) {
+                assertFalse(GossipValidation.validHost(host), () -> "Accepted U+" + Integer.toHexString(c) + " in " + host);
+            }
+        }
+    }
+
     @Test void unpairedUnicodeSurrogatesCannotSilentlyChangeOnUtf8Encoding() throws Exception {
         String invalid = String.valueOf((char) 0xd800);
         assertInvalid(() -> record(Map.of("value", invalid)));
@@ -211,6 +227,36 @@ class MemberRecordTest {
     @ValueSource(strings = {"1-1-1-1-1", "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA", "not-a-uuid", ""})
     void bootIdsMustBeCanonicalLowercaseUuids(String bootId) {
         assertInvalid(() -> MemberKey.fromWire("Peer", bootId));
+    }
+
+    @Test void wireFormIsBuiltOncePerRecord() {
+        var record = record(Map.of("role", "worker"));
+        assertSame(record.toWire(), record.toWire(), "Built once per record, not for every exchange that carries it");
+    }
+
+    @Test void endpointIsTheRecordsSeedBuiltOnce() {
+        var record = record(Map.of());
+        assertEquals(new GossipConfig.Seed("Peer", "::1", 65535), record.endpoint());
+        assertSame(record.endpoint(), record.endpoint(), "Built and validated once per record, not on every use");
+    }
+
+    @Test void bootIdsAreAcceptedExactlyWhenTheyPrintBackIdentically() {
+        var inputs = new ArrayList<>(List.of("1-1-1-1-1", "+0000000-0000-0000-0000-000000000000", "", "x"));
+        for (String base : List.of(new UUID(0, 0).toString(), new UUID(-1, -1).toString(), "0123abcd-4567-89ef-0123-456789abcdef")) {
+            inputs.addAll(List.of(base, base.toUpperCase(), base.substring(1), base + "0", "0" + base));
+            for (int i = 0; i < base.length(); i++) {
+                for (char c = 0; c < 128; c++) { inputs.add(base.substring(0, i) + c + base.substring(i + 1)); }
+            }
+        }
+        for (String bootId : inputs) {
+            boolean canonical;
+            try { canonical = UUID.fromString(bootId).toString().equals(bootId); }
+            catch (IllegalArgumentException notUuid) { canonical = false; }
+            boolean accepted;
+            try { MemberKey.fromWire("Peer", bootId); accepted = true; }
+            catch (MembershipException rejected) { accepted = false; }
+            assertEquals(canonical, accepted, bootId);
+        }
     }
 
     @Test void rejectsMalformedFieldsStatesEndpointsAndIdentities() {

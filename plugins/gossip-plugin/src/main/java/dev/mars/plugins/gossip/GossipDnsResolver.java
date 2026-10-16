@@ -65,8 +65,6 @@ final class GossipDnsResolver implements AutoCloseable {
         this.lookup = lookup;
     }
 
-    GossipConfig.Seed resolve(GossipConfig.Seed peer) throws IOException { return resolveAll(peer).getFirst(); }
-
     /**
      * Every address of the peer's host. The first address rotates between calls to spread load; the rest are
      * connection fallbacks, so one unreachable address (for example an unrouted IPv6 record) cannot fail the peer.

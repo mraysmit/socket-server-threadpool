@@ -26,7 +26,8 @@ import java.util.function.ToIntFunction;
 final class GossipBatchSelector {
     private final ToIntFunction<MemberRecord> encodedSize;
     private final Map<MemberKey, Entry> entries = new HashMap<>();
-    private final ArrayList<Entry> scan = new ArrayList<>();
+    private ArrayList<Entry> scan = new ArrayList<>();
+    private ArrayList<Entry> previousScan = new ArrayList<>(); // Last call's scan; the table rarely reorders.
     private final LinkedHashSet<Entry> departures = new LinkedHashSet<>();
     private final LinkedHashSet<Entry> changes = new LinkedHashSet<>();
     private int cursor;
@@ -82,14 +83,23 @@ final class GossipBatchSelector {
 
     private void refresh(List<MemberRecord> records) {
         long current = ++generation;
+        var previous = scan;
+        scan = previousScan;
+        previousScan = previous;
         scan.clear();
         for (var record : records) {
-            var key = record.key();
-            Entry entry = entries.get(key);
-            boolean changed = entry == null || entry.record.heartbeat() != record.heartbeat()
-                    || entry.record.state() != record.state();
-            if (entry == null) { entry = new Entry(); entries.put(key, entry); }
-            entry.record = record;
+            // Usually the entry at the same place last time, still holding this very record: then neither the
+            // record nor the map needs reading. Only a changed record or a reordered table does.
+            Entry before = scan.size() < previous.size() ? previous.get(scan.size()) : null;
+            Entry entry = before;
+            boolean changed = false;
+            if (before == null || before.record != record) {
+                var key = record.key();
+                entry = before != null && before.record.key().equals(key) ? before : entries.get(key);
+                changed = entry == null || entry.record.heartbeat() != record.heartbeat() || entry.record.state() != record.state();
+                if (entry == null) { entry = new Entry(); entries.put(key, entry); }
+                entry.record = record;
+            }
             entry.index = scan.size();
             entry.included = false;
             entry.generation = current;

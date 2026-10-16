@@ -248,7 +248,8 @@ class GossipTransportTest {
         var clock = new java.util.concurrent.atomic.AtomicLong();
         var upgraded = new java.util.concurrent.atomic.AtomicBoolean();
         var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-        try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), clock::get);
+        try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), Duration.ofSeconds(5),
+                Duration.ofSeconds(10), Duration.ofSeconds(15), clock::get);
              var peer = new ProtocolPeer(4, version1Peer(config, versions, upgraded::get, 2))) {
             transport.exchange(peer.endpoint());
             clock.addAndGet(GossipTransport.VERSION_1_RECHECK.toNanos() - 1);
@@ -610,13 +611,16 @@ class GossipTransportTest {
         assertEquals(java.util.Set.of("Extra-0", "Extra-1", "Extra-2", "Extra-3", "Extra-4"), seen);
     }
 
-    @Test void interruptingTheCallerEndsSelectorWaitAndReleasesItsPermit() throws Exception {
+    @ParameterizedTest @ValueSource(booleans = {true, false})
+    void interruptingTheCallerEndsItsExchangeAndReleasesItsPermit(boolean virtual) throws Exception {
         var config = GossipCommandsTest.config(32768, 32, 128);
         var release = new CountDownLatch(1);
         try (var peer = new ProtocolPeer((socket, port, request) -> release.await(5, TimeUnit.SECONDS));
              var transport = new GossipTransport(config, table(config))) {
             var completed = new CompletableFuture<Throwable>();
-            Thread caller = Thread.ofVirtual().start(() -> {
+            // Unlike a virtual thread, a platform thread is not woken from blocking socket I/O by its own interrupt.
+            Thread.Builder threads = virtual ? Thread.ofVirtual() : Thread.ofPlatform();
+            Thread caller = threads.start(() -> {
                 try { transport.exchange(peer.endpoint()); completed.complete(new AssertionError("Expected interruption")); }
                 catch (Throwable failure) { completed.complete(failure); }
             });

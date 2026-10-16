@@ -273,7 +273,7 @@ class GossipRuntimeTest {
                 var record = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
                         1, MemberRecord.State.ALIVE, Map.of());
                 table.mergeDirect(record, List.of());
-                return new GossipWire.Exchange(record, List.of());
+                return new GossipWire.Exchange(record, List.of(), 1, null);
             }
             @Override public void close() { }
         };
@@ -338,7 +338,7 @@ class GossipRuntimeTest {
             try { if (block) { release.await(); } }
             catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             if (fail) { throw new IOException("Unavailable fixture peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of());
+            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, null);
         }
         @Override public void close() { closed = true; release.countDown(); }
     }

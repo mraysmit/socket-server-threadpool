@@ -28,14 +28,18 @@ public record MemberKey(String serverId, UUID bootId) {
     }
 
     public static MemberKey fromWire(String serverId, String bootId) {
-        UUID parsed;
-        try { parsed = UUID.fromString(bootId); }
-        catch (IllegalArgumentException | NullPointerException e) {
-            throw new MembershipException(INVALID_RECORD, "bootId must be a canonical UUID");
+        if (!canonical(bootId)) { throw new MembershipException(INVALID_RECORD, "bootId must be a canonical lowercase UUID"); }
+        return new MemberKey(serverId, UUID.fromString(bootId));
+    }
+
+    /** The only form UUID.toString prints: lowercase hex digits with hyphens at 8, 13, 18 and 23, 36 characters long. */
+    private static boolean canonical(String uuid) {
+        if (uuid == null || uuid.length() != 36) { return false; }
+        for (int i = 0; i < 36; i++) {
+            char c = uuid.charAt(i);
+            boolean valid = i == 8 || i == 13 || i == 18 || i == 23 ? c == '-' : (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+            if (!valid) { return false; }
         }
-        if (!parsed.toString().equals(bootId)) {
-            throw new MembershipException(INVALID_RECORD, "bootId must be a canonical lowercase UUID");
-        }
-        return new MemberKey(serverId, parsed);
+        return true;
     }
 }

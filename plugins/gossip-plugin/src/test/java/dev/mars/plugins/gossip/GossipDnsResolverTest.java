@@ -63,11 +63,11 @@ class GossipDnsResolverTest {
 
     @Test void actualSystemResolverHelperResolvesLocalhostAndNumericEndpointsNeedNoHelper() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 2)) {
-            var peer = resolver.resolve(new GossipConfig.Seed("Peer", "localhost", 9000));
+            var peer = resolver.resolveAll(new GossipConfig.Seed("Peer", "localhost", 9000)).getFirst();
             assertTrue(InetAddress.ofLiteral(peer.host()).isLoopbackAddress());
             assertEquals(1, resolver.cacheSize());
             assertEquals(0, resolver.activeHelpers());
-            assertEquals("127.0.0.1", resolver.resolve(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)).host());
+            assertEquals("127.0.0.1", resolver.resolveAll(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)).getFirst().host());
             assertEquals(1, resolver.cacheSize());
         }
     }
@@ -76,15 +76,15 @@ class GossipDnsResolverTest {
         var clock = new AtomicLong();
         try (var resolver = new GossipDnsResolver(1, 1, Duration.ofSeconds(2), clock::get, this::launch)) {
             var peer = new GossipConfig.Seed("Peer", "good.test", 9000);
-            assertEquals("127.0.0.1", resolver.resolve(peer).host());
-            assertTrue(InetAddress.ofLiteral(resolver.resolve(peer).host()).isLoopbackAddress());
+            assertEquals("127.0.0.1", resolver.resolveAll(peer).getFirst().host());
+            assertTrue(InetAddress.ofLiteral(resolver.resolveAll(peer).getFirst().host()).isLoopbackAddress());
             assertEquals(1, lookups.size());
             clock.set(TimeUnit.SECONDS.toNanos(61));
-            resolver.resolve(peer);
+            resolver.resolveAll(peer).getFirst();
             assertEquals(2, lookups.size());
-            resolver.resolve(new GossipConfig.Seed("Peer", "another.test", 9000));
+            resolver.resolveAll(new GossipConfig.Seed("Peer", "another.test", 9000)).getFirst();
             assertEquals(1, resolver.cacheSize());
-            resolver.resolve(peer);
+            resolver.resolveAll(peer).getFirst();
             assertEquals(4, lookups.size());
         }
         await(() -> lookups.stream().noneMatch(Thread::isAlive));
@@ -98,7 +98,7 @@ class GossipDnsResolverTest {
             assertEquals(List.of("127.0.0.1", "0:0:0:0:0:0:0:1"), first.stream().map(GossipConfig.Seed::host).toList());
             assertEquals(first.reversed(), second, "The first address rotates; the rest remain as fallbacks");
             assertTrue(first.stream().allMatch(endpoint -> endpoint.serverId().equals("Peer") && endpoint.port() == 9000));
-            assertEquals(first.getFirst(), resolver.resolve(peer), "resolve returns the next first address");
+            assertEquals(first.getFirst(), resolver.resolveAll(peer).getFirst(), "resolve returns the next first address");
             assertEquals(1, lookups.size(), "Rotation is served from the cache");
             var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9000);
             assertEquals(List.of(numeric), resolver.resolveAll(numeric));
@@ -112,11 +112,11 @@ class GossipDnsResolverTest {
                  return fixtureLookup(host, release);
              });
              var callers = Executors.newVirtualThreadPerTaskExecutor()) {
-            var first = callers.submit(() -> resolver.resolve(new GossipConfig.Seed("Peer", "wait.test", 9000)));
+            var first = callers.submit(() -> resolver.resolveAll(new GossipConfig.Seed("Peer", "wait.test", 9000)).getFirst());
             await(() -> resolver.activeHelpers() == 1);
             // With one lookup allowed, a second host is refused but the same host joins the lookup in flight.
-            assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "other.test", 9000)));
-            var second = callers.submit(() -> resolver.resolve(new GossipConfig.Seed("Peer", "WAIT.test", 9010)));
+            assertThrows(IOException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "other.test", 9000)).getFirst());
+            var second = callers.submit(() -> resolver.resolveAll(new GossipConfig.Seed("Peer", "WAIT.test", 9010)).getFirst());
             java.nio.file.Files.createFile(release);
             assertEquals(new GossipConfig.Seed("Peer", "127.0.0.1", 9000), first.get(5, TimeUnit.SECONDS));
             assertEquals(new GossipConfig.Seed("Peer", "127.0.0.1", 9010), second.get(5, TimeUnit.SECONDS));
@@ -126,9 +126,9 @@ class GossipDnsResolverTest {
 
     @Test void timeoutAndInvalidRepliesLeaveNoHelpersOrPoisonedCacheEntries() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 2, Duration.ofMillis(150), System::nanoTime, this::launch)) {
-            assertThrows(SocketTimeoutException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "stall.test", 9000)));
+            assertThrows(SocketTimeoutException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "stall.test", 9000)).getFirst());
             for (String host : List.of("bad.test", "fail.test")) {
-                assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", host, 9000)));
+                assertThrows(IOException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", host, 9000)).getFirst());
             }
             await(() -> resolver.activeHelpers() == 0);
             assertEquals(0, resolver.cacheSize());
@@ -139,15 +139,15 @@ class GossipDnsResolverTest {
     @Test void closeKillsAnActiveLookupAndUnblocksTheOwnedCaller() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 1, Duration.ofSeconds(10), System::nanoTime, this::launch);
              var worker = Executors.newVirtualThreadPerTaskExecutor()) {
-            var lookup = worker.submit(() -> resolver.resolve(new GossipConfig.Seed("Peer", "stall.test", 9000)));
+            var lookup = worker.submit(() -> resolver.resolveAll(new GossipConfig.Seed("Peer", "stall.test", 9000)).getFirst());
             await(() -> resolver.activeHelpers() == 1);
-            assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "other.test", 9000)));
+            assertThrows(IOException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "other.test", 9000)).getFirst());
             resolver.close();
             var failure = assertThrows(ExecutionException.class, () -> lookup.get(2, TimeUnit.SECONDS));
             assertInstanceOf(IOException.class, failure.getCause());
             assertEquals(0, resolver.activeHelpers());
             await(() -> lookups.stream().noneMatch(Thread::isAlive));
-            assertThrows(IOException.class, () -> resolver.resolve(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)));
+            assertThrows(IOException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)).getFirst());
         }
     }
 

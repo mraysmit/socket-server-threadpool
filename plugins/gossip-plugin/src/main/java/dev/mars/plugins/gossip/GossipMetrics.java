@@ -33,8 +33,11 @@ final class GossipMetrics {
     volatile int workers;
     volatile int dnsHelpers;
     volatile int retryingPeers;
-    volatile Long lastRound;
-    private volatile Long lastSuccess;
+    // Marks a time not yet taken, so recording one boxes nothing; a nanoTime reading of exactly this value would only
+    // read as unknown until the next.
+    private static final long NEVER = Long.MIN_VALUE;
+    volatile long lastRound = NEVER;
+    private volatile long lastSuccess = NEVER;
     private GossipLog log;
 
     GossipMetrics() { this(null); }
@@ -57,7 +60,7 @@ final class GossipMetrics {
         result.put("workers", workers);
         result.put("dnsHelpers", dnsHelpers);
         result.put("retryingPeers", retryingPeers);
-        result.put("lastRoundAgeMillis", lastRound == null ? null : Math.max(0, System.nanoTime() - lastRound) / 1_000_000);
+        result.put("lastRoundAgeMillis", ageMillis(lastRound));
         result.put("failures", kinds);
         return result;
     }
@@ -67,11 +70,11 @@ final class GossipMetrics {
         lastSuccess = System.nanoTime();
     }
 
-    boolean isolated() { return lastSuccess == null; }
-    Long lastSuccessAgeMillis() {
-        Long previous = lastSuccess;
-        return previous == null ? null : Math.max(0, System.nanoTime() - previous) / 1_000_000;
-    }
+    boolean isolated() { return lastSuccess == NEVER; }
+    Long lastSuccessAgeMillis() { return ageMillis(lastSuccess); }
+
+    /** Milliseconds since a nanoTime reading, or null if none has been taken. */
+    private static Long ageMillis(long then) { return then == NEVER ? null : Math.max(0, System.nanoTime() - then) / 1_000_000; }
     Map<String, Object> counts(int inflight) {
         return Map.of("inbound", inbound.get(), "outbound", outbound.get(), "outboundFailures", outboundFailures.get(),
                 "rejected", rejectedExchanges.get(), "inflight", inflight);

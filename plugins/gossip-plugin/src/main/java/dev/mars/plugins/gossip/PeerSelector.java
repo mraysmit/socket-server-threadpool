@@ -59,7 +59,7 @@ final class PeerSelector {
         for (var member : snapshot.members()) {
             if (member.record().key().equals(self.key()) || member.record().state() == MemberRecord.State.LEFT) { continue; }
             var record = member.record();
-            var peer = new GossipConfig.Seed(record.key().serverId(), record.host(), record.port());
+            var peer = record.endpoint();
             var address = GossipValidation.literal(peer.host());
             if (!isSelf(self, selfAddress, peer, address)) {
                 var candidate = new Candidate(peer, member.assessment() != MembershipTable.Assessment.ALIVE);
@@ -105,14 +105,10 @@ final class PeerSelector {
         return recovery.get(index);
     }
 
-    synchronized void success(GossipConfig.Seed peer) { retries.remove(canonical(peer)); }
-
-    /** DNS may confirm an alias of an endpoint whose identity is already directly verified. */
-    synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, MembershipTable.Snapshot snapshot) {
-        resolved(peer, endpoint, () -> snapshot);
-    }
-
-    /** As above; the snapshot is taken only for a configured seed whose resolved address differs from it. */
+    /**
+     * DNS may confirm an alias of an endpoint whose identity is already directly verified. The snapshot is taken only
+     * for a configured seed whose resolved address differs from it.
+     */
     synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, Supplier<MembershipTable.Snapshot> snapshots) {
         var resolved = normalized(endpoint);
         if (!config.seeds().contains(peer) || normalized(peer).equals(resolved)) { return; }
@@ -120,7 +116,7 @@ final class PeerSelector {
         boolean verified = snapshot.members().stream().anyMatch(member -> member.endpointVerified()
                 && !member.record().key().equals(snapshot.self().key())
                 && member.assessment() == MembershipTable.Assessment.ALIVE
-                && normalized(new GossipConfig.Seed(member.record().key().serverId(), member.record().host(), member.record().port())).equals(resolved));
+                && normalized(member.record().endpoint()).equals(resolved));
         if (verified) { rememberAlias(peer, resolved); }
     }
 
@@ -188,7 +184,8 @@ final class PeerSelector {
     }
 
     static boolean isSelf(MemberRecord self, GossipConfig.Seed peer) {
-        return isSelf(self, GossipValidation.literal(self.host()), peer, GossipValidation.literal(peer.host()));
+        return self.port() == peer.port()
+                && isSelf(self, GossipValidation.literal(self.host()), peer, GossipValidation.literal(peer.host()));
     }
 
     /** As above, with both hosts already parsed (null for a hostname). */

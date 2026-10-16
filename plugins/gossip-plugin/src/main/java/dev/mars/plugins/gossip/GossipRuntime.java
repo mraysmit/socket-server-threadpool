@@ -162,7 +162,7 @@ final class GossipRuntime implements AutoCloseable {
         for (var member : snapshot.members()) {
             var record = member.record();
             if (record.key().equals(snapshot.self().key()) || record.state() == MemberRecord.State.LEFT) { continue; }
-            addDepartureTarget(new GossipConfig.Seed(record.key().serverId(), record.host(), record.port()), snapshot.self(), cap);
+            addDepartureTarget(record.endpoint(), snapshot.self(), cap);
         }
         for (var seed : config.seeds()) { addDepartureTarget(seed, snapshot.self(), cap); }
         table.leaveLocal();

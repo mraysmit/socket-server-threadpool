@@ -95,7 +95,7 @@ final class GossipCommands {
         } catch (MembershipException failure) {
             if (failure.reason() == MembershipException.Reason.CONFLICT) {
                 var peer = incoming.sender();
-                log.identity("inbound", new GossipConfig.Seed(peer.key().serverId(), peer.host(), peer.port()), null, failure.getMessage());
+                log.identity("inbound", peer.endpoint(), null, failure.getMessage());
             }
             throw failure;
         }

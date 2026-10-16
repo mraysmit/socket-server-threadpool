@@ -65,6 +65,8 @@ public final class MemberRecord {
     private final int serializedBytes;
     // Computed lazily; racing threads compute the same value, so plain volatile publication is enough.
     private volatile String fingerprint;
+    private volatile GossipConfig.Seed endpoint;
+    private volatile Map<String, Object> wire;
 
     public MemberRecord(MemberKey key, String host, int port, long heartbeat, State state, Map<String, Object> metadata) {
         if (key == null || !GossipValidation.validHost(host) || port < 1 || port > 65535
@@ -122,16 +124,22 @@ public final class MemberRecord {
                 GossipWire.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
     }
 
+    /** The record's fields for JSON, built once: every exchange that carries the record sends the same map. */
     public Map<String, Object> toWire() {
-        var fields = new LinkedHashMap<String, Object>();
-        fields.put("serverId", key.serverId());
-        fields.put("bootId", key.bootId().toString());
-        fields.put("host", host);
-        fields.put("port", port);
-        fields.put("heartbeat", heartbeat);
-        fields.put("state", state.name());
-        fields.put("metadata", metadata);
-        return Collections.unmodifiableMap(fields);
+        var fields = wire;
+        if (fields == null) {
+            var built = new LinkedHashMap<String, Object>();
+            built.put("serverId", key.serverId());
+            built.put("bootId", key.bootId().toString());
+            built.put("host", host);
+            built.put("port", port);
+            built.put("heartbeat", heartbeat);
+            built.put("state", state.name());
+            built.put("metadata", metadata);
+            fields = Collections.unmodifiableMap(built);
+            wire = fields;
+        }
+        return fields;
     }
 
     /** Exact UTF-8 size of {@link #toWire()} encoded as JSON, identical standalone or inside an envelope. */
@@ -146,6 +154,13 @@ public final class MemberRecord {
             fingerprint = digest;
         }
         return digest;
+    }
+
+    /** This member as a peer endpoint, built once: selection asks for it every round, and its fields are already valid. */
+    GossipConfig.Seed endpoint() {
+        var seed = endpoint;
+        if (seed == null) { seed = new GossipConfig.Seed(key.serverId(), host, port); endpoint = seed; }
+        return seed;
     }
 
     boolean sameEndpoint(MemberRecord other) { return host.equals(other.host) && port == other.port; }
@@ -250,6 +265,7 @@ public final class MemberRecord {
 
     /** Checks the exact UTF-8 size and that the host codec can read the metadata back; returns the size. */
     private static int validateMetadata(Map<String, Object> metadata, int longestNumber) {
+        if (metadata.isEmpty()) { return 2; } // {} needs no encoding to measure, and always reads back.
         try {
             String json = Json.write(metadata);
             int bytes = json.getBytes(StandardCharsets.UTF_8).length;

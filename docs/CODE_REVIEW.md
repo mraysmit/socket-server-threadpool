@@ -16,7 +16,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 ## Status (2026-10-16)
 
-**Fixed:** every finding, #1 to #13 and all six low-impact items. #10 to #13 came from a second pass that measured where the remaining time went; see [Second pass](#second-pass-efficiency-deep-dive-2026-10-16). A profiling pass between the two cut decoding costs; see [After the review](#after-the-review-measured-decoding-costs-2026-10-16). Two related changes have also landed since the review:
+**Fixed:** every finding, #1 to #13 and all six low-impact items. #10 to #13 came from a second pass that measured where the remaining time went; see [Second pass](#second-pass-efficiency-deep-dive-2026-10-16). A profiling pass between the two cut decoding costs; see [After the review](#after-the-review-measured-decoding-costs-2026-10-16). What was still open after #10 to #13 was then fixed too; see [Follow-up](#follow-up-what-was-still-open-2026-10-16). Two related changes have also landed since the review:
 
 - **Address fallback.** When a peer's hostname resolves to several addresses and connecting to one fails (refused or unreachable), the same exchange now tries the others. `GossipDnsResolver.resolveAll` returns every address, and `GossipTransport` and `GossipRuntime` use it. This affects how #4 should be fixed; see the note there.
 - **Test support moved to the host.** Plugin tests now use the host's `dev.mars.testing` library. This changes no finding below.
@@ -28,10 +28,10 @@ Line numbers and links refer to the code as of 2026-10-16.
 **Was:** for every record in every exchange, `requireForwardable` built and encoded three complete envelopes: a request with the record as sender, a reply holding the record, and a members page holding the record. It also rebuilt a Base64 cursor that never changed, once per record. A reply carrying 31 records needed about 94 envelope encodings, roughly 10× the bytes actually sent. The same record was encoded again by `GossipWire.decode`'s request-size check, by `MembershipTable.checkRecordSize`, and by every call to `MemberRecord.serializedBytes()` or `fingerprint()`.
 
 **Now:**
-- [`MemberRecord`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L137-L149) is a final class that computes its encoded size and fingerprint once, then reuses them.
-- [`GossipWire`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L121-L125) adds sizes up instead of encoding envelopes. A record's JSON is identical standalone or nested, so an envelope is a fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
-- [`requireForwardable`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L177-L192) needs no envelope encoding per record. Its two local-record overheads are recomputed only when the local record changes in more than its heartbeat.
-- The request-size check in `decode` ([GossipWire.java:85](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L85)) no longer re-encodes the request.
+- [`MemberRecord`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L145-L157) is a final class that computes its encoded size and fingerprint once, then reuses them.
+- [`GossipWire`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L113-L117) adds sizes up instead of encoding envelopes. A record's JSON is identical standalone or nested, so an envelope is a fixed overhead plus its records plus one comma between neighbours. Each overhead is measured once.
+- [`requireForwardable`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L169-L184) needs no envelope encoding per record. Its two local-record overheads are recomputed only when the local record changes in more than its heartbeat.
+- The request-size check in `decode` ([GossipWire.java:79](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L79)) no longer re-encodes the request.
 
 **Verified by** `GossipSizeAccountingTest`. It keeps the original encode-everything algorithms as a reference and requires identical decisions, sweeping record sizes across every byte limit. It includes JSON-escaped and multi-byte metadata, and plain-ASCII sweeps that land on each exact limit. Six deliberately introduced one-byte errors were each caught.
 
@@ -49,7 +49,7 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 **Was:** on every inbound and outbound merge, `apply` copied both `entries` and `suppressions` into new maps, so a conflict thrown partway through a batch could not leave the table half-changed.
 
-**Now:** the validation loop only reads the table; it collects updates and admissions, and every change is applied after it ([MembershipTable.java:146-148, 205](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L146-L148)). A conflict throws before anything is applied, so a rejected batch still leaves the table untouched, with no copy. Batch keys are already unique, so reading the live table gives the same answers the copies did.
+**Now:** the validation loop only reads the table; it collects updates and admissions, and every change is applied after it ([MembershipTable.java:145-147, 204](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L145-L147)). A conflict throws before anything is applied, so a rejected batch still leaves the table untouched, with no copy. Batch keys are already unique, so reading the live table gives the same answers the copies did.
 
 **Verified by** the existing rollback tests. A deliberately introduced variant that applied each update inside the loop failed five of them.
 
@@ -61,13 +61,13 @@ Line numbers and links refer to the code as of 2026-10-16.
 
 **Was:** each hostname lookup ran `java -cp … GossipDnsLookup` as a separate process, about 130 ms of JVM startup and tens of MB per cold lookup, so that stop could kill a lookup blocked inside the platform resolver.
 
-**Now:** lookups run in-process, each on its own short-lived daemon thread, with the same two-second timeout, `max.inflight` bound and 60-second cache ([GossipDnsResolver.java:74-113](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L74-L113)). `resolveAll` still returns every address with the first one rotating, as the connection fallback requires. The helper program `GossipDnsLookup` and its test fixture program are deleted.
+**Now:** lookups run in-process, each on its own short-lived daemon thread, with the same two-second timeout, `max.inflight` bound and 60-second cache ([GossipDnsResolver.java:72-111](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L72-L111)). `resolveAll` still returns every address with the first one rotating, as the connection fallback requires. The helper program `GossipDnsLookup` and its test fixture program are deleted.
 
-**Trade-off, agreed before the change:** a lookup blocked inside the platform resolver can no longer be killed. On timeout or stop, the waiting caller is released at once and the lookup thread is interrupted; one that ignores the interrupt is abandoned, finishing in the background and counting toward the bound until it returns ([GossipDnsResolver.java:135-148](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L135-L148)).
+**Trade-off, agreed before the change:** a lookup blocked inside the platform resolver can no longer be killed. On timeout or stop, the waiting caller is released at once and the lookup thread is interrupted; one that ignores the interrupt is abandoned, finishing in the background and counting toward the bound until it returns ([GossipDnsResolver.java:133-146](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L133-L146)).
 
 **Verified by** the resolver and runtime tests, rewritten on an in-process lookup fixture with the same behaviours as the old fixture program: stall, wait for release, fail, empty reply, mixed addresses. The `localhost` load profile no longer asserts that sampling caught a lookup in flight, since in-process lookups finish in microseconds; its convergence through the hostname seed shows the lookups ran.
 
-**Also fixed:** a concurrent request for the same host now shares the lookup already running ([GossipDnsResolver.java:83](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L83)).
+**Also fixed:** a concurrent request for the same host now shares the lookup already running ([GossipDnsResolver.java:81](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipDnsResolver.java#L81)).
 
 ## Medium impact
 
@@ -81,10 +81,10 @@ Line numbers and links refer to the code as of 2026-10-16.
 - the commands, to read `self()` and `serverId`.
 
 **Now:**
-- `MembershipTable` has [`localKey()`, `self()` and `identityConflicts()`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L293-L301), which read the local identity, the local record, or the conflict set without copying the table. `snapshot()` computes each entry's assessment once.
+- `MembershipTable` has [`localKey()`, `self()` and `identityConflicts()`](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L292-L300), which read the local identity, the local record, or the conflict set without copying the table. `snapshot()` computes each entry's assessment once.
 - `GossipRuntime` and `GossipCommands` keep the local `serverId` in a field ([GossipRuntime.java:101](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L101), [GossipCommands.java:51](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L51)).
 - The exchange path passes the snapshot to `PeerSelector.resolved` as a supplier ([GossipRuntime.java:251-252](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L251-L252)). It is taken only when a configured seed resolves to a different address and its alias must be confirmed.
-- The transport took one snapshot per outbound exchange instead of three ([GossipTransport.java:157, 166](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L157-L166)), and the commands one per inbound exchange instead of two. #11 later removed these too: exchanges now read only the table's records.
+- The transport took one snapshot per outbound exchange instead of three ([GossipTransport.java:156, 165](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L156-L165)), and the commands one per inbound exchange instead of two. #11 later removed these too: exchanges now read only the table's records.
 
 The snapshots that remain are in peer selection, `leave`, `members` and `status`; batch selection stopped using one in #11. The review suggested having the merge methods return the conflicts. A separate `identityConflicts()` was used instead, because `MergeResult` is a value type that tests compare directly.
 
@@ -94,11 +94,11 @@ The snapshots that remain are in peer selection, `leave`, `members` and `status`
 
 **Was:** every connection attempt opened a `Selector` (with its own wakeup channel) beside a non-blocking `SocketChannel`, and waited in an `await` loop, although exchanges run on virtual threads where plain blocking I/O is cheap.
 
-**Now:** one blocking `Socket` per attempt ([GossipTransport.java:222-254](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L222-L254)). Connects and reads use socket timeouts; each read waits at most the read-idle limit and never past the total deadline ([GossipTransport.java:257-278](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L257-L278)). A blocking write has no timeout, so a small virtual-thread watchdog closes the socket once the total deadline passes. A socket closed by the watchdog, an interrupt or `close()` is reported as a timeout, an interruption or a closed transport, as before. The `Selector`, the `await` loop and the `Connection` wrapper are gone.
+**Now:** one blocking `Socket` per attempt ([GossipTransport.java:223-263](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L223-L263)). Connects and reads use socket timeouts; each read waits at most the read-idle limit and never past the total deadline ([GossipTransport.java:266-287](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L266-L287)). A blocking write has no timeout, so a small virtual-thread watchdog closes the socket once the total deadline passes. A socket closed by the watchdog, an interrupt or `close()` is reported as a timeout, an interruption or a closed transport, as before. The `Selector`, the `await` loop and the `Connection` wrapper are gone.
 
 **Verified by** the existing transport tests, all passing unchanged: connect, read-idle and total deadlines, trickling peers, interruption, close cancellation, the address fallback and the byte limits. **Not covered by a test:** the write watchdog, because loopback buffers absorb a full 64 KB request, so a stalled write can't be produced reliably.
 
-**Limitation:** a caller on a platform thread is not interrupted out of a blocked read, but stays bounded by the deadlines. The runtime's workers are virtual threads.
+**Limitation, fixed in the follow-up:** a caller on a platform thread was not woken from a blocked read by its interrupt, only by the deadlines, up to 15 s later. The watchdog now also closes the socket within 50 ms when such a caller is interrupted ([GossipTransport.java:230-241](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L230-L241)). The runtime's own workers are virtual threads.
 
 **Measured:** outbound exchanges over loopback TCP with about 29 KB of records per reply went from about 3.7 ms to about 2.1 ms (three runs each).
 
@@ -106,7 +106,7 @@ The snapshots that remain are in peer selection, `leave`, `members` and `status`
 
 **Was:** `readLine` copied the reply into a `ByteArrayOutputStream` one byte at a time. `ByteArrayOutputStream.write(int)` is `synchronized`, so a 64 KB reply meant 64K lock acquisitions, plus a final `toByteArray()` copy.
 
-**Now:** [GossipTransport.java:257-278](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L257-L278) reads straight into one buffer of `max.exchange.bytes + 1` bytes and scans only the newly read bytes for the terminator. It decodes the line in place, without a copy. The spare byte keeps the limit exact: a reply of exactly the maximum length followed by its terminator is accepted, and one byte more is rejected.
+**Now:** [GossipTransport.java:266-287](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L266-L287) reads straight into one buffer of `max.exchange.bytes + 1` bytes and scans only the newly read bytes for the terminator. It decodes the line in place, without a copy. The spare byte keeps the limit exact: a reply of exactly the maximum length followed by its terminator is accepted, and one byte more is rejected.
 
 **Verified by** the existing byte-limit, invalid-UTF-8, empty-reply and oversize tests. A new test sends the same boundary replies in 37-byte chunks, with each terminator (`\n`, `\r\n`, `\r`, or none with the peer closing), and with bytes after the terminator. Four deliberately introduced errors were each caught: a buffer one byte too small, keeping the bytes after the terminator, a missing over-limit check, and not treating `\r` as a terminator.
 
@@ -117,7 +117,7 @@ The snapshots that remain are in peer selection, `leave`, `members` and `status`
 **Was:** every exchange with a version-1 peer first sent version 2 and was rejected, so each one cost two TCP connections and two round trips.
 
 **Now:**
-- After a peer rejects version 2 and a full, identity-checked version-1 exchange with it succeeds, the transport remembers it and sends version 1 directly ([GossipTransport.java:131-132, 165](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L131-L132), [183-201](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L183-L201)).
+- After a peer rejects version 2 and a full, identity-checked version-1 exchange with it succeeds, the transport remembers it and sends version 1 directly ([GossipTransport.java:130-131, 164](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L130-L131), [182-200](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L182-L200)).
 - Entries are keyed by server ID and port. They expire after 10 minutes, so an upgraded peer gets version 2 again, and at most one entry is kept per member or seed.
 - A failed version-1 retry is never remembered, so a stray or failed reply can't make a downgrade stick.
 
@@ -131,16 +131,16 @@ The snapshots that remain are in peer selection, `leave`, `members` and `status`
 
 **Was:** `fromWire` deep-copied the metadata and the constructor copied it again, then encoded and re-parsed it. The same happened on every heartbeat and departure, although that metadata was already frozen.
 
-**Now:** `fromWire` hands the metadata straight to the constructor, which copies and checks it once ([MemberRecord.java:111-123](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L111-L123)). A record built from an existing one, for a heartbeat, departure, local update or the widest-heartbeat stand-in, uses `with(heartbeat, state)`, which shares the already-checked metadata ([MemberRecord.java:87-101](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L87-L101)).
+**Now:** `fromWire` hands the metadata straight to the constructor, which copies and checks it once ([MemberRecord.java:113-125](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L113-L125)). A record built from an existing one, for a heartbeat, departure, local update or the widest-heartbeat stand-in, uses `with(heartbeat, state)`, which shares the already-checked metadata ([MemberRecord.java:89-103](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L89-L103)).
 
 ## Low impact and readability
 
-- ~~**Exceptions used for normal control flow.**~~ Fixed 2026-10-16: `GossipValidation.literal` recognises a hostname by its characters before calling `InetAddress.ofLiteral`, so hostnames no longer cost an exception ([GossipValidation.java:46-59](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L46-L59)). It replaces the try/catch in `PeerSelector.normalized`, `PeerSelector.isSelf` and the resolver, with the same results.
-- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the cursor patterns are compiled once ([GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)); the ID pattern, at first compiled once too, was later replaced by a character loop (#12, [GossipValidation.java:34-44](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L34-L44)). `validHost` now remembers its answer for up to 1,024 hosts, checking length before caching so network input cannot inflate the cache; it went from about 360 ns to about 17 ns per call.
+- ~~**Exceptions used for normal control flow.**~~ Fixed 2026-10-16: `GossipValidation.literal` recognises a hostname by its characters before calling `InetAddress.ofLiteral`, so hostnames no longer cost an exception ([GossipValidation.java:46-58](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L46-L58)). It replaces the try/catch in `PeerSelector.normalized`, `PeerSelector.isSelf` and the resolver, with the same results.
+- ~~**Regex compiled on every call.**~~ Fixed 2026-10-16: the cursor patterns are compiled once ([GossipCommands.java:32-33](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L32-L33)); the ID pattern, at first compiled once too, was later replaced by a character loop (#12, [GossipValidation.java:34-43](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L34-L43)). `validHost` now remembers its answer for up to 1,024 hosts, checking length before caching so network input cannot inflate the cache; it went from about 360 ns to about 17 ns per call.
 - ~~**Convoluted recovery-fill loop.**~~ Fixed 2026-10-16: a bounded loop that relies on the cursor yielding each recovery peer once per cycle ([PeerSelector.java:92-95](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L92-L95)); the hand-written shuffle is now `Collections.shuffle`.
-- ~~**Rotation that isn't actually fair (a correctness problem).**~~ Fixed 2026-10-16: both rotations now remember the member that is due next, not just its index ([GossipBatchSelector.java:54-56, 79](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L54-L56), [PeerSelector.java:99-105](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L99-L105)). If that member was removed, its successor has taken its index, so resuming there is still right. Two new tests reproduced the skipped member before the fix and pass after it.
+- ~~**Rotation that isn't actually fair (a correctness problem).**~~ Fixed 2026-10-16: both rotations now remember the member that is due next, not just its index ([GossipBatchSelector.java:55-57, 80](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L55-L57), [PeerSelector.java:99-105](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L99-L105)). If that member was removed, its successor has taken its index, so resuming there is still right. Two new tests reproduced the skipped member before the fix and pass after it.
 - ~~**Clock inconsistency.**~~ Fixed 2026-10-16: departure timing uses the injected clock ([GossipRuntime.java:170, 209](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipRuntime.java#L209)).
-- ~~**Duplicated self-detection logic.**~~ Fixed 2026-10-16: the transport now uses the shared `PeerSelector.isSelf` ([GossipTransport.java:124](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L124)).
+- ~~**Duplicated self-detection logic.**~~ Fixed 2026-10-16: the transport now uses the shared `PeerSelector.isSelf` ([GossipTransport.java:123](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L123)).
 
 ## After the review: measured decoding costs (2026-10-16)
 
@@ -154,7 +154,7 @@ Profiling inbound exchanges with Java Flight Recorder showed that the metadata c
 
 A probe showed that, within the metadata limits (4 KB, depth 16), the read-back only ever rejects numbers of about 1,000 digits or more, the codec's default number-length limit.
 
-**Changes** ([MemberRecord.java:252-261](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L252-L261), [268-282](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L268-L282)):
+**Changes** ([MemberRecord.java:267-277](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L267-L277), [284-298](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L284-L298)):
 - The read-back runs only when the metadata holds a number of 100 characters or more. Anything that could reach the codec's limit is still checked by the real codec, so validation is unchanged unless the host's number limit is set below 100 characters.
 - The metadata's byte count from that check is kept and added to the size of the record's other fields, so the metadata is encoded once; #10 later computed those other fields by arithmetic too.
 
@@ -186,7 +186,7 @@ Scope: all 16 main source files at commit `d25d08c`, looking for remaining ineff
 
 **Was:** `serializedBytes()` put the six fixed fields in a map and ran the JSON encoder on it. The result was cached, but every received record is a new object, so the encoder ran once for every record in every exchange, inbound and outbound: about 0.45–0.6 µs per record, roughly twice the 0.25 µs it takes to decode and validate an empty-metadata record. A 32-record exchange spent about 14–16 µs on it, roughly 40% of an empty-metadata inbound exchange at 128 members.
 
-**Now:** each record computes its size from its field lengths when it is built, and `serializedBytes()` reads it ([MemberRecord.java:52-57](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L52-L57), [268-282](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L268-L282)). Every fixed field is ASCII that JSON never escapes: the server ID matches `[A-Za-z0-9._-]`, the boot ID is a canonical UUID, the port and heartbeat are integers, and the state is an enum name. Host validation accepts no character that JSON escapes or encodes in more than one byte; this was checked for every Unicode character in three positions in a host.
+**Now:** each record computes its size from its field lengths when it is built, and `serializedBytes()` reads it ([MemberRecord.java:52-57](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L52-L57), [284-298](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L284-L298)). Every fixed field is ASCII that JSON never escapes: the server ID matches `[A-Za-z0-9._-]`, the boot ID is a canonical UUID, the port and heartbeat are integers, and the state is an enum name. Host validation accepts no character that JSON escapes or encodes in more than one byte; this was checked for every Unicode character in three positions in a host.
 
 **Verified by** a new test that compares the size with the real encoding for every digit count of the port and heartbeat, every host form, the shortest and longest server IDs and both states, for records built directly and derived with `with()`. It passed on the old code. Four deliberately introduced errors were each caught: a fixed part one byte short, digit counting wrong at each power of ten (caught only by the new test), the state's length ignored, and `with()` keeping the base record's size.
 
@@ -199,9 +199,9 @@ Scope: all 16 main source files at commit `d25d08c`, looking for remaining ineff
 - **The live-member recount on every merge.** The count is used only when a batch admits new members, and a stable swarm admits none: about 2–5 µs at 480 members.
 
 **Now:**
-- Both exchange directions choose their batch from `MembershipTable.peers()`: the table's records without the local one, with no assessments, views or copies ([MembershipTable.java:303-310](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L303-L310), [GossipCommands.java:102-108](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L102-L108), [GossipTransport.java:123-127](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L123-L127)).
-- The selector refreshes its index in one pass, reads a size only for each record a batch considers, and sweeps for removed members only when the table has shrunk ([GossipBatchSelector.java:42-110](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L42-L110)). The `Sized` wrapper and the separate sizing pass are gone.
-- The live-member count runs only when a batch admits new members ([MembershipTable.java:206-208](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L206-L208)).
+- Both exchange directions choose their batch from `MembershipTable.peers()`: the table's records without the local one, with no assessments, views or copies ([MembershipTable.java:302-310](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L302-L310), [GossipCommands.java:102-108](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipCommands.java#L102-L108), [GossipTransport.java:122-126](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L122-L126)).
+- The selector refreshes its index in one pass, reads a size only for each record a batch considers, and sweeps for removed members only when the table has shrunk ([GossipBatchSelector.java:43-120](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L43-L120)). The `Sized` wrapper and the separate sizing pass are gone.
+- The live-member count runs only when a batch admits new members ([MembershipTable.java:205-207](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L205-L207)).
 
 **Verified by** tests written first. A table test requires `peers()` to equal the snapshot's records without the local one, in the same order, through merges, a departure, a local heartbeat and expiry. A selector test requires sizes to be read only for the records a batch considers; it failed on the old selector, which measured all 32 records to choose 2. The selector's test that sizes are measured outside its lock was replaced: it guarded against slow size encoding, which #10 removed. The existing capacity tests pin the conditional count. Eight deliberately introduced errors were each caught: five in the selector and `peers()`, three in the count.
 
@@ -220,8 +220,8 @@ Scope: all 16 main source files at commit `d25d08c`, looking for remaining ineff
 It ran once per round (every second by default), so even at 480 members it used about 0.02% of a core.
 
 **Now:**
-- Server IDs are checked with a character loop, about 60 ns down to 4 ns, and `literal()` uses a plain loop instead of a stream ([GossipValidation.java:34-59](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L34-L59)). Every received record's server ID goes through the first, so decoding gains too.
-- Peer selection parses the local host once per round and each candidate's host once, and normalising returns a seed already in normal form instead of validating a copy ([PeerSelector.java:57-76](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L57-L76), [173-199](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L173-L199)).
+- Server IDs are checked with a character loop, about 60 ns down to 4 ns, and `literal()` uses a plain loop instead of a stream ([GossipValidation.java:33-58](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L33-L58)). Every received record's server ID goes through the first, so decoding gains too.
+- Peer selection parses the local host once per round and each candidate's host once, and normalising returns a seed already in normal form instead of validating a copy ([PeerSelector.java:57-76](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L57-L76), [169-196](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L169-L196)).
 
 **Verified by** tests that pinned the behaviour first and passed on the old code: the ID check against the documented pattern for every UTF-16 character and the boundary lengths, `literal()` against the real address parser, and selection with addresses written differently. One deliberately introduced error, comparing each candidate with the local address instead of its own, was at first not caught: no test had a neighbour on the local port at another address, which is the normal deployment with every node on one port. The test now includes one. Nine deliberate errors were each caught.
 
@@ -229,7 +229,7 @@ It ran once per round (every second by default), so even at 480 members it used 
 
 **Was:** `replyMemberBudget` encoded a complete empty reply, including the local record, for every inbound exchange: about 1 µs with the empty local metadata used in production, and about 10 µs with large local metadata.
 
-**Now:** the empty reply's fixed overhead is measured once for each protocol version and admission value, and each budget adds the local record's size and server ID ([GossipWire.java:142-160](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L142-L160)), the way request sizes are already added up.
+**Now:** the empty reply's fixed overhead is measured once for each protocol version and admission value, and each budget adds the local record's size and server ID ([GossipWire.java:134-152](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L134-L152)), the way request sizes are already added up.
 
 **Verified by** a test that passed on the old code first, comparing the budget with the encoded empty reply for both protocol versions, every admission value, three server ID lengths, both states and many metadata sizes, all through one `GossipWire`, so that what it measures once cannot depend on the first record it saw. Four deliberately introduced errors were each caught, two of them only by this test.
 
@@ -237,9 +237,9 @@ It ran once per round (every second by default), so even at 480 members it used 
 
 These cost little at run time; the cost is in reading the code.
 
-- **Repeated checks on each inbound exchange.** Duplicate keys are checked twice ([GossipWire.java:70-77](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L70-L77), [MembershipTable.java:120-124](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L120-L124)), the batch limit four times ([GossipWire.java:66](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L66), [MembershipTable.java:109-119](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L109-L119)), and each record's size twice. The member list is copied four times. The table's checks protect its public methods and the wire checks protect the protocol, so some of the overlap is deliberate.
-- **Maps built three times.** `GossipWire.parameters` and the version-2 `GossipWire.result` build each map three times: `Map.of`, then a `LinkedHashMap`, then `Map.copyOf` ([GossipWire.java:95-114](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L95-L114)). That costs about 0.2 µs per reply; most of the time spent building a reply goes to each record's `toWire()`. Building one map is a clarity fix.
-- **About 30 lines used only by tests.** `MembershipTable.mergeEncoded`, the six-argument `Snapshot` constructor, the two-argument `Exchange` constructor, `PeerSelector.success(Seed)` and `PeerSelector.resolved(…, Snapshot)`, `GossipDnsResolver.resolve`, and four of the five `GossipTransport` constructors. Removing them means rewriting the tests that call them.
+- ~~**Repeated checks on each inbound exchange.**~~ Fixed in the [follow-up](#follow-up-what-was-still-open-2026-10-16): duplicate keys and the batch limit are each checked once by the table, the decoder keeps only the limit check that bounds its own work, and an exchange's batch is copied once fewer.
+- ~~**Maps built three times.**~~ Fixed in the [follow-up](#follow-up-what-was-still-open-2026-10-16): each request and reply is built as one map.
+- ~~**About 30 lines used only by tests.**~~ Fixed in the [follow-up](#follow-up-what-was-still-open-2026-10-16), except `MembershipTable.mergeEncoded` and the public `GossipTransport` constructors: the design document offers those to callers that own a standalone table, so this pass was wrong to list them as test-only.
 
 ### Checked and not worth changing
 
@@ -264,6 +264,49 @@ Measured with the same benchmark before and after the fixes, median of three run
 | Peer selection, once per round | 49.7 µs | 18.1 µs | 189.7 µs | 60.5 µs |
 
 Empty-metadata inbound exchanges are twice as fast at 128 members and 2.7 times as fast at 480; with small metadata, 1.8 and 2.1 times. Growing the table from 128 to 480 members now adds about 5 µs to an exchange, down from about 25 µs. Peer selection is about three times as fast. The module's 264 tests (258 before; seven added, one replaced) and its 8 integration tests pass, as do the host's 337.
+
+## Follow-up: what was still open (2026-10-16)
+
+After #10 to #13, the problems still open were fixed rather than listed. Four remain by decision, and two are outside the plugin or were agreed earlier; all are listed at the end with reasons. Every change was made test first: new behaviour started from a failing test, and unchanged behaviour was pinned by tests that passed on the old code before the change. 25 deliberately introduced errors were each caught, one of them by sending a test into an endless loop that had to be stopped.
+
+**Correctness and safety**
+- **The host check #10 relies on is now a test.** #10 counts a host's characters as its JSON bytes, which is right only while validation accepts nothing JSON escapes and nothing UTF-8 encodes in more than one byte. That had been checked once by a separate program. A test now asserts it for every character in every position a host can take, including IPv6 scope IDs ([MemberRecordTest.java:159](../plugins/gossip-plugin/src/test/java/dev/mars/plugins/gossip/MemberRecordTest.java#L159)); loosening validation to accept internationalised hostnames fails it.
+- **A flaky test fixed.** `GossipDepartureTest` waited for two calls, then read two states that its client records just after each call, so the check could see only one ([GossipDepartureTest.java:254-256](../plugins/gossip-plugin/src/test/java/dev/mars/plugins/gossip/GossipDepartureTest.java#L254-L256)).
+- **Interrupting a caller on a platform thread ends its exchange promptly.** Java does not wake a platform thread from blocking socket I/O when it is interrupted, so an embedding application that cancelled `exchangeWith` waited for the socket to time out, up to 15 s. The watchdog now also closes the socket within 50 ms of such an interrupt ([GossipTransport.java:230-241](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipTransport.java#L230-L241)). The interrupt test runs on both kinds of thread; the platform case failed before the change.
+- **The public API is intact.** `MembershipTable.mergeEncoded` and the public `GossipTransport` constructors were first removed as test-only, then restored when the design document turned out to offer them to callers that own a standalone table. `mergeEncoded` now also has a test that it rejects duplicate keys.
+
+**Repeated work removed**
+- **Host lookups take no lock.** Every decoded record and endpoint looked its host up in one synchronized map that reordered itself on every read. It is now a concurrent map that reads without locking and starts again when full ([GossipValidation.java:26-29](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L26-L29), [60-69](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipValidation.java#L60-L69)); a test now checks its bound.
+- **Empty metadata is not encoded to measure it** ([MemberRecord.java:268](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L268)): `{}` is 2 bytes, and writing it cost about half of building an empty-metadata record.
+- **Boot IDs are checked without printing a copy** ([MemberKey.java:30-44](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberKey.java#L30-L44)); a test compares acceptance with parsing and printing back identically, for every position of three UUIDs replaced by every ASCII character.
+- **Each record builds its wire map and its endpoint once** ([MemberRecord.java:127-143](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L127-L143), [159-164](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MemberRecord.java#L159-L164)). Requests and replies carry the same records many times, and peer selection, departure and conflict logging built and validated a new `Seed` every time. The cached maps cost about 450 bytes per record, about 230 KB at 512 records.
+- **The batch selector finds each member by position first** ([GossipBatchSelector.java:84-102](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipBatchSelector.java#L84-L102)): the table rarely reorders, so the hash lookup is now the exception, and a member whose record has not changed costs one reference comparison, without reading the record. `peers()` compares map keys by identity ([MembershipTable.java:302-310](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L302-L310)).
+- **Checked, not changed:** profiles put about a fifth of an inbound exchange in `MemberKey.equals`. Writing it by hand only moved those samples: the cost was reading 480 entries from memory, which the shortcut above now mostly avoids. The hand-written version was removed again.
+- **Each check once** ([GossipWire.java:69-71](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L69-L71), [MembershipTable.java:106-126](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/MembershipTable.java#L106-L126)): duplicate keys are rejected only by the table, which checks every batch it is given; the batch limit is checked once by the table and once by the decoder before it decodes anything, which bounds its work; an exchange's batch is copied once fewer. Requests and replies are each built as one map, with constant field-name sets ([GossipWire.java:89-106](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipWire.java#L89-L106)).
+- **No boxed `Long` per exchange or round** ([GossipMetrics.java:36-40](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipMetrics.java#L36-L40), [76-77](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/GossipMetrics.java#L76-L77)); a new test pins that both ages read as unknown until first set.
+- **`isSelf` parses hosts only when the ports match**, as before #12 ([PeerSelector.java:186-189](../plugins/gossip-plugin/src/main/java/dev/mars/plugins/gossip/PeerSelector.java#L186-L189)).
+- **Test-only code removed from main:** the six-argument `Snapshot` and two-argument `Exchange` constructors, `PeerSelector.success(Seed)` and `resolved(…, Snapshot)`, `GossipDnsResolver.resolve`, and the transport's clock-only constructor.
+
+**Verified, unchanged:** the batch selector no longer filters out the local record. Handing it every record, the local one included, fails the existing exchange tests in both directions, so callers are held to `peers()`.
+
+**Measured** with the same benchmark, the versions run alternately, medians of three runs each. Times are in µs for tables of 128 and then 480 members; the first column comes from an earlier alternating run of the same benchmark on the same day.
+
+| Plugin time | before #10 (`d25d08c`) | after #10 to #13 (`34d4cd1`) | after the follow-up |
+|---|---|---|---|
+| Inbound exchange, empty metadata (as in production) | 37.0 / 61.0 | 17.5 / 24.8 | 11.7 / 14.7 |
+| Inbound exchange, small metadata | 58.7 / 76.8 | 32.8 / 42.4 | 30.9 / 34.8 |
+| Peer selection, once per round | 47.3 / 169.7 | 17.2 / 59.2 | 10.6 / 44.3 |
+
+Growing the table from 128 to 480 members now adds about 3 µs to an empty-metadata exchange, against about 24 µs before #10. Outbound exchanges over loopback TCP, which include connection setup and the host's JSON handling, took about 1.0–1.3 ms in every version; the differences between versions were within the run-to-run noise, also when the run order alternated.
+
+**Where the time goes now**, in a profile of the final code (inbound exchange, 480 members, empty metadata): decoding the 32 received records 43% (checking their boot IDs and server IDs 18%), copying the table's records for the batch 18%, refreshing the selector 17%, merging 15%, and building the reply 2%.
+
+**Deliberately unchanged**
+- **Two passes over the table per exchange remain.** `peers()` copies the records so that the table lock is held only for the copy, and the selector visits every record to keep its rotation fair and its change queues current. Removing them needs a change log between the table and the selector.
+- **Records the table already holds are still decoded in full.** With empty metadata, skipping identical records would save about 1–2 µs per exchange, but would couple decoding to the table and take its lock for the lookups. It pays off only with large metadata, which nothing sends today.
+- **Peer selection still parses and normalises each member's address every round.** Caching the parsed forms would save part of that, once a second.
+- **The write watchdog (#6) still has no test.** Loopback buffers absorb a full request, so a stalled write needs a hook in production code to shrink the socket's send buffer, only for this test.
+- **Outside this plugin, or agreed earlier:** the host's double encoding and the DNS lookup trade-off (#4).
 
 ## Suggested order of work
 

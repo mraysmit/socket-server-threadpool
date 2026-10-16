@@ -251,7 +251,8 @@ class GossipDepartureTest {
             assertTrue(client.entered.await(2, TimeUnit.SECONDS));
             assertEquals(List.of(MemberRecord.State.ALIVE), client.states);
             runtime.leave();
-            GossipDnsResolverTest.await(() -> client.calls.size() == 2);
+            // The client records each state after its call, so wait for the state, or the check can see one of two.
+            GossipDnsResolverTest.await(() -> client.states.size() == 2);
             assertEquals(List.of(MemberRecord.State.ALIVE, MemberRecord.State.LEFT), client.states);
             client.release.countDown();
             GossipDnsResolverTest.await(() -> "QUIESCED".equals(metrics.workerState));
@@ -365,7 +366,7 @@ class GossipDepartureTest {
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             }
             if (peer.serverId().equals("Bad")) { throw new IOException("Unavailable peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of());
+            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, null);
         }
         @Override public void close() { closed = true; release.countDown(); }
     }
