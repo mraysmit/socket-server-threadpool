@@ -38,8 +38,9 @@ import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 
-/** One bounded UTF-8 JSON exchange per owned connection, with no transport-created threads. */
+/** One bounded UTF-8 JSON exchange per owned connection. Its only threads are watchdogs that each exchange joins. */
 public final class GossipTransport implements GossipRuntime.ExchangeClient {
     static final class BusyException extends IOException {
         BusyException() { super("Gossip outbound capacity is full"); }
@@ -71,6 +72,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final long idleNanos;
     private final long exchangeNanos;
     private final LongSupplier clock;
+    private final Supplier<Socket> sockets;
     // serverId:port of peers that completed a version-1 exchange after rejecting version 2, to when that was learned.
     private final LinkedHashMap<String, Long> version1Peers = new LinkedHashMap<>();
     private boolean closed;
@@ -92,9 +94,16 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     /** The clock times only the version-1 memory; socket deadlines always use System.nanoTime. */
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
                     Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock) {
+        this(config, table, metrics, connectTimeout, readIdleTimeout, exchangeTimeout, clock, Socket::new);
+    }
+
+    /** Tests replace {@code sockets} to stall a write, which a real loopback socket cannot be relied on to do. */
+    GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics, Duration connectTimeout,
+                    Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock, Supplier<Socket> sockets) {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
         this.clock = java.util.Objects.requireNonNull(clock);
+        this.sockets = java.util.Objects.requireNonNull(sockets);
         this.metrics = metrics;
         log = metrics.log(config, table.self());
         wire = new GossipWire(config);
@@ -223,7 +232,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      */
     private String exchangeBytes(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
         checkDeadline(deadline);
-        try (var socket = new Socket()) {
+        try (var socket = sockets.get()) {
             synchronized (this) {
                 if (closed) { throw new IOException("Gossip transport is closed"); }
                 active.add(socket);

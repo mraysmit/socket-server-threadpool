@@ -31,9 +31,11 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.math.BigInteger;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -637,6 +639,33 @@ class GossipTransportTest {
         }
     }
 
+    @Test void watchdogEndsAWriteStillBlockedAtTheExchangeDeadline() throws Exception {
+        var config = GossipCommandsTest.config(32768, 32, 128);
+        var writing = new CountDownLatch(1);
+        try (var acceptor = Executors.newVirtualThreadPerTaskExecutor();
+             var listener = new ServerSocket(0, 1, java.net.InetAddress.getByAddress(new byte[] {127, 0, 0, 1}))) {
+            Future<Socket> accepted = acceptor.submit(listener::accept);
+            var peer = new GossipConfig.Seed("Peer", "127.0.0.1", listener.getLocalPort());
+            try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), Duration.ofSeconds(1),
+                    Duration.ofSeconds(10), Duration.ofSeconds(1), System::nanoTime, () -> new StalledWriteSocket(writing))) {
+                var completed = new CompletableFuture<Throwable>();
+                long start = System.nanoTime();
+                Thread.ofVirtual().start(() -> {
+                    try { transport.exchange(peer); completed.complete(new AssertionError("Expected the deadline to end the write")); }
+                    catch (Throwable failure) { completed.complete(failure); }
+                });
+                assertTrue(writing.await(2, TimeUnit.SECONDS));
+                // Connects and reads have socket timeouts; only the watchdog can end a write.
+                var failure = assertInstanceOf(SocketTimeoutException.class, completed.get(3, TimeUnit.SECONDS));
+                assertEquals("Gossip I/O deadline exceeded", failure.getMessage());
+                assertTrue(System.nanoTime() - start >= TimeUnit.MILLISECONDS.toNanos(950), "Ended by the one-second deadline");
+                assertEquals(0, transport.inflight());
+            } finally {
+                if (accepted.state() == Future.State.SUCCESS) { accepted.resultNow().close(); }
+            }
+        }
+    }
+
     @ParameterizedTest @ValueSource(booleans = {false, true})
     void exchangeDoesNotReturnUntilItsWatchdogHasEnded(boolean interrupted) throws Exception {
         var config = GossipCommandsTest.config(32768, 32, 128);
@@ -677,6 +706,39 @@ class GossipTransportTest {
                 assertTrue(caller.join(Duration.ofSeconds(2)));
                 assertEquals(0, transport.inflight());
             } finally { release.countDown(); }
+        }
+    }
+
+    /**
+     * A socket whose writes block until it is closed, as a real write does once a peer that never reads has filled
+     * the buffers. A real loopback socket cannot show this: Windows, for one, accepts a whole request regardless of
+     * its buffer sizes.
+     */
+    private static final class StalledWriteSocket extends Socket {
+        private final CountDownLatch writing;
+        private final CountDownLatch closed = new CountDownLatch(1);
+
+        StalledWriteSocket(CountDownLatch writing) { this.writing = writing; }
+
+        @Override public OutputStream getOutputStream() {
+            return new OutputStream() {
+                @Override public void write(int b) throws IOException { write(new byte[] {(byte) b}, 0, 1); }
+
+                @Override public void write(byte[] bytes, int offset, int length) throws IOException {
+                    writing.countDown();
+                    boolean interrupted = false;
+                    while (closed.getCount() > 0) {
+                        try { closed.await(); } catch (InterruptedException e) { interrupted = true; }
+                    }
+                    if (interrupted) { Thread.currentThread().interrupt(); }
+                    throw new SocketException("Socket closed");
+                }
+            };
+        }
+
+        @Override public void close() throws IOException {
+            closed.countDown();
+            super.close();
         }
     }
 

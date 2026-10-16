@@ -25,6 +25,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -59,6 +60,16 @@ class GossipDnsResolverTest {
             return new InetAddress[] {InetAddress.ofLiteral("192.0.2.1"), InetAddress.ofLiteral("127.0.0.1"), InetAddress.ofLiteral("192.0.2.2")};
         }
         return new InetAddress[] {InetAddress.ofLiteral("127.0.0.1"), InetAddress.ofLiteral("::1")};
+    }
+
+    /** Blocks until released, ignoring interrupts as a lookup inside the platform resolver does. */
+    private static InetAddress[] ignoringInterrupts(CountDownLatch release) {
+        boolean interrupted = false;
+        while (release.getCount() > 0) {
+            try { release.await(); } catch (InterruptedException e) { interrupted = true; }
+        }
+        if (interrupted) { Thread.currentThread().interrupt(); }
+        return new InetAddress[] {InetAddress.ofLiteral("127.0.0.1")};
     }
 
     @Test void actualSystemResolverHelperResolvesLocalhostAndNumericEndpointsNeedNoHelper() throws Exception {
@@ -122,6 +133,48 @@ class GossipDnsResolverTest {
             assertEquals(new GossipConfig.Seed("Peer", "127.0.0.1", 9010), second.get(5, TimeUnit.SECONDS));
             assertEquals(1, lookups.size(), "Both requests must be served by one lookup");
         }
+    }
+
+    @Test void closeReleasesTheCallerAtOnceAndAbandonsALookupThatIgnoresInterrupts() throws Exception {
+        var release = new CountDownLatch(1);
+        var resolver = new GossipDnsResolver(4, 1, Duration.ofSeconds(10), System::nanoTime, host -> {
+            lookups.add(Thread.currentThread());
+            return ignoringInterrupts(release);
+        });
+        try (var callers = Executors.newVirtualThreadPerTaskExecutor()) {
+            var lookup = callers.submit(() -> resolver.resolveAll(new GossipConfig.Seed("Peer", "stuck.test", 9000)).getFirst());
+            await(() -> lookups.size() == 1);
+            var closing = Thread.ofVirtual().start(resolver::close);
+            // The caller is released at once, while close still gives the lookup up to a second to end.
+            var failure = assertThrows(ExecutionException.class, () -> lookup.get(500, TimeUnit.MILLISECONDS));
+            assertInstanceOf(IOException.class, failure.getCause());
+            // Close then returns without the lookup, which runs on until the platform resolver would have answered.
+            assertTrue(closing.join(Duration.ofSeconds(3)), "Close must not wait for a lookup that ignores interrupts");
+            assertTrue(lookups.getFirst().isAlive());
+            release.countDown();
+            await(() -> !lookups.getFirst().isAlive() && resolver.activeHelpers() == 0);
+        } finally {
+            release.countDown();
+            resolver.close();
+        }
+    }
+
+    @Test void aTimedOutLookupThatIgnoresItsInterruptKeepsItsSlotUntilItReturns() throws Exception {
+        var release = new CountDownLatch(1);
+        try (var resolver = new GossipDnsResolver(4, 1, Duration.ofMillis(150), System::nanoTime, host -> {
+                 if (!host.startsWith("stuck")) { return launch(host); }
+                 lookups.add(Thread.currentThread());
+                 return ignoringInterrupts(release);
+             })) {
+            assertThrows(SocketTimeoutException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "stuck.test", 9000)));
+            // The abandoned lookup still holds the only slot, so lookups cannot pile up behind an unresponsive resolver.
+            assertEquals(1, resolver.activeHelpers());
+            var full = assertThrows(IOException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "other.test", 9000)));
+            assertEquals("Gossip resolver capacity is full", full.getMessage());
+            release.countDown();
+            await(() -> resolver.activeHelpers() == 0);
+            assertEquals("127.0.0.1", resolver.resolveAll(new GossipConfig.Seed("Peer", "other.test", 9000)).getFirst().host());
+        } finally { release.countDown(); }
     }
 
     @Test void timeoutAndInvalidRepliesLeaveNoHelpersOrPoisonedCacheEntries() throws Exception {
