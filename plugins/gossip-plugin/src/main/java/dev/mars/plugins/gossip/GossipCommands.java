@@ -157,7 +157,7 @@ final class GossipCommands {
         result.put("gossipVersion", 1);
         result.put("swarmId", config.swarmId());
         result.put("self", snapshot.self().toWire());
-        result.put("workerState", metrics.workerState);
+        result.put("workerState", runtime.state().name());
         result.put("isolated", metrics.isolated());
         result.put("implementationStage", "departure-runtime");
         result.put("supportedOperations", List.of("exchange", "members", "status", "leave"));

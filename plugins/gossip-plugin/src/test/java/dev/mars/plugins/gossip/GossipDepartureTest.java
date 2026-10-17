@@ -52,7 +52,7 @@ class GossipDepartureTest {
             }
             gate.countDown();
             for (var request : requests) { assertEquals(2, request.get(2, TimeUnit.SECONDS).get("targets")); }
-            GossipDnsResolverTest.await(() -> "QUIESCED".equals(metrics.workerState));
+            GossipDnsResolverTest.await(() -> runtime.state() == GossipRuntime.State.QUIESCED);
             GossipDnsResolverTest.await(() -> logs.size() == 1);
             var departure = runtime.departure();
             assertEquals("COMPLETED", departure.get("state"));
@@ -87,7 +87,7 @@ class GossipDepartureTest {
             runtime.leave();
             assertTrue(System.nanoTime() - began < TimeUnit.SECONDS.toNanos(1));
             assertTrue(client.entered.await(2, TimeUnit.SECONDS));
-            GossipDnsResolverTest.await(() -> "QUIESCED".equals(metrics.workerState));
+            GossipDnsResolverTest.await(() -> runtime.state() == GossipRuntime.State.QUIESCED);
             assertEquals("EXHAUSTED", runtime.departure().get("state"));
             assertEquals(1, runtime.departure().get("attempts"));
             assertEquals(1, runtime.departure().get("cancelled"));
@@ -112,7 +112,7 @@ class GossipDepartureTest {
             var second = stoppers.submit(() -> { runtime.close(); return null; });
             first.get(2, TimeUnit.SECONDS); second.get(2, TimeUnit.SECONDS);
             assertEquals("CANCELLED", runtime.departure().get("state"));
-            assertEquals("STOPPED", metrics.workerState);
+            assertEquals(GossipRuntime.State.STOPPED, runtime.state());
             assertTrue(client.threads.stream().noneMatch(Thread::isAlive));
             assertEquals(runtime.departure(), runtime.leave());
         }
@@ -255,7 +255,7 @@ class GossipDepartureTest {
             GossipDnsResolverTest.await(() -> client.states.size() == 2);
             assertEquals(List.of(MemberRecord.State.ALIVE, MemberRecord.State.LEFT), client.states);
             client.release.countDown();
-            GossipDnsResolverTest.await(() -> "QUIESCED".equals(metrics.workerState));
+            GossipDnsResolverTest.await(() -> runtime.state() == GossipRuntime.State.QUIESCED);
             assertEquals("COMPLETED", runtime.departure().get("state"));
             assertEquals(1, runtime.departure().get("attempts"));
             assertEquals(1, runtime.departure().get("successes"));
@@ -279,7 +279,7 @@ class GossipDepartureTest {
             runtime.leave();
             GossipDnsResolverTest.await(() -> "FAILED".equals(runtime.departure().get("state")));
             GossipDnsResolverTest.await(() -> logs.size() == 2);
-            assertEquals("CLEANUP_FAILED", metrics.workerState);
+            assertEquals(GossipRuntime.State.CLEANUP_FAILED, runtime.state());
             assertSame(expected, assertThrows(IOException.class, runtime::close));
             assertEquals(1, logs.stream().filter(line -> line.contains("event=CLEANUP_FAILED")).count());
             assertTrue(logs.getFirst().contains("resource=transport"));
@@ -307,7 +307,7 @@ class GossipDepartureTest {
                 new Random(7), new GossipDnsResolver(8, 2));
         assertSame(expected, assertThrows(IOException.class, runtime::close));
         assertSame(expected, assertThrows(IOException.class, runtime::close));
-        assertEquals("CLEANUP_FAILED", metrics.workerState);
+        assertEquals(GossipRuntime.State.CLEANUP_FAILED, runtime.state());
         assertEquals("NOT_REQUESTED", runtime.departure().get("state"));
         assertEquals(1, attemptedLogs.get());
     }

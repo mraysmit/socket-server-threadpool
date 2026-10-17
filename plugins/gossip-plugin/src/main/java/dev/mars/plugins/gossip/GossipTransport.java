@@ -17,6 +17,7 @@ package dev.mars.plugins.gossip;
 
 import dev.mars.client.CommandExecutionException;
 import dev.mars.protocol.CommandProtocol;
+import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.CommandRequest;
 import dev.mars.protocol.CommandError;
 
@@ -145,9 +146,17 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
                 var line = exchangeBytes(candidates, payload, deadline);
                 candidates = List.of(line.address()); // A version retry reuses the address that answered.
-                var reply = CommandProtocol.parseReply(line.text());
-                if (!messageId.equals(reply.messageId())) { throw new IOException("Gossip message ID mismatch"); }
-                if (!peer.serverId().equals(reply.serverId())) { throw new IOException("Gossip server ID mismatch"); }
+                CommandReply reply;
+                try { reply = CommandProtocol.parseReply(line.text()); }
+                catch (IOException unreadable) {
+                    throw new GossipExchangeException(GossipFailure.PROTOCOL, unreadable.getMessage(), unreadable);
+                }
+                if (!messageId.equals(reply.messageId())) {
+                    throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip message ID mismatch");
+                }
+                if (!peer.serverId().equals(reply.serverId())) {
+                    throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip server ID mismatch");
+                }
                 if (reply.error() != null) {
                     if (version == 2 && reply.error().code() == CommandError.Code.INVALID_PARAMETERS
                             && VERSION_1_REJECTIONS.contains(reply.error().message())) {
@@ -158,9 +167,11 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                     throw new CommandExecutionException(reply);
                 }
                 var result = wire.decode(reply.result(), false);
-                if (result.gossipVersion() != version) { throw GossipWire.invalid("Reply gossipVersion does not match request"); }
+                if (result.gossipVersion() != version) {
+                    throw GossipWire.invalid(GossipFailure.VERSION, "Reply gossipVersion does not match request");
+                }
                 if (!reply.serverId().equals(result.sender().key().serverId())) {
-                    throw new IOException("Outer serverId disagrees with gossip sender");
+                    throw new GossipExchangeException(GossipFailure.IDENTITY, "Outer serverId disagrees with gossip sender");
                 }
                 wire.requireForwardable(table.self(), result.records());
                 // Closing cancels uncommitted work as well as sockets. No merge may start after close returns.
@@ -183,7 +194,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             throw new IOException("Gossip " + e.reason() + ": " + e.getMessage(), e);
         } catch (IOException e) {
             metrics.outboundFailures.incrementAndGet();
-            if (GossipRuntime.classify(e) == GossipMetrics.Failure.IDENTITY) { log.identity("outbound", peer, messageId, e.getMessage()); }
+            if (GossipFailure.of(e) == GossipFailure.IDENTITY) { log.identity("outbound", peer, messageId, e.getMessage()); }
             throw e;
         } finally { permits.release(); }
     }
@@ -293,7 +304,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             for (; scanned < length; scanned++) {
                 if (bytes[scanned] == '\n' || bytes[scanned] == '\r') { return decodeUtf8(bytes, scanned); }
             }
-            if (length == bytes.length) { throw new IOException("Gossip reply exceeds max.exchange.bytes before parsing"); }
+            if (length == bytes.length) {
+                throw new GossipExchangeException(GossipFailure.PROTOCOL, "Gossip reply exceeds max.exchange.bytes before parsing");
+            }
         }
     }
 

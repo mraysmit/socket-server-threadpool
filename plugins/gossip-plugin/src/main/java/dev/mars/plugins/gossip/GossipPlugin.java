@@ -63,7 +63,7 @@ public final class GossipPlugin implements CommandPlugin {
             var commands = new GossipCommands(config, table, metrics, transport, runtime);
             started = new Started(transport, commands, runtime);
             if (schedule) { runtime.start(); }
-            else { metrics.workerState = "MANUAL"; }
+            else { runtime.manual(); }
         } catch (IOException | RuntimeException | Error e) {
             try { if (runtime == null) { transport.close(); } else { runtime.close(); } }
             catch (IOException cleanup) { e.addSuppressed(cleanup); }

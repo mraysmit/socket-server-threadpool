@@ -15,12 +15,10 @@
  */
 package dev.mars.plugins.gossip;
 
-import dev.mars.client.CommandExecutionException;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
-import java.net.SocketTimeoutException;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -70,8 +68,8 @@ final class GossipRuntime implements AutoCloseable {
     private final Set<GossipConfig.Seed> departurePending = new LinkedHashSet<>();
     private boolean leaving;
     private long departureStarted;
-    private String departureState = "NOT_REQUESTED";
-    private String departureOutcome;
+    private DepartureState departureState = DepartureState.NOT_REQUESTED;
+    private DepartureState departureOutcome; // How the departure ended, once it has; null before then.
     private int departureTargets;
     private int departureAttempts;
     private int departureSuccesses;
@@ -79,6 +77,7 @@ final class GossipRuntime implements AutoCloseable {
     private int departureSkipped;
     private int departureCancelled;
     private boolean departureLogged;
+    private volatile State state = State.INITIALIZING;
 
     GossipRuntime(GossipConfig config, MembershipTable table, GossipTransport transport, GossipMetrics metrics) throws IOException {
         this(config, table, transport, metrics, System::nanoTime, new Random(),
@@ -111,10 +110,15 @@ final class GossipRuntime implements AutoCloseable {
     synchronized void start() {
         if (started || stopped) { throw new IllegalStateException("Gossip runtime cannot restart"); }
         started = true;
-        metrics.workerState = "RUNNING";
+        state = State.RUNNING;
         scheduler = Thread.ofVirtual().name("gossip-" + serverId + "-rounds").unstarted(this::run);
         scheduler.start();
     }
+
+    /** Rounds will be run by hand, through {@link #round()}, instead of by the owned scheduler. */
+    synchronized void manual() { state = State.MANUAL; }
+
+    State state() { return state; }
 
     private void run() {
         try {
@@ -139,7 +143,7 @@ final class GossipRuntime implements AutoCloseable {
                     boolean finish;
                     synchronized (this) {
                         finish = leaving && !stopped;
-                        if (finish && departureOutcome == null) { departureOutcome = "FAILED"; }
+                        if (finish && departureOutcome == null) { departureOutcome = DepartureState.FAILED; }
                     }
                     if (finish) {
                         try { closeOwned(true); }
@@ -147,7 +151,7 @@ final class GossipRuntime implements AutoCloseable {
                     }
                 } finally { closeLock.unlock(); }
             }
-            synchronized (this) { if (!stopped) { metrics.workerState = "FAILED"; } }
+            synchronized (this) { if (!stopped) { state = State.FAILED; } }
         }
     }
 
@@ -166,11 +170,11 @@ final class GossipRuntime implements AutoCloseable {
         table.leaveLocal();
         leaving = true;
         departureStarted = clock.getAsLong();
-        departureState = "DISSEMINATING";
+        departureState = DepartureState.DISSEMINATING;
         departureTargets = departurePending.size();
-        metrics.workerState = "LEAVING";
+        state = State.LEAVING;
         for (var worker : ownedWorkers) { worker.interrupt(); }
-        if (!started) { start(); metrics.workerState = "LEAVING"; }
+        if (!started) { start(); state = State.LEAVING; }
         notifyAll();
         return departure();
     }
@@ -180,7 +184,7 @@ final class GossipRuntime implements AutoCloseable {
     }
 
     synchronized Map<String, Object> departure() {
-        return Map.of("state", departureState, "budgetMillis", departureNanos / 1_000_000,
+        return Map.of("state", departureState.name(), "budgetMillis", departureNanos / 1_000_000,
                 "targets", departureTargets, "attempts", departureAttempts, "successes", departureSuccesses,
                 "failures", departureFailures, "skipped", departureSkipped, "cancelled", departureCancelled);
     }
@@ -203,8 +207,8 @@ final class GossipRuntime implements AutoCloseable {
         table.maintain();
         ownedWorkers.removeIf(thread -> !thread.isAlive());
         if (leaving) {
-            if (departurePending.isEmpty() && ownedWorkers.isEmpty()) { departureOutcome = "COMPLETED"; return; }
-            if (clock.getAsLong() - departureStarted >= departureNanos) { departureOutcome = "EXHAUSTED"; return; }
+            if (departurePending.isEmpty() && ownedWorkers.isEmpty()) { departureOutcome = DepartureState.COMPLETED; return; }
+            if (clock.getAsLong() - departureStarted >= departureNanos) { departureOutcome = DepartureState.EXHAUSTED; return; }
         }
         int slots = config.maxInflight() - Math.max(ownedWorkers.size(), transport.inflight());
         if (slots <= 0) { metrics.skipped.incrementAndGet(); return; }
@@ -234,7 +238,7 @@ final class GossipRuntime implements AutoCloseable {
         String resolvedKey = null;
         boolean acquired = false;
         boolean resolving = true;
-        String outcome = "CANCELLED";
+        Outcome outcome = Outcome.CANCELLED;
         try {
             metrics.dnsHelpers = resolver.activeHelpers();
             var endpoints = resolver.resolveAll(peer);
@@ -249,30 +253,30 @@ final class GossipRuntime implements AutoCloseable {
                 int selfPort = table.self().port();
                 if (isLocal(endpoint, selfPort)) {
                     metrics.skipped.incrementAndGet();
-                    outcome = "SKIPPED";
+                    outcome = Outcome.SKIPPED;
                     return;
                 }
                 if (!roundDestinations.add(resolvedKey) || !resolvedInFlight.add(resolvedKey)) {
-                    resolvedKey = null; metrics.skipped.incrementAndGet(); outcome = "SKIPPED"; return;
+                    resolvedKey = null; metrics.skipped.incrementAndGet(); outcome = Outcome.SKIPPED; return;
                 }
                 acquired = true;
                 // The host's other addresses are connection fallbacks; never reach this process through one.
                 attempts = endpoints.stream().filter(candidate -> candidate == endpoint || !isLocal(candidate, selfPort)).toList();
             }
             var exchange = transport.exchange(attempts);
-            outcome = "SUCCESS";
+            outcome = Outcome.SUCCESS;
             if (!departing && exchange.senderAdmission() == MembershipTable.Admission.CAPACITY) {
                 selector.capacity(peer, endpoint);
-                metrics.failure(GossipMetrics.Failure.CAPACITY);
+                metrics.failure(GossipFailure.CAPACITY);
             } else { selector.success(peer, endpoint); }
         } catch (IOException | RuntimeException e) {
             synchronized (this) {
                 if (!stopped && (departing || !leaving)) {
-                    outcome = "FAILURE";
-                    if (e instanceof GossipTransport.BusyException) { metrics.skipped.incrementAndGet(); outcome = "SKIPPED"; }
+                    outcome = Outcome.FAILURE;
+                    if (e instanceof GossipTransport.BusyException) { metrics.skipped.incrementAndGet(); outcome = Outcome.SKIPPED; }
                     else {
                         selector.failure(peer);
-                        metrics.failure(resolving ? GossipMetrics.Failure.DNS : classify(e));
+                        metrics.failure(resolving ? GossipFailure.DNS : GossipFailure.of(e));
                     }
                 }
             }
@@ -280,10 +284,10 @@ final class GossipRuntime implements AutoCloseable {
             synchronized (this) {
                 if (departing) {
                     switch (outcome) {
-                        case "SUCCESS" -> departureSuccesses++;
-                        case "FAILURE" -> departureFailures++;
-                        case "SKIPPED" -> departureSkipped++;
-                        default -> departureCancelled++;
+                        case SUCCESS -> departureSuccesses++;
+                        case FAILURE -> departureFailures++;
+                        case SKIPPED -> departureSkipped++;
+                        case CANCELLED -> departureCancelled++;
                     }
                 }
                 if (acquired) { resolvedInFlight.remove(resolvedKey); }
@@ -300,31 +304,6 @@ final class GossipRuntime implements AutoCloseable {
         return endpoint.port() == selfPort && (address.isLoopbackAddress() || localAddresses.contains(address));
     }
 
-    static GossipMetrics.Failure classify(Exception failure) {
-        for (Throwable cause = failure; cause != null; cause = cause.getCause()) {
-            if (cause instanceof SocketTimeoutException) { return GossipMetrics.Failure.TIMEOUT; }
-            if (cause instanceof java.nio.charset.CharacterCodingException) { return GossipMetrics.Failure.PROTOCOL; }
-            if (cause instanceof MembershipException member) {
-                if (member.reason() == MembershipException.Reason.CAPACITY) { return GossipMetrics.Failure.CAPACITY; }
-                if (member.reason() == MembershipException.Reason.CONFLICT) { return GossipMetrics.Failure.IDENTITY; }
-                return classifyProtocol(member.getMessage());
-            }
-            if (cause instanceof CommandExecutionException remote) { return classifyProtocol(remote.reply().error().message()); }
-        }
-        String message = java.util.Objects.toString(failure.getMessage(), "");
-        if (message.contains("mismatch") || message.contains("disagrees")) { return GossipMetrics.Failure.IDENTITY; }
-        if (message.startsWith("Invalid message reply") || message.contains("exceeds max.exchange.bytes")) { return GossipMetrics.Failure.PROTOCOL; }
-        return GossipMetrics.Failure.NETWORK;
-    }
-
-    private static GossipMetrics.Failure classifyProtocol(String message) {
-        if (message.contains("CAPACITY:")) { return GossipMetrics.Failure.CAPACITY; }
-        if (message.contains("CONFLICT:")) { return GossipMetrics.Failure.IDENTITY; }
-        if (message.contains("gossipVersion")) { return GossipMetrics.Failure.VERSION; }
-        if (message.contains("swarmId")) { return GossipMetrics.Failure.SWARM; }
-        return GossipMetrics.Failure.PROTOCOL;
-    }
-
     @Override public void close() throws IOException {
         closeLock.lock();
         try { closeOwned(false); }
@@ -336,15 +315,15 @@ final class GossipRuntime implements AutoCloseable {
         synchronized (this) {
             if (stopped) {
                 if (stopFailure != null) { throw stopFailure; }
-                metrics.workerState = "STOPPED";
+                state = State.STOPPED;
                 owned = scheduler == null ? List.of() : List.of(scheduler);
             } else {
                 stopped = true;
-                metrics.workerState = "STOPPING";
+                state = State.STOPPING;
                 var threads = new java.util.ArrayList<>(ownedWorkers);
                 if (scheduler != null) { threads.add(scheduler); }
                 owned = List.copyOf(threads);
-                if (leaving && !departed) { departureOutcome = "CANCELLED"; }
+                if (leaving && !departed) { departureOutcome = DepartureState.CANCELLED; }
             }
         }
         long deadline = System.nanoTime() + STOP_TIMEOUT.toNanos();
@@ -373,8 +352,8 @@ final class GossipRuntime implements AutoCloseable {
             }
             Map<String, Object> outcome = null;
             synchronized (this) {
-                metrics.workerState = failure == null ? departed ? "QUIESCED" : "STOPPED" : "CLEANUP_FAILED";
-                if (leaving) { departureState = failure == null ? departureOutcome : "FAILED"; }
+                state = failure != null ? State.CLEANUP_FAILED : departed ? State.QUIESCED : State.STOPPED;
+                if (leaving) { departureState = failure == null ? departureOutcome : DepartureState.FAILED; }
                 departurePending.clear();
                 stopFailure = failure;
                 if (leaving && !departureLogged) { departureLogged = true; outcome = departure(); }
@@ -387,4 +366,13 @@ final class GossipRuntime implements AutoCloseable {
     }
 
     private record CleanupProblem(String resource, IOException failure) { }
+
+    /** The runtime's lifecycle, as status reports it. */
+    enum State { INITIALIZING, MANUAL, RUNNING, LEAVING, STOPPING, STOPPED, QUIESCED, CLEANUP_FAILED, FAILED }
+
+    /** A departure's progress, as the departure result reports it. The last four are how it ended. */
+    private enum DepartureState { NOT_REQUESTED, DISSEMINATING, COMPLETED, EXHAUSTED, CANCELLED, FAILED }
+
+    /** How one exchange ended, for the departure counts. */
+    private enum Outcome { SUCCESS, FAILURE, SKIPPED, CANCELLED }
 }

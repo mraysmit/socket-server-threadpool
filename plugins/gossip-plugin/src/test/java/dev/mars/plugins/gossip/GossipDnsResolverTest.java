@@ -221,7 +221,7 @@ class GossipDnsResolverTest {
             runtime.start();
             await(() -> resolver.activeHelpers() == 1);
             runtime.close();
-            assertEquals("STOPPED", metrics.workerState);
+            assertEquals(GossipRuntime.State.STOPPED, runtime.state());
             assertEquals(0, metrics.workers);
             assertTrue(lookupThreads.stream().noneMatch(Thread::isAlive));
             await(() -> lookups.stream().noneMatch(Thread::isAlive));
@@ -245,7 +245,7 @@ class GossipDnsResolverTest {
                 new java.util.Random(1), resolver, Duration.ofMillis(500))) {
             runtime.leave();
             await(() -> resolver.activeHelpers() == 1);
-            await(() -> "QUIESCED".equals(metrics.workerState));
+            await(() -> runtime.state() == GossipRuntime.State.QUIESCED);
             assertEquals("EXHAUSTED", runtime.departure().get("state"));
             assertEquals(1, runtime.departure().get("cancelled"));
             assertEquals(0, resolver.activeHelpers());

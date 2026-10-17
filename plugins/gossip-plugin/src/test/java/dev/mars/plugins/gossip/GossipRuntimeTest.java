@@ -90,7 +90,7 @@ class GossipRuntimeTest {
             assertTrue(metrics.skipped.get() > 0);
             runtime.close();
             assertEquals(0, metrics.workers);
-            assertEquals("STOPPED", metrics.workerState);
+            assertEquals(GossipRuntime.State.STOPPED, runtime.state());
             assertTrue(client.threads.stream().noneMatch(Thread::isAlive));
             runtime.close();
         }
@@ -231,6 +231,24 @@ class GossipRuntimeTest {
         }
     }
 
+    @Test void aPlainIOExceptionIsANetworkFailureWhateverItsMessageSays() {
+        // Only a failure's type and kind decide its metrics category; rewording a message must not move it.
+        for (String message : List.of("Gossip server ID mismatch", "Outer serverId disagrees with gossip sender",
+                "Invalid message reply: bad", "Gossip reply exceeds max.exchange.bytes before parsing")) {
+            assertEquals(GossipFailure.NETWORK, GossipFailure.of(new IOException(message)), message);
+        }
+    }
+
+    @Test void typedFailuresAreClassifiedByTheKindTheyCarry() {
+        assertEquals(GossipFailure.IDENTITY, GossipFailure.of(
+                new GossipExchangeException(GossipFailure.IDENTITY, "Reply came from another process")));
+        var version = new MembershipException(MembershipException.Reason.INVALID_RECORD, GossipFailure.VERSION, "Unsupported");
+        assertEquals(GossipFailure.VERSION, GossipFailure.of(new IOException("Wrapped", version)), "Found through the cause");
+        var invalid = new MembershipException(MembershipException.Reason.INVALID_RECORD, "mentions gossipVersion and swarmId");
+        assertEquals(GossipFailure.PROTOCOL, GossipFailure.of(new IOException("Wrapped", invalid)),
+                "An invalid record is a protocol failure, whatever its message mentions");
+    }
+
     @Test void runtimeThreadsCarryTheContextClassLoaderTheHostSetWhenStartingThePlugin() throws Exception {
         // The host calls plugin hooks with the plugin's own class loader as the context loader; threads the plugin
         // starts must carry that loader too, not the host's.
@@ -333,7 +351,7 @@ class GossipRuntimeTest {
             assertTrue(lines.getFirst().contains("event=ROUND_FAILED"));
             assertTrue(lines.getFirst().contains("Owner heartbeat is exhausted"));
             runtime.close();
-            assertEquals("STOPPED", metrics.workerState);
+            assertEquals(GossipRuntime.State.STOPPED, runtime.state());
             assertTrue(client.closed);
             assertEquals(1, lines.size(), "Ordinary successful close must not invent departure or failure logs");
         }

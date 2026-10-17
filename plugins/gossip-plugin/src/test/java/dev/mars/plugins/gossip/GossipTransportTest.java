@@ -92,6 +92,7 @@ class GossipTransportTest {
                 socket.getOutputStream().write(badReply(config, port, request, failure));
             })) {
                 var error = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+                assertEquals(category(failure), GossipFailure.of(error), "Metrics category");
                 if (failure == Failure.REMOTE_CAPACITY) {
                     assertEquals(CommandError.Code.INVALID_PARAMETERS, assertInstanceOf(CommandExecutionException.class, error).reply().error().code());
                 }
@@ -149,6 +150,19 @@ class GossipTransportTest {
             assertEquals(1, lines.size());
             assertTrue(lines.getFirst().contains("Reachable duplicate server IDs: [Peer]"));
         }
+    }
+
+    /** The metrics category each bad reply is counted under. */
+    private static GossipFailure category(Failure failure) {
+        return switch (failure) {
+            case MESSAGE_ID, SERVER_ID, SENDER_ID -> GossipFailure.IDENTITY;
+            case VERSION -> GossipFailure.VERSION;
+            case SWARM -> GossipFailure.SWARM;
+            case REMOTE_CAPACITY -> GossipFailure.CAPACITY;
+            case EMPTY_REPLY -> GossipFailure.NETWORK;
+            case BOOT_ID, FRACTIONAL_HEARTBEAT, DUPLICATE, UNKNOWN_FIELD, MALFORMED_JSON, INVALID_UTF8, OVERSIZE_BYTES,
+                 OVERSIZE_UNICODE, ADMISSION_MISSING, ADMISSION_INVALID -> GossipFailure.PROTOCOL;
+        };
     }
 
     private static byte[] badReply(GossipConfig config, int port, CommandRequest request, Failure failure) {
@@ -313,8 +327,8 @@ class GossipTransportTest {
                  })) {
                 var failure = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
                 if (kind.equals("errorCode") || kind.equals("unrelatedError")) { assertInstanceOf(CommandExecutionException.class, failure); }
-                else if (kind.equals("legacySuccess")) { assertEquals(GossipMetrics.Failure.VERSION, GossipRuntime.classify(failure)); }
-                else { assertEquals(GossipMetrics.Failure.IDENTITY, GossipRuntime.classify(failure)); }
+                else if (kind.equals("legacySuccess")) { assertEquals(GossipFailure.VERSION, GossipFailure.of(failure)); }
+                else { assertEquals(GossipFailure.IDENTITY, GossipFailure.of(failure)); }
                 assertEquals(1, table.snapshot().retainedIdentities());
                 assertEquals(0, transport.inflight());
             }
@@ -345,7 +359,7 @@ class GossipTransportTest {
             var failure = assertThrows(java.net.SocketException.class, () -> transport.exchange(List.of(
                     new GossipConfig.Seed("Peer", "127.0.0.1", closed), new GossipConfig.Seed("Peer", "127.0.0.2", closed))));
             assertEquals(1, failure.getSuppressed().length);
-            assertEquals(GossipMetrics.Failure.NETWORK, GossipRuntime.classify(failure));
+            assertEquals(GossipFailure.NETWORK, GossipFailure.of(failure));
             assertEquals(1, metrics.outboundFailures.get(), "One exchange failed, however many addresses it tried");
             assertEquals(0, transport.inflight());
         }

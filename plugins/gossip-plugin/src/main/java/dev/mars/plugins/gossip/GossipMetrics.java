@@ -27,9 +27,7 @@ final class GossipMetrics {
     final AtomicLong rounds = new AtomicLong();
     final AtomicLong roundFailures = new AtomicLong();
     final AtomicLong skipped = new AtomicLong();
-    enum Failure { DNS, NETWORK, TIMEOUT, PROTOCOL, IDENTITY, CAPACITY, VERSION, SWARM }
-    private final Map<Failure, AtomicLong> failures = new java.util.EnumMap<>(Failure.class);
-    volatile String workerState = "INITIALIZING";
+    private final Map<GossipFailure, AtomicLong> failures = new java.util.EnumMap<>(GossipFailure.class);
     volatile int workers;
     volatile int dnsHelpers;
     volatile int retryingPeers;
@@ -43,13 +41,13 @@ final class GossipMetrics {
     GossipMetrics() { this(null); }
     GossipMetrics(GossipLog log) {
         this.log = log;
-        for (var kind : Failure.values()) { failures.put(kind, new AtomicLong()); }
+        for (var kind : GossipFailure.values()) { failures.put(kind, new AtomicLong()); }
     }
     synchronized GossipLog log(GossipConfig config, MemberRecord self) {
         if (log == null) { log = new GossipLog(config, self); }
         return log;
     }
-    void failure(Failure kind) { failures.get(kind).incrementAndGet(); }
+    void failure(GossipFailure kind) { failures.get(kind).incrementAndGet(); }
     Map<String, Object> runtime() {
         var kinds = new LinkedHashMap<String, Long>();
         failures.forEach((kind, count) -> kinds.put(kind.name(), count.get()));

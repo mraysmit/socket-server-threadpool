@@ -57,11 +57,11 @@ public final class GossipWire {
 
     public Exchange decode(Object value, boolean request) {
         if (!(value instanceof Map<?, ?> map)) { throw invalid("Invalid exchange fields"); }
-        int version = exactInteger(map.get("gossipVersion"), "gossipVersion", 1, 2);
+        int version = gossipVersion(map.get("gossipVersion"));
         var fields = request ? REQUEST_FIELDS : version == 2 ? REPLY_FIELDS_V2 : REPLY_FIELDS;
         if (!map.keySet().equals(fields)) { throw invalid("Invalid exchange fields"); }
         if (request && !"exchange".equals(map.get("operation"))) { throw invalid("operation must be exchange"); }
-        if (!config.swarmId().equals(map.get("swarmId"))) { throw invalid("swarmId does not match this swarm"); }
+        if (!config.swarmId().equals(map.get("swarmId"))) { throw invalid(GossipFailure.SWARM, "swarmId does not match this swarm"); }
         if (!(map.get("members") instanceof List<?> members) || members.size() >= config.maxBatchMembers()) {
             throw invalid("Sender and members exceed max.batch.members");
         }
@@ -87,7 +87,7 @@ public final class GossipWire {
     }
 
     public Map<String, Object> parameters(MemberRecord self, List<MemberRecord> members, int version) {
-        return Map.of("operation", "exchange", "gossipVersion", exactInteger(version, "gossipVersion", 1, 2),
+        return Map.of("operation", "exchange", "gossipVersion", gossipVersion(version),
                 "swarmId", config.swarmId(), "sender", self.toWire(), "members", wireRecords(members));
     }
 
@@ -96,7 +96,7 @@ public final class GossipWire {
     }
 
     public Map<String, Object> result(MemberRecord self, List<MemberRecord> members, int version, MembershipTable.Admission admission) {
-        if (exactInteger(version, "gossipVersion", 1, 2) == 1) { return result(self, members); }
+        if (gossipVersion(version) == 1) { return result(self, members); }
         return Map.of("gossipVersion", 2, "swarmId", config.swarmId(), "sender", self.toWire(), "members", wireRecords(members),
                 "senderAdmission", java.util.Objects.requireNonNull(admission).name());
     }
@@ -137,7 +137,7 @@ public final class GossipWire {
      * see the actual one.
      */
     int replyMemberBudget(MemberRecord self, int version, MembershipTable.Admission admission) {
-        int slot = exactInteger(version, "gossipVersion", 1, 2) == 1 ? 0 : 1 + admission.ordinal();
+        int slot = gossipVersion(version) == 1 ? 0 : 1 + admission.ordinal();
         int[] overheads = replyOverheads;
         if (overheads == null) {
             var admissions = MembershipTable.Admission.values();
@@ -265,5 +265,16 @@ public final class GossipWire {
         catch (IOException e) { throw invalid("Gossip data cannot be serialized"); }
     }
 
+    /** A gossipVersion of 1 or 2. Anything else is a version failure, in the wording deployed version-1 peers send. */
+    private static int gossipVersion(Object value) {
+        try { return exactInteger(value, "gossipVersion", 1, 2); }
+        catch (MembershipException e) { throw invalid(GossipFailure.VERSION, e.getMessage()); }
+    }
+
     static MembershipException invalid(String message) { return new MembershipException(INVALID_RECORD, message); }
+
+    /** An invalid record counted under a more specific metrics category than a protocol failure. */
+    static MembershipException invalid(GossipFailure kind, String message) {
+        return new MembershipException(INVALID_RECORD, kind, message);
+    }
 }
