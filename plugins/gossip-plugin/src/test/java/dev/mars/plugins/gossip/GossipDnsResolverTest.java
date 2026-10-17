@@ -66,7 +66,7 @@ class GossipDnsResolverTest {
     private static InetAddress[] ignoringInterrupts(CountDownLatch release) {
         boolean interrupted = false;
         while (release.getCount() > 0) {
-            try { release.await(); } catch (InterruptedException e) { interrupted = true; }
+            try { release.await(); } catch (InterruptedException _) { interrupted = true; }
         }
         if (interrupted) { Thread.currentThread().interrupt(); }
         return new InetAddress[] {InetAddress.ofLiteral("127.0.0.1")};
@@ -215,7 +215,7 @@ class GossipDnsResolverTest {
         });
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime, new java.util.Random(1), resolver)) {
             runtime.start();
@@ -239,7 +239,7 @@ class GossipDnsResolverTest {
         });
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
                 new java.util.Random(1), resolver, Duration.ofMillis(500))) {

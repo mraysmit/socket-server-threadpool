@@ -302,7 +302,7 @@ class GossipTransportTest {
         try (var transport = new GossipTransport(config, table(config), new GossipMetrics())) {
             for (int i = 0; i < 3; i++) {
                 var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-                try (var peer = new ProtocolPeer(2, version1Peer(config, versions, () -> false, 10 + i))) {
+                try (var peer = new ProtocolPeer(2, version1Peer(config, versions, () -> false, 10L + i))) {
                     transport.exchange(peer.endpoint());
                     assertEquals(List.of(2, 1), versions);
                 }
@@ -578,7 +578,7 @@ class GossipTransportTest {
         var config = GossipCommandsTest.config(32768, 32, 2);
         var first = new GossipPlugin(config, false);
         var second = new GossipPlugin(config, false);
-        try (var a = TestServer.start("Server-A", first); var b = TestServer.start("Server-B", second)) {
+        try (var _ = TestServer.start("Server-A", first); var b = TestServer.start("Server-B", second)) {
             var client = new TextMessageClient("127.0.0.1", b.getPort(), "Server-B");
             client.execute("gossip", new GossipWire(config).parameters(GossipCommandsTest.member("Third", 3), List.of()));
             var reply = first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort()));
@@ -701,7 +701,7 @@ class GossipTransportTest {
                         if (first && interrupted) { interrupt(); }
                         boolean woken = false;
                         while (release.getCount() > 0) {
-                            try { release.await(); } catch (InterruptedException e) { woken = true; }
+                            try { release.await(); } catch (InterruptedException _) { woken = true; }
                         }
                         if (woken) { Thread.currentThread().interrupt(); }
                     }
@@ -742,7 +742,7 @@ class GossipTransportTest {
                     writing.countDown();
                     boolean interrupted = false;
                     while (closed.getCount() > 0) {
-                        try { closed.await(); } catch (InterruptedException e) { interrupted = true; }
+                        try { closed.await(); } catch (InterruptedException _) { interrupted = true; }
                     }
                     if (interrupted) { Thread.currentThread().interrupt(); }
                     throw new SocketException("Socket closed");
@@ -779,7 +779,7 @@ class GossipTransportTest {
                         var parsed = CommandProtocol.parseRequest(reader.readLine());
                         request.complete(parsed);
                         try { answer.run(socket, listener.getLocalPort(), parsed); }
-                        catch (IOException expectedDisconnect) { /* Bounded clients may close while a fixture is writing. */ }
+                        catch (IOException _) { /* Bounded clients may close while a fixture is writing. */ }
                     } catch (Exception e) { request.completeExceptionally(e); throw e; }
                 }
                 return null;

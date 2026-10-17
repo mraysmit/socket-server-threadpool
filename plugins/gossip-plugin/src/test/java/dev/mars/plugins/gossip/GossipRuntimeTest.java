@@ -150,13 +150,13 @@ class GossipRuntimeTest {
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
                 calls.add(peer.serverId()); threads.add(Thread.currentThread());
-                var record = PeerSelectorTest.record(peer.serverId(), 2, peer.port());
-                table.mergeDirect(record, List.of());
+                var responder = PeerSelectorTest.record(peer.serverId(), 2, peer.port());
+                table.mergeDirect(responder, List.of());
                 metrics.success(true);
-                return new GossipWire.Exchange(record, List.of(), 2, peer.serverId().equals("A")
+                return new GossipWire.Exchange(responder, List.of(), 2, peer.serverId().equals("A")
                         ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED);
             }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get, new Random(1), new GossipDnsResolver(2, 1))) {
             runtime.round();
@@ -189,7 +189,7 @@ class GossipRuntimeTest {
                 offered.add(endpoints.stream().map(GossipConfig.Seed::host).toList());
                 throw new java.net.ConnectException("Connection refused");
             }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime, new Random(3),
                 controlledResolver(Path.of("unused"), helpers))) {
@@ -214,7 +214,7 @@ class GossipRuntimeTest {
                 throw new dev.mars.client.CommandExecutionException(dev.mars.protocol.CommandReply.failure(UUID.randomUUID(), "A", 1,
                         dev.mars.protocol.CommandError.Code.INVALID_PARAMETERS, "CAPACITY: membership is full"));
             }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, clock::get, new Random(2), new GossipDnsResolver(2, 1))) {
             runtime.round();
@@ -260,7 +260,7 @@ class GossipRuntimeTest {
                 seen.complete(Thread.currentThread().getContextClassLoader());
                 throw new IOException("Only the exchange thread's context class loader matters here");
             }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         try (var pluginLoader = new java.net.URLClassLoader(new java.net.URL[0], getClass().getClassLoader());
              var runtime = new GossipRuntime(config, table, client, new GossipMetrics(), System::nanoTime, new Random(1),
@@ -312,12 +312,12 @@ class GossipRuntimeTest {
         var client = new GossipRuntime.ExchangeClient() {
             @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
                 calls.add(peer); threads.add(Thread.currentThread());
-                var record = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
+                var responder = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
                         1, MemberRecord.State.ALIVE, Map.of());
-                table.mergeDirect(record, List.of());
-                return new GossipWire.Exchange(record, List.of(), 1, null);
+                table.mergeDirect(responder, List.of());
+                return new GossipWire.Exchange(responder, List.of(), 1, null);
             }
-            @Override public void close() { }
+            @Override public void close() { /* Nothing to release. */ }
         };
         var release = Files.createFile(temporary.resolve("release-dns"));
         var helpers = new CopyOnWriteArrayList<Thread>();
@@ -378,7 +378,7 @@ class GossipRuntimeTest {
             calls.add(peer); threads.add(Thread.currentThread());
             if (busy) { throw new GossipTransport.BusyException(); }
             try { if (block) { release.await(); } }
-            catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
+            catch (InterruptedException _) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             if (fail) { throw new IOException("Unavailable fixture peer"); }
             return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, null);
         }
