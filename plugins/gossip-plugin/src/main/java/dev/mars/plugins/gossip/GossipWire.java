@@ -120,7 +120,7 @@ public final class GossipWire {
     private int requestOverhead(MemberRecord sample) {
         int overhead = requestOverhead;
         if (overhead < 0) {
-            overhead = requestBytes(parameters(sample, List.of())).length - sample.serializedBytes();
+            overhead = requestBytes(parameters(sample, List.of())).length - sample.serializedBytes() - 1;
             requestOverhead = overhead;
         }
         return overhead;
