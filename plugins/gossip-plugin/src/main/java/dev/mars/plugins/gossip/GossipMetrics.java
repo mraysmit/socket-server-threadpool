@@ -18,6 +18,7 @@ package dev.mars.plugins.gossip;
 import java.util.Map;
 import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.TimeUnit;
 
 final class GossipMetrics {
     final AtomicLong inbound = new AtomicLong();
@@ -72,7 +73,7 @@ final class GossipMetrics {
     Long lastSuccessAgeMillis() { return ageMillis(lastSuccess); }
 
     /** Milliseconds since a nanoTime reading, or null if none has been taken. */
-    private static Long ageMillis(long then) { return then == NEVER ? null : Math.max(0, System.nanoTime() - then) / 1_000_000; }
+    private static Long ageMillis(long then) { return then == NEVER ? null : TimeUnit.NANOSECONDS.toMillis(Math.max(0, System.nanoTime() - then)); }
     Map<String, Object> counts(int inflight) {
         return Map.of("inbound", inbound.get(), "outbound", outbound.get(), "outboundFailures", outboundFailures.get(),
                 "rejected", rejectedExchanges.get(), "inflight", inflight);

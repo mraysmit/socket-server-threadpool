@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
@@ -291,7 +292,7 @@ class GossipSizeAccountingTest {
                     "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE);
             int reply = wire.replyBytes("Self", wire.result(budgetSelf, List.of(peer), 2, MembershipTable.Admission.CAPACITY));
             var row = GossipWire.memberView(new MembershipTable.MemberView(peer, MembershipTable.Assessment.CANDIDATE,
-                    Long.MAX_VALUE, Long.MAX_VALUE, false, false));
+                    Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false));
             int page = wire.replyBytes("Self", wire.page(budgetSelf, List.of(row), cursor, capacity));
             assertTrue(page > reply, "bytes=" + bytes + " page=" + page + " reply=" + reply);
         }
@@ -371,7 +372,7 @@ class GossipSizeAccountingTest {
                 throw new MembershipException(MembershipException.Reason.INVALID_RECORD, SINGLE_SENDER);
             }
             var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record,
-                    MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, Long.MAX_VALUE, false, false);
+                    MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false);
             String cursor = Base64.getUrlEncoder().withoutPadding().encodeToString(
                     (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
             fits(wire, self, wire.page(budgetSelf, List.of(GossipWire.memberView(worst)), cursor,

@@ -104,6 +104,15 @@ class GossipConfigTest {
                 () -> GossipConfig.fromProperties(properties, "Self")).getMessage().contains(key));
     }
 
+    @Test void millisecondSettingsGoUpToTheLargestThatStillConvertsToNanoseconds() {
+        long largest = 9_223_372_036_854L; // Long.MAX_VALUE nanoseconds, in whole milliseconds.
+        var properties = minimal();
+        properties.setProperty("terminal.retention.millis", Long.toString(largest));
+        assertEquals(largest, GossipConfig.fromProperties(properties, "Self").terminalRetentionMillis());
+        properties.setProperty("terminal.retention.millis", Long.toString(largest + 1));
+        assertThrows(IllegalArgumentException.class, () -> GossipConfig.fromProperties(properties, "Self"));
+    }
+
     @ParameterizedTest
     @CsvSource({"round.millis,0", "heartbeat.millis,-1", "round.millis,1.5", "round.millis,+1",
             "round.millis,9223372036854775807", "round.millis,9223372036854775808",

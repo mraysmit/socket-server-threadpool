@@ -32,4 +32,16 @@ class GossipMetricsTest {
         assertTrue(metrics.lastSuccessAgeMillis() >= 0);
         assertTrue((Long) metrics.runtime().get("lastRoundAgeMillis") >= 0);
     }
+
+    @Test void agesAreReportedInWholeMilliseconds() throws InterruptedException {
+        var metrics = new GossipMetrics();
+        metrics.success(true);
+        metrics.lastRound = System.nanoTime();
+        Thread.sleep(25);
+        long success = metrics.lastSuccessAgeMillis();
+        long round = (Long) metrics.runtime().get("lastRoundAgeMillis");
+        // At least the time slept, and nowhere near the 25,000 it would read if counted in microseconds.
+        assertTrue(success >= 20 && success < 10_000, "success age " + success);
+        assertTrue(round >= 20 && round < 10_000, "round age " + round);
+    }
 }

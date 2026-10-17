@@ -30,6 +30,7 @@ import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 import java.util.random.RandomGenerator;
 import java.util.stream.Collectors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Chooses each round's peers: a random fanout of healthy peers, and turns in a queue for recovery probes, so that
@@ -55,7 +56,7 @@ final class PeerSelector {
         this.config = config;
         this.clock = clock;
         this.random = random;
-        roundNanos = config.roundMillis() * 1_000_000;
+        roundNanos = TimeUnit.MILLISECONDS.toNanos(config.roundMillis());
     }
 
     synchronized List<GossipConfig.Seed> select(MembershipTable.Snapshot snapshot, Set<GossipConfig.Seed> busy, int slots) {

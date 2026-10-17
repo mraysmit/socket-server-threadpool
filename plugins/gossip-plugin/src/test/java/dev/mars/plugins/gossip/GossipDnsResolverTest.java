@@ -83,6 +83,19 @@ class GossipDnsResolverTest {
         }
     }
 
+    @Test void aFinishedLookupNoLongerCountsAgainstTheHelperLimit() throws Exception {
+        try (var resolver = new GossipDnsResolver(64, 1, Duration.ofSeconds(2), System::nanoTime, this::launch)) {
+            // Holding the resolver's lock keeps a finished helper from cleaning up after itself, as a busy resolver can.
+            // With one helper allowed, the next host must still find room once the first lookup has finished.
+            synchronized (resolver) {
+                resolver.resolveAll(new GossipConfig.Seed("Peer", "first.test", 9000));
+                assertEquals(0, resolver.activeHelpers(), "A finished lookup is no longer an active helper");
+                assertEquals("127.0.0.1", resolver.resolveAll(new GossipConfig.Seed("Peer", "second.test", 9000)).getFirst().host());
+            }
+        }
+        await(() -> lookups.stream().noneMatch(Thread::isAlive));
+    }
+
     @Test void cachedAddressesRotateExpireAndStayWithinTheHostCap() throws Exception {
         var clock = new AtomicLong();
         try (var resolver = new GossipDnsResolver(1, 1, Duration.ofSeconds(2), clock::get, this::launch)) {

@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /** Immutable per-instance configuration. Endpoint parsing performs no DNS or network I/O. */
 public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seeds,
@@ -34,7 +35,8 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
                            long suspectAfterMillis, long deadAfterMillis, long terminalRetentionMillis,
                            boolean discoveryEnabled) {
     public static final String CONFIG_PROPERTY = "gossip.config";
-    private static final long MAX_MILLIS = Long.MAX_VALUE / 1_000_000;
+    /** The largest millisecond setting that still converts to nanoseconds without overflow. */
+    private static final long MAX_MILLIS = TimeUnit.NANOSECONDS.toMillis(Long.MAX_VALUE);
     private static final Set<String> KEYS = Set.of("swarm.id", "advertise.host", "seeds", "round.millis",
             "heartbeat.millis", "fanout", "max.inflight", "max.members", "max.records", "max.batch.members",
             "max.exchange.bytes", "suspect.after.millis", "dead.after.millis", "terminal.retention.millis",

@@ -22,6 +22,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
@@ -226,7 +227,7 @@ class PeerSelectorTest {
     }
 
     private static MembershipTable.MemberView view(MemberRecord member, MembershipTable.Assessment assessment) {
-        return new MembershipTable.MemberView(member, assessment, 0, null, assessment == ALIVE, false);
+        return new MembershipTable.MemberView(member, assessment, 0, OptionalLong.empty(), assessment == ALIVE, false);
     }
 
     /** A snapshot of the local member followed by these, in order. */

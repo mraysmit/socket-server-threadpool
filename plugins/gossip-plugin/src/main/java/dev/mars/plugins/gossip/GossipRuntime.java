@@ -201,7 +201,7 @@ final class GossipRuntime implements AutoCloseable {
 
     /** The owner's heartbeat advances on its own interval, not every round, and stops once it is leaving. */
     private void publishHeartbeat(long now) {
-        if (!departure.requested() && now - lastHeartbeat >= config.heartbeatMillis() * 1_000_000) {
+        if (!departure.requested() && now - lastHeartbeat >= TimeUnit.MILLISECONDS.toNanos(config.heartbeatMillis())) {
             table.advanceLocal();
             lastHeartbeat = now;
         }

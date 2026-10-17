@@ -23,9 +23,11 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Objects;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import java.util.concurrent.TimeUnit;
 
 import static dev.mars.plugins.gossip.MemberRecord.State.ALIVE;
 import static dev.mars.plugins.gossip.MemberRecord.State.LEFT;
@@ -37,7 +39,7 @@ public final class MembershipTable {
     public enum Admission { ADMITTED, CAPACITY, IGNORED }
 
     public record MemberView(MemberRecord record, Assessment assessment, long advanceAgeNanos,
-                             Long directSuccessAgeNanos, boolean endpointVerified, boolean identityConflict) { }
+                             OptionalLong directSuccessAgeNanos, boolean endpointVerified, boolean identityConflict) { }
 
     public record Snapshot(MemberRecord self, List<MemberView> members, Set<String> identityConflicts,
                            int activeMembers, int retainedIdentities, int tombstones, long admissionsSkipped) {
@@ -69,11 +71,11 @@ public final class MembershipTable {
         if (self.state() != ALIVE) { throw new MembershipException(INVALID_RECORD, "Initial local record must be ALIVE"); }
         checkRecordSize(self);
         localKey = self.key();
-        suspectNanos = config.suspectAfterMillis() * 1_000_000;
-        deadNanos = config.deadAfterMillis() * 1_000_000;
-        retentionNanos = config.terminalRetentionMillis() * 1_000_000;
+        suspectNanos = TimeUnit.MILLISECONDS.toNanos(config.suspectAfterMillis());
+        deadNanos = TimeUnit.MILLISECONDS.toNanos(config.deadAfterMillis());
+        retentionNanos = TimeUnit.MILLISECONDS.toNanos(config.terminalRetentionMillis());
         long now = clock.getAsLong();
-        entries.put(localKey, new Entry(self, now, null, true, now));
+        entries.put(localKey, new Entry(self, now, OptionalLong.empty(), true, now));
     }
 
     /** Decode every record before applying any of them. Outer envelope validation belongs to the transport. */
@@ -228,7 +230,7 @@ public final class MembershipTable {
             if (departedForGood || staleCopy) { return SKIP; }
         }
         boolean remembered = tombstone != null && incoming.state() == ALIVE && incoming.heartbeat() == tombstone.heartbeat();
-        return new Admit(new Entry(incoming, remembered ? tombstone.lastAdvance() : now, null, false, now));
+        return new Admit(new Entry(incoming, remembered ? tombstone.lastAdvance() : now, OptionalLong.empty(), false, now));
     }
 
     /** A peer this process dialled, still ALIVE at the endpoint it answered on, gains direct-success evidence. */
@@ -236,7 +238,7 @@ public final class MembershipTable {
         if (!evidence.isDirect(incoming.key()) || entry.record().state() != ALIVE || !entry.record().sameEndpoint(incoming)) {
             return entry;
         }
-        return new Entry(entry.record(), entry.lastAdvance(), now, true, entry.stateSince());
+        return new Entry(entry.record(), entry.lastAdvance(), OptionalLong.of(now), true, entry.stateSince());
     }
 
     /**
@@ -322,7 +324,7 @@ public final class MembershipTable {
     private MemberRecord replaceLocal(MemberRecord record) {
         checkRecordSize(record);
         long now = clock.getAsLong();
-        entries.put(localKey, new Entry(record, now, null, true, now));
+        entries.put(localKey, new Entry(record, now, OptionalLong.empty(), true, now));
         return record;
     }
 
@@ -366,7 +368,7 @@ public final class MembershipTable {
             Entry entry = item.entry();
             if (entry.record().state() == ALIVE) { active++; }
             members.add(new MemberView(entry.record(), item.assessment(), age(now, entry.lastAdvance()),
-                    entry.lastDirectSuccess() == null ? null : age(now, entry.lastDirectSuccess()),
+                    age(now, entry.lastDirectSuccess()),
                     entry.endpointVerified(), conflicts.contains(entry.record().key().serverId())));
         }
         return new Snapshot(entries.get(localKey).record(), members, conflicts, active,
@@ -401,19 +403,28 @@ public final class MembershipTable {
         return entry.endpointVerified() ? Assessment.ALIVE : Assessment.CANDIDATE;
     }
 
+    /** How long ago the latest evidence came: the last advance, or a direct success if one came since. */
     private static long evidenceAge(Entry entry, long now) {
-        return entry.lastDirectSuccess() == null ? age(now, entry.lastAdvance())
-                : Math.min(age(now, entry.lastAdvance()), age(now, entry.lastDirectSuccess()));
+        long sinceAdvance = age(now, entry.lastAdvance());
+        var success = entry.lastDirectSuccess();
+        // Times are compared by their ages, never directly: only nanoTime differences survive wraparound.
+        return success.isPresent() ? Math.min(sinceAdvance, age(now, success.getAsLong())) : sinceAdvance;
     }
 
     /** nanoTime subtraction remains valid across signed wraparound; negative elapsed values are clamped. */
     private static long age(long now, long then) { return Math.max(0, now - then); }
 
+    /** As above, for a time that may never have happened. */
+    private static OptionalLong age(long now, OptionalLong then) {
+        return then.isPresent() ? OptionalLong.of(age(now, then.getAsLong())) : OptionalLong.empty();
+    }
+
     private static MembershipException conflict(MemberKey key) {
         return new MembershipException(CONFLICT, "Conflicting owner record for " + key);
     }
 
-    private record Entry(MemberRecord record, long lastAdvance, Long lastDirectSuccess,
+    /** {@code lastDirectSuccess} is empty until this process has exchanged with the member itself. */
+    private record Entry(MemberRecord record, long lastAdvance, OptionalLong lastDirectSuccess,
                          boolean endpointVerified, long stateSince) { }
     private record Suppression(MemberRecord.State state, long heartbeat, String fingerprint,
                                long lastAdvance, long retainedAt) { }

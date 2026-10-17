@@ -20,6 +20,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A voluntary departure: which peers still need telling, how each attempt went, and how the departure ended. How it
@@ -113,7 +114,7 @@ final class Departure {
     }
 
     Map<String, Object> result() {
-        return Map.of("state", state.name(), "budgetMillis", budgetNanos / 1_000_000, "targets", targets,
+        return Map.of("state", state.name(), "budgetMillis", TimeUnit.NANOSECONDS.toMillis(budgetNanos), "targets", targets,
                 "attempts", attempts, "successes", successes, "failures", failures, "skipped", skipped, "cancelled", cancelled);
     }
 }

@@ -23,12 +23,21 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 class GossipWireTest {
     private final GossipWire wire = new GossipWire(GossipCommandsTest.config(32768, 4, 8));
     private final MemberRecord peer = GossipCommandsTest.member("Peer", 2);
+
+    @Test void aMembersPageRowReportsItsAgesInWholeMilliseconds() {
+        var row = GossipWire.memberView(new MembershipTable.MemberView(peer, MembershipTable.Assessment.ALIVE,
+                TimeUnit.MILLISECONDS.toNanos(5) + 999_999, OptionalLong.of(TimeUnit.MILLISECONDS.toNanos(7)), true, false));
+        assertEquals(5L, row.get("advanceAgeMillis"), "Nanoseconds are truncated to whole milliseconds");
+        assertEquals(7L, row.get("directSuccessAgeMillis"));
+    }
 
     @ParameterizedTest @EnumSource(MembershipTable.Admission.class)
     void versionTwoDecodesEachAdmissionOutcomeAndVersionOneHasUnknownAdmission(MembershipTable.Admission admission) {

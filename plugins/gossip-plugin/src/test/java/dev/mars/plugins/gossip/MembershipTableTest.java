@@ -28,6 +28,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
@@ -118,13 +119,13 @@ class MembershipTableTest {
         table.mergeDirect(peer, List.of(forwarded));
         assertEquals(MembershipTable.Assessment.ALIVE, view(table, peer.key()).assessment());
         assertEquals(CANDIDATE, view(table, forwarded.key()).assessment());
-        assertNull(view(table, forwarded.key()).directSuccessAgeNanos());
+        assertEquals(OptionalLong.empty(), view(table, forwarded.key()).directSuccessAgeNanos());
         clock.advance(30);
         assertEquals(DEAD, view(table, peer.key()).assessment());
         table.mergeDirect(peer, List.of(forwarded));
         assertEquals(MembershipTable.Assessment.ALIVE, view(table, peer.key()).assessment());
         assertEquals(TimeUnit.MILLISECONDS.toNanos(30), view(table, peer.key()).advanceAgeNanos());
-        assertEquals(0L, view(table, peer.key()).directSuccessAgeNanos());
+        assertEquals(OptionalLong.of(0), view(table, peer.key()).directSuccessAgeNanos());
         assertEquals(DEAD, view(table, forwarded.key()).assessment());
     }
 
@@ -506,7 +507,7 @@ class MembershipTableTest {
         assertEquals(3, table.snapshot().retainedIdentities());
         assertEquals(2, table.snapshot().activeMembers());
         assertEquals(TimeUnit.MILLISECONDS.toNanos(60), view(table, peer.key()).advanceAgeNanos());
-        assertEquals(0L, view(table, peer.key()).directSuccessAgeNanos());
+        assertEquals(OptionalLong.of(0), view(table, peer.key()).directSuccessAgeNanos());
     }
 
     @Test void skippedAliveAdmissionsDoNotBlockTerminalRecordsThatStillFit() {
@@ -592,8 +593,25 @@ class MembershipTableTest {
         table.merge(List.of(version(peer, 2)));
         var view = view(table, peer.key());
         assertEquals(2, view.record().heartbeat());
-        assertEquals(Long.valueOf(TimeUnit.MILLISECONDS.toNanos(4)), view.directSuccessAgeNanos(),
+        assertEquals(OptionalLong.of(TimeUnit.MILLISECONDS.toNanos(4)), view.directSuccessAgeNanos(),
                 "The direct success before the advance still counts");
+    }
+
+    @Test void theLocalMemberNeverHasADirectSuccess() {
+        var table = table();
+        assertEquals(OptionalLong.empty(), view(table, self.key()).directSuccessAgeNanos());
+        table.advanceLocal();
+        assertEquals(OptionalLong.empty(), view(table, self.key()).directSuccessAgeNanos(), "This process never exchanges with itself");
+    }
+
+    @Test void aDepartingPeerThatStillAnswersGainsNoDirectSuccess() {
+        var table = table();
+        table.mergeDirect(peer, List.of());
+        clock.advance(4);
+        // A departing peer keeps answering exchanges, with its LEFT record, until it stops.
+        table.mergeDirect(departed(peer), List.of());
+        assertEquals(OptionalLong.of(TimeUnit.MILLISECONDS.toNanos(4)), view(table, peer.key()).directSuccessAgeNanos(),
+                "A reply from a departed member must not keep it fresh");
     }
 
     private static void assertReason(MembershipException.Reason reason, org.junit.jupiter.api.function.Executable operation) {

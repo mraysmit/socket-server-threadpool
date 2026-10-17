@@ -27,9 +27,11 @@ import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
+import java.util.concurrent.TimeUnit;
 
 import static dev.mars.plugins.gossip.MembershipException.invalidRecord;
 
@@ -190,7 +192,7 @@ public final class GossipWire {
     }
 
     private static MembershipTable.MemberView widestView(MemberRecord member) {
-        return new MembershipTable.MemberView(member, MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, Long.MAX_VALUE, false, false);
+        return new MembershipTable.MemberView(member, MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false);
     }
 
     /** A members cursor at its widest: a boot ID is fixed-width, and the offset is at most the record limit. */
@@ -217,8 +219,10 @@ public final class GossipWire {
     static Map<String, Object> memberView(MembershipTable.MemberView member) {
         var result = new LinkedHashMap<>(member.record().toWire());
         result.put("assessment", member.assessment().name());
-        result.put("advanceAgeMillis", member.advanceAgeNanos() / 1_000_000);
-        result.put("directSuccessAgeMillis", member.directSuccessAgeNanos() == null ? null : member.directSuccessAgeNanos() / 1_000_000);
+        result.put("advanceAgeMillis", TimeUnit.NANOSECONDS.toMillis(member.advanceAgeNanos()));
+        var directSuccessAge = member.directSuccessAgeNanos();
+        // None yet is written as null, which the members page has always reported.
+        result.put("directSuccessAgeMillis", directSuccessAge.isPresent() ? TimeUnit.NANOSECONDS.toMillis(directSuccessAge.getAsLong()) : null);
         result.put("endpointVerified", member.endpointVerified());
         result.put("identityConflict", member.identityConflict());
         return result;

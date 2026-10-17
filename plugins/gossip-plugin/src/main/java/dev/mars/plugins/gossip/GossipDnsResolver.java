@@ -80,7 +80,7 @@ final class GossipDnsResolver implements AutoCloseable {
             if (previous != null && clock.getAsLong() - previous.created < CACHE_NANOS) { return numeric(peer, previous.rotation()); }
             lookup = active.get(host);
             if (lookup == null) {
-                if (active.size() >= maxHelpers) { throw new IOException("Gossip resolver capacity is full"); }
+                if (running() >= maxHelpers) { throw new IOException("Gossip resolver capacity is full"); }
                 var result = new CompletableFuture<List<InetAddress>>();
                 lookup = new InFlight(Thread.ofPlatform().daemon().name("gossip-dns-lookup").unstarted(() -> {
                     try { result.complete(addresses(host)); }
@@ -126,7 +126,13 @@ final class GossipDnsResolver implements AutoCloseable {
         return addresses.stream().map(address -> numeric(peer, address)).toList();
     }
 
-    synchronized int activeHelpers() { return active.size(); }
+    synchronized int activeHelpers() { return running(); }
+
+    /**
+     * Lookups still running. A finished one stops counting at once: its thread removes it from {@code active} only
+     * after waking its callers, and one of them may already be asking for the next host.
+     */
+    private int running() { return (int) active.values().stream().filter(lookup -> !lookup.result().isDone()).count(); }
     synchronized int cacheSize() { return cache.size(); }
 
     /** Releases waiting callers at once, then gives interruptible lookups a moment to end. */

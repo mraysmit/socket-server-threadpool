@@ -50,6 +50,24 @@ class GossipRuntimeTest {
         return GossipConfig.fromProperties(properties, "Self");
     }
 
+    @Test void theLocalHeartbeatAdvancesOncePerHeartbeatIntervalNotEveryRound() throws Exception {
+        var clock = new AtomicLong();
+        var config = config(""); // A heartbeat every 5 ms.
+        var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000), clock::get);
+        try (var runtime = new GossipRuntime(config, table, new Client(false, false), new GossipMetrics(), clock::get, new Random(1),
+                new GossipDnsResolver(8, 2))) {
+            clock.set(TimeUnit.MILLISECONDS.toNanos(60));
+            runtime.round();
+            long beat = table.self().heartbeat();
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(4));
+            runtime.round();
+            assertEquals(beat, table.self().heartbeat(), "4 ms is less than one heartbeat interval");
+            clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(1));
+            runtime.round();
+            assertEquals(beat + 1, table.self().heartbeat());
+        }
+    }
+
     @Test void isolatedRoundsAdvanceOnlyOwnerHeartbeatsAndRunRetentionMaintenance() throws Exception {
         var clock = new AtomicLong();
         var config = config("");
