@@ -756,6 +756,121 @@ class GossipTransportTest {
         }
     }
 
+    @Test void aClosedTransportRefusesWorkWithoutCountingAFailedExchange() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var metrics = new GossipMetrics();
+        var transport = new GossipTransport(config, table(config), metrics);
+        transport.close();
+        var refused = assertThrows(IOException.class, () -> transport.exchange(new GossipConfig.Seed("Peer", "127.0.0.1", 9)));
+        assertEquals("Gossip transport is closed", refused.getMessage());
+        assertEquals(0, metrics.outboundFailures.get(), "Refusing work is not a failed exchange");
+        assertEquals(0, transport.inflight());
+    }
+
+    @Test void anExchangeWithThisProcessIsRefusedBeforeAnyConnection() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        try (var transport = new GossipTransport(config, table)) {
+            var self = table.self();
+            var refused = assertThrows(IOException.class, () -> transport.exchange(new GossipConfig.Seed("Anyone", self.host(), self.port())));
+            assertEquals("Cannot exchange with the local endpoint", refused.getMessage());
+        }
+    }
+
+    @Test void aVersion1RetryGoesOnlyToTheAddressThatAnswered() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
+        var stray = new java.util.concurrent.atomic.AtomicReference<ServerSocket>();
+        var legacy = version1Peer(config, versions, () -> false, 2);
+        try (var peer = new ProtocolPeer(2, (socket, port, request) -> {
+                 // The address that refused the first connection listens from now on, so a retry there would reach it.
+                 if (stray.get() == null) { stray.set(new ServerSocket(port, 1, java.net.InetAddress.getByAddress(new byte[] {127, 0, 0, 2}))); }
+                 legacy.run(socket, port, request);
+             });
+             var transport = new GossipTransport(config, table(config), Duration.ofSeconds(5), Duration.ofSeconds(2), Duration.ofSeconds(15))) {
+            var answering = peer.endpoint();
+            var refusing = new GossipConfig.Seed(answering.serverId(), "127.0.0.2", answering.port());
+            try {
+                transport.exchange(List.of(refusing, answering));
+                assertEquals(List.of(2, 1), versions);
+                stray.get().setSoTimeout(1);
+                assertThrows(SocketTimeoutException.class, () -> stray.get().accept().close(), "The retry must not try the address that refused");
+            } finally { if (stray.get() != null) { stray.get().close(); } }
+        }
+    }
+
+    @Test void recordsThatCouldNotBeForwardedAreRejectedBeforeMerging() throws Exception {
+        var config = GossipCommandsTest.config(4096, 4, 8);
+        // A large local record leaves too little room beside it, in this process's own replies, for the large member.
+        var self = new MemberRecord(new MemberKey("Self", new UUID(0, 1)), "127.0.0.1", 9000, 1, MemberRecord.State.ALIVE,
+                Map.of("text", "x".repeat(1800)));
+        var table = new MembershipTable(config, self);
+        var large = new MemberRecord(new MemberKey("Large", new UUID(0, 7)), "127.0.0.1", 9300, 1, MemberRecord.State.ALIVE,
+                Map.of("text", "y".repeat(2300)));
+        try (var transport = new GossipTransport(config, table);
+             var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(line(GossipWire.bytes(
+                     CommandReply.success(request, "Peer", 1, new GossipWire(config).result(responder(port, 2), List.of(large),
+                             ((Number) request.parameters().get("gossipVersion")).intValue(), MembershipTable.Admission.ADMITTED))))))) {
+            var rejected = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+            assertTrue(rejected.getMessage().contains("Complete reply exceeds max.exchange.bytes"), rejected.getMessage());
+            assertEquals(1, table.snapshot().retainedIdentities(), "Neither the responder nor the large member is merged");
+        }
+    }
+
+    @Test void aTransportClosedWhileItsReplyArrivesMergesNothing() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        var owner = new java.util.concurrent.atomic.AtomicReference<GossipTransport>();
+        Runnable closeTransport = () -> {
+            try { owner.get().close(); } catch (IOException e) { throw new java.io.UncheckedIOException(e); }
+        };
+        try (var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(reply(config, request, responder(port, 2))));
+             var transport = new GossipTransport(config, table, new GossipMetrics(), Duration.ofSeconds(1), Duration.ofSeconds(2),
+                     Duration.ofSeconds(5), System::nanoTime, () -> new CloseOnReplySocket(closeTransport))) {
+            owner.set(transport);
+            var refused = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+            assertEquals("Gossip transport is closed", refused.getMessage());
+            assertEquals(1, table.snapshot().retainedIdentities(), "The reply arrived, but nothing was merged");
+        }
+    }
+
+    @Test void anIdentityConflictFoundWhileMergingAReplyIsLogged() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        var lines = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, lines::add));
+        try (var transport = new GossipTransport(config, table, metrics);
+             var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(reply(config, request, responder(port, 2))))) {
+            // The table already holds the responder's version with another endpoint, so its reply conflicts.
+            var held = responder(peer.endpoint().port(), 2);
+            table.merge(List.of(new MemberRecord(held.key(), held.host(), held.port() + 1, held.heartbeat(), held.state(), held.metadata())));
+            var conflict = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
+            assertTrue(conflict.getMessage().startsWith("Gossip CONFLICT"), conflict.getMessage());
+            assertEquals(1, lines.size());
+            assertTrue(lines.getFirst().contains("event=IDENTITY_CONFLICT") && lines.getFirst().contains("direction=outbound"), lines.getFirst());
+        }
+    }
+
+    /** A socket that closes the transport once the reply's last line has been read, before the exchange can merge it. */
+    private static final class CloseOnReplySocket extends Socket {
+        private final Runnable onReply;
+        private boolean done;
+
+        CloseOnReplySocket(Runnable onReply) { this.onReply = onReply; }
+
+        @Override public java.io.InputStream getInputStream() throws IOException {
+            return new java.io.FilterInputStream(super.getInputStream()) {
+                @Override public int read(byte[] bytes, int offset, int length) throws IOException {
+                    int count = super.read(bytes, offset, length);
+                    for (int i = 0; i < count && !done; i++) {
+                        if (bytes[offset + i] == '\n') { done = true; onReply.run(); }
+                    }
+                    return count;
+                }
+            };
+        }
+    }
+
     @FunctionalInterface private interface Answer { void run(Socket socket, int port, CommandRequest request) throws Exception; }
 
     private static final class ProtocolPeer implements AutoCloseable {

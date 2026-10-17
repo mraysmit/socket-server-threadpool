@@ -28,6 +28,9 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
+import static dev.mars.plugins.gossip.MembershipTable.Assessment.ALIVE;
+import static dev.mars.plugins.gossip.MembershipTable.Assessment.CANDIDATE;
+import static dev.mars.plugins.gossip.MembershipTable.Assessment.DEAD;
 import static org.junit.jupiter.api.Assertions.*;
 
 class PeerSelectorTest {
@@ -215,25 +218,228 @@ class PeerSelectorTest {
         assertEquals(Set.of("127.0.0.1", "127.0.0.2"), selected.stream().map(GossipConfig.Seed::host).collect(java.util.stream.Collectors.toSet()));
     }
 
+    /** Members at distinct endpoints, in order. */
+    private static List<MemberRecord> members(String... ids) {
+        var members = new ArrayList<MemberRecord>();
+        for (String id : ids) { members.add(record(id, members.size() + 2, 9101 + members.size())); }
+        return members;
+    }
+
+    private static MembershipTable.MemberView view(MemberRecord member, MembershipTable.Assessment assessment) {
+        return new MembershipTable.MemberView(member, assessment, 0, null, assessment == ALIVE, false);
+    }
+
+    /** A snapshot of the local member followed by these, in order. */
+    private MembershipTable.Snapshot snapshot(List<MembershipTable.MemberView> members) {
+        var views = new ArrayList<MembershipTable.MemberView>();
+        views.add(view(self, ALIVE));
+        views.addAll(members);
+        return new MembershipTable.Snapshot(self, views, Set.of(), views.size(), views.size(), 0, 0);
+    }
+
+    /** A snapshot in which no member is verified, so every one is a recovery peer. */
+    private MembershipTable.Snapshot unverified(List<MemberRecord> records) {
+        return snapshot(records.stream().map(member -> view(member, CANDIDATE)).toList());
+    }
+
+    /** The one recovery peer a single-slot selection probes. */
+    private String probe(PeerSelector selector, List<MemberRecord> members) {
+        return selector.select(unverified(members), Set.of(), 1).getFirst().serverId();
+    }
+
     @Test void removingAnEarlierRecoveryPeerDoesNotMakeTheRotationSkipTheNextOne() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var members = members("A", "B", "C", "D", "E");
+        for (String expected : List.of("A", "B", "C")) { assertEquals(expected, probe(selector, members)); }
+        // D is next. Removing B shifts D down one place; the rotation must still offer D, not skip to E.
+        var withoutB = new ArrayList<>(members);
+        withoutB.remove(1);
+        assertEquals("D", probe(selector, withoutB));
+        assertEquals("E", probe(selector, withoutB));
+    }
+
+    @Test void whenThePeerDueNextLeavesTheOneWaitingLongestIsProbedNext() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var members = members("A", "B", "C", "D");
+        assertEquals("A", probe(selector, members));
+        assertEquals("B", probe(selector, members));
+        // C was due next and leaves, with A. D has never been probed and B just was, so D comes first.
+        var remaining = List.of(members.get(1), members.get(3));
+        assertEquals("D", probe(selector, remaining));
+        assertEquals("B", probe(selector, remaining));
+    }
+
+    @Test void aNewRecoveryPeerWaitsBehindEveryPeerAlreadyWaiting() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var members = members("A", "B", "C");
+        var first = members.subList(0, 2);
+        assertEquals("A", probe(selector, first));
+        // C arrives after A's probe put A back in the queue, so C waits behind B and A.
+        for (String expected : List.of("B", "A", "C", "B")) { assertEquals(expected, probe(selector, members)); }
+    }
+
+    @Test void aPeerThatRecoversAndThenNeedsRecoveryAgainRejoinsAtTheBack() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var members = members("A", "B", "D");
+        assertEquals("A", probe(selector, members.subList(0, 2)));
+        // A is healthy for one round, in which D first needs recovery.
+        selector.select(snapshot(List.of(view(members.get(0), ALIVE), view(members.get(1), CANDIDATE), view(members.get(2), CANDIDATE))), Set.of(), 1);
+        // A needs recovery again, so it waits behind D, which was already waiting.
+        for (String expected : List.of("B", "D", "A")) { assertEquals(expected, probe(selector, members)); }
+    }
+
+    @Test void aSeedThatFailedByHostnameAndIsThenFoundFullKeepsGrowingItsBackoff() {
+        var config = config(1, "Full@full.test:9010");
+        var table = new MembershipTable(config, self, clock::get);
+        table.mergeDirect(record("Full", 2, 9010), List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(2));
+        var seed = config.seeds().getFirst();
+        selector.failure(seed);
+        selector.capacity(seed, new GossipConfig.Seed("Full", "127.0.0.1", 9010));
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
+        assertTrue(selector.select(table.snapshot(), Set.of(), 1).isEmpty(), "The capacity hint must continue the backoff the failure began");
+    }
+
+    @Test void aMemberThatHasLeftIsNeverOffered() {
+        var config = config(1, "");
+        var table = new MembershipTable(config, self, clock::get);
+        var leaving = record("Leaving", 2, 9010);
+        table.mergeDirect(leaving, List.of());
+        table.merge(List.of(new MemberRecord(leaving.key(), leaving.host(), leaving.port(), leaving.heartbeat(), MemberRecord.State.LEFT, Map.of())));
+        assertTrue(table.snapshot().members().stream().anyMatch(member -> member.record().state() == MemberRecord.State.LEFT));
+        var selector = new PeerSelector(config, clock::get, new Random(1));
+        for (int i = 0; i < 3; i++) { assertTrue(selector.select(table.snapshot(), Set.of(), 1).isEmpty()); }
+    }
+
+    @Test void aHealthyRecordWinsOverARecoveringOneAtTheSameEndpoint() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        // Two boots of one server at one endpoint, the first unverified and the second alive, and a dead peer.
+        var snapshot = snapshot(List.of(view(record("Twice", 2, 9010), CANDIDATE), view(record("Twice", 3, 9010), ALIVE),
+                view(record("Dead", 4, 9020), DEAD)));
+        var offered = new ArrayList<String>();
+        for (int i = 0; i < 6; i++) { offered.add(selector.select(snapshot, Set.of(), 1).getFirst().serverId()); }
+        // The endpoint is healthy, so it takes the ordinary slots, and the dead peer only every third, reserved one.
+        assertEquals(List.of("Twice", "Twice", "Dead", "Twice", "Twice", "Dead"), offered);
+    }
+
+    @Test void retryStateIsDroppedForAPeerNoLongerOfferedUnlessItsExchangeIsStillRunning() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var peer = new GossipConfig.Seed("Gone", "127.0.0.1", 9010);
+        selector.failure(peer);
+        selector.select(unverified(List.of()), Set.of(peer), 1);
+        assertEquals(1, selector.retryCount(), "A running exchange may still fail, and its backoff must then grow");
+        selector.select(unverified(List.of()), Set.of(), 1);
+        assertEquals(0, selector.retryCount());
+    }
+
+    @Test void neverOffersMoreThanTheFanoutHoweverManySlotsAreFree() {
+        var selector = new PeerSelector(config(1, ""), clock::get, new Random(1));
+        var snapshot = snapshot(members("A", "B", "C").stream().map(member -> view(member, ALIVE)).toList());
+        assertEquals(1, selector.select(snapshot, Set.of(), 3).size());
+    }
+
+    @Test void aSuccessClearsBackoffKeptUnderTheResolvedAddressAfterTheAliasExpires() {
+        var config = config(1, "Peer@peer.example.test:9010");
+        var selector = new PeerSelector(config, clock::get, new Random(1));
+        var seed = config.seeds().getFirst();
+        var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9010);
+        selector.capacity(seed, numeric);
+        clock.addAndGet(TimeUnit.SECONDS.toNanos(60));
+        selector.success(seed, numeric);
+        assertEquals(0, selector.retryCount());
+    }
+
+    @Test void aFirstFailureBacksOffForBetweenThreeQuartersOfARoundAndARoundAndAQuarter() {
+        var config = config(1, "Peer@127.0.0.1:9010");
+        var table = new MembershipTable(config, self, clock::get);
+        var peer = config.seeds().getFirst();
+        int early = 0;
+        for (int seed = 0; seed < 50; seed++) {
+            clock.set(0);
+            var selector = new PeerSelector(config, clock::get, new Random(seed));
+            selector.failure(peer);
+            clock.set(TimeUnit.MILLISECONDS.toNanos(74));
+            assertTrue(selector.select(table.snapshot(), Set.of(), 1).isEmpty());
+            clock.set(TimeUnit.MILLISECONDS.toNanos(90));
+            if (!selector.select(table.snapshot(), Set.of(), 1).isEmpty()) { early++; }
+            clock.set(TimeUnit.MILLISECONDS.toNanos(126));
+            assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
+        }
+        assertTrue(early > 0, "Jitter must also shorten the wait, so peers that failed together are not retried together");
+    }
+
+    @Test void retryStateIsBoundedByTheMembersAndSeedsItCouldBeFor() {
         var config = config(1, "");
         var selector = new PeerSelector(config, clock::get, new Random(1));
-        var members = new java.util.ArrayList<MemberRecord>();
-        for (String id : List.of("A", "B", "C", "D", "E")) { members.add(record(id, members.size() + 2, 9101 + members.size())); }
-        java.util.function.Function<List<MemberRecord>, MembershipTable.Snapshot> unverified = records -> {
-            var views = new java.util.ArrayList<MembershipTable.MemberView>();
-            views.add(new MembershipTable.MemberView(self, MembershipTable.Assessment.ALIVE, 0, null, true, false));
-            for (var record : records) { views.add(new MembershipTable.MemberView(record, MembershipTable.Assessment.CANDIDATE, 0, null, false, false)); }
-            return new MembershipTable.Snapshot(self, views, Set.of(), views.size(), views.size(), 0, 0);
-        };
-        for (String expected : List.of("A", "B", "C")) {
-            assertEquals(expected, selector.select(unverified.apply(members), Set.of(), 1).getFirst().serverId());
+        for (int i = 0; i < 10; i++) { selector.failure(new GossipConfig.Seed("P" + i, "127.0.0.1", 9100 + i)); }
+        assertEquals(config.maxMembers(), selector.retryCount());
+    }
+
+    @Test void theLocalHostnameIsRecognisedWhateverItsCase() {
+        assertTrue(PeerSelector.isSelf(at("Self", 1, "Node.Example", 9000), new GossipConfig.Seed("Self", "node.example", 9000)));
+    }
+
+    @Test void aFailureAfterAnAliasExpiresIsChargedToTheHostnameNotTheOldAddress() {
+        var config = config(2, "Peer@peer.example.test:9010");
+        var table = new MembershipTable(config, self, clock::get);
+        table.mergeDirect(record("Peer", 2, 9010), List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(8));
+        var seed = config.seeds().getFirst();
+        var numeric = new GossipConfig.Seed("Peer", "127.0.0.1", 9010);
+        selector.success(seed, numeric);
+        clock.addAndGet(TimeUnit.SECONDS.toNanos(60));
+        selector.failure(seed); // A fresh lookup of the hostname failed; the member at the old address is unaffected.
+        assertEquals(List.of(numeric), selector.select(table.snapshot(), Set.of(), 2));
+    }
+
+    @Test void aSuccessfulExchangeGivesOnlyAConfiguredSeedAnAlias() {
+        var config = config(2, "");
+        var table = new MembershipTable(config, self, clock::get);
+        table.mergeDirect(record("Peer", 2, 9010), List.of());
+        table.merge(List.of(at("Peer", 3, "peer.example.test", 9010)));
+        var selector = new PeerSelector(config, clock::get, new Random(9));
+        selector.success(new GossipConfig.Seed("Peer", "peer.example.test", 9010), new GossipConfig.Seed("Peer", "127.0.0.1", 9010));
+        assertEquals(2, selector.select(table.snapshot(), Set.of(), 2).size());
+    }
+
+    @Test void aSeedNotYetSeenAsAHealthyMemberIsProbedOnlyInReservedSlots() {
+        var config = config(1, "Unseen@127.0.0.1:9030");
+        var table = new MembershipTable(config, self, clock::get);
+        table.mergeDirect(record("Healthy", 2, 9010), List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(6));
+        for (int i = 1; i <= 30; i++) {
+            assertEquals(i % 3 == 0 ? "Unseen" : "Healthy", selector.select(table.snapshot(), Set.of(), 1).getFirst().serverId());
         }
-        // D is next. Removing B shifts D down one place; the rotation must still offer D, not skip to E.
-        var withoutB = new java.util.ArrayList<>(members);
-        withoutB.remove(1);
-        assertEquals("D", selector.select(unverified.apply(withoutB), Set.of(), 1).getFirst().serverId());
-        assertEquals("E", selector.select(unverified.apply(withoutB), Set.of(), 1).getFirst().serverId());
+    }
+
+    @Test void backoffNeverExceedsThirtySecondsEvenWhenARoundIsLonger() {
+        var properties = GossipConfigTest.minimal();
+        properties.setProperty("round.millis", "60000");
+        properties.setProperty("seeds", "Peer@127.0.0.1:9010");
+        var config = GossipConfig.fromProperties(properties, "Self");
+        var table = new MembershipTable(config, self, clock::get);
+        var selector = new PeerSelector(config, clock::get, new Random(1));
+        var peer = config.seeds().getFirst();
+        selector.failure(peer);
+        clock.set(TimeUnit.SECONDS.toNanos(30));
+        assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
+    }
+
+    @Test void aFullMemberKnownByHostnameKeepsItsBackoff() {
+        var config = config(1, "");
+        var table = new MembershipTable(config, self, clock::get);
+        var named = at("Named", 2, "named.example.test", 9010);
+        table.mergeDirect(named, List.of());
+        var selector = new PeerSelector(config, clock::get, new Random(2));
+        var peer = named.endpoint();
+        var answered = new GossipConfig.Seed("Named", "127.0.0.1", 9010);
+        selector.capacity(peer, answered);
+        assertTrue(selector.select(table.snapshot(), Set.of(), 1).isEmpty(), "A full peer must wait before it is tried again");
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
+        assertEquals(List.of(peer), selector.select(table.snapshot(), Set.of(), 1));
+        selector.capacity(peer, answered);
+        clock.addAndGet(TimeUnit.MILLISECONDS.toNanos(126));
+        assertTrue(selector.select(table.snapshot(), Set.of(), 1).isEmpty(), "A second capacity hint must preserve exponential backoff");
     }
 
     @Test void hostValidationGivesTheSameAnswerWhenCachedAndAcrossEviction() {

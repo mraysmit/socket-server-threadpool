@@ -575,6 +575,27 @@ class MembershipTableTest {
         assertEquals(2, table.snapshot().retainedIdentities());
     }
 
+    @Test void aDifferentDepartureAtTheSameVersionIsAConflictAndAnIdenticalOneIsIgnored() {
+        var table = table();
+        var left = departed(version(peer, 3));
+        table.merge(List.of(left));
+        var forged = new MemberRecord(left.key(), left.host(), left.port() + 1, left.heartbeat(), MemberRecord.State.LEFT, left.metadata());
+        assertReason(MembershipException.Reason.CONFLICT, () -> table.merge(List.of(forged)));
+        assertEquals(left, view(table, peer.key()).record(), "A rejected copy leaves the departure as it was");
+        assertEquals(new MembershipTable.MergeResult(0, 0, 1), table.merge(List.of(departed(version(peer, 3)))));
+    }
+
+    @Test void anAdvanceKeepsTheMembersLastDirectSuccess() {
+        var table = table();
+        table.mergeDirect(peer, List.of());
+        clock.advance(4);
+        table.merge(List.of(version(peer, 2)));
+        var view = view(table, peer.key());
+        assertEquals(2, view.record().heartbeat());
+        assertEquals(Long.valueOf(TimeUnit.MILLISECONDS.toNanos(4)), view.directSuccessAgeNanos(),
+                "The direct success before the advance still counts");
+    }
+
     private static void assertReason(MembershipException.Reason reason, org.junit.jupiter.api.function.Executable operation) {
         assertEquals(reason, assertThrows(MembershipException.class, operation).reason());
     }

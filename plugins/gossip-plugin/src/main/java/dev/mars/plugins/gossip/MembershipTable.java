@@ -81,18 +81,18 @@ public final class MembershipTable {
         checkBatchSize(records);
         var decoded = new ArrayList<MemberRecord>(records.size());
         for (Object record : records) { decoded.add(MemberRecord.fromWire(record)); }
-        return apply(validateBatch(decoded), null, null).merge();
+        return apply(validateBatch(decoded), FORWARDED).merge();
     }
 
     /** Forwarded owner records supply activity evidence, but do not verify their advertised endpoints. */
     public MergeResult merge(List<MemberRecord> records) {
         // A private copy, so a caller changing its list cannot change the batch while it is checked and applied.
-        return apply(validateBatch(records == null ? null : new ArrayList<>(records)), null, null).merge();
+        return apply(validateBatch(records == null ? null : new ArrayList<>(records)), FORWARDED).merge();
     }
 
     /** Admission of the sender is captured atomically with the committed merge, not a later snapshot. */
     public ExchangeMerge mergeExchange(MemberRecord sender, List<MemberRecord> forwarded) {
-        return apply(validateExchange(sender, forwarded), null, sender.key());
+        return apply(validateExchange(sender, forwarded), new FromSender(sender.key()));
     }
 
     /**
@@ -100,7 +100,7 @@ public final class MembershipTable {
      * Only this responder gains direct-success evidence; members carried in its batch do not.
      */
     public MergeResult mergeDirect(MemberRecord responder, List<MemberRecord> forwarded) {
-        return apply(validateExchange(responder, forwarded), responder, null).merge();
+        return apply(validateExchange(responder, forwarded), new FromResponder(responder)).merge();
     }
 
     private List<MemberRecord> validateExchange(MemberRecord responder, List<MemberRecord> forwarded) {
@@ -137,97 +137,144 @@ public final class MembershipTable {
         }
     }
 
-    private synchronized ExchangeMerge apply(List<MemberRecord> records, MemberRecord direct, MemberKey sender) {
-        if (direct != null && direct.key().equals(localKey)) {
+    /**
+     * Merges a validated batch: decides each record against the table, commits the updates, then admits new members
+     * while there is room. Deciding only reads the table and may throw on a conflict, so a rejected batch leaves the
+     * table untouched without copying it. Batch keys are unique, so no key is read twice.
+     */
+    private synchronized ExchangeMerge apply(List<MemberRecord> records, Evidence evidence) {
+        if (evidence instanceof FromResponder(var responder) && responder.key().equals(localKey)) {
             throw new MembershipException(CONFLICT, "A direct peer must not be the local process");
         }
         long now = clock.getAsLong();
-        // The loop only reads the table and may throw on a conflict; every change is applied after it, so a
-        // rejected batch leaves the table untouched without copying it. Batch keys are unique, so no key is read twice.
         var updates = new LinkedHashMap<MemberKey, Entry>();
         var admissions = new LinkedHashMap<MemberKey, Entry>();
-        int admitted = 0;
         int advanced = 0;
         int ignored = 0;
-        int skipped = 0;
-        boolean senderSkipped = false;
         for (MemberRecord incoming : records) {
-            MemberKey key = incoming.key();
-            Entry old = entries.get(key);
-            boolean directRecord = direct != null && direct.key().equals(key);
-            if (key.equals(localKey)) {
-                MemberRecord local = old.record();
-                // Peers can still forward the last ALIVE version after this owner publishes LEFT.
-                boolean staleAlive = local.state() == LEFT && incoming.state() == ALIVE
-                        && incoming.heartbeat() <= local.heartbeat();
-                if (!staleAlive && !incoming.equals(local) && incoming.heartbeat() >= local.heartbeat()) {
-                    throw conflict(key);
-                }
-                ignored++;
-                continue;
-            }
-            if (old != null) {
-                MemberRecord previous = old.record();
-                if (previous.state() == LEFT) {
-                    if (incoming.state() == LEFT && incoming.heartbeat() == previous.heartbeat()
-                            && !incoming.equals(previous)) { throw conflict(key); }
+            var key = incoming.key();
+            switch (decide(incoming, now, evidence)) {
+                case Skip _ -> ignored++;
+                case Keep(var entry) -> {
                     ignored++;
-                } else if (incoming.state() == LEFT || incoming.heartbeat() > previous.heartbeat()) {
-                    old = new Entry(incoming, now, old.lastDirectSuccess(),
-                            old.endpointVerified() && previous.sameEndpoint(incoming), now);
+                    updates.put(key, withDirectEvidence(entry, incoming, evidence, now));
+                }
+                case Advance(var entry) -> {
                     advanced++;
-                } else {
-                    if (incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) { throw conflict(key); }
-                    ignored++;
+                    updates.put(key, withDirectEvidence(entry, incoming, evidence, now));
                 }
-            } else {
-                Suppression suppressed = suppressions.get(key);
-                if (suppressed != null) {
-                    boolean sameVersion = incoming.heartbeat() == suppressed.heartbeat();
-                    if (sameVersion && incoming.state() == suppressed.state()
-                            && !incoming.fingerprint().equals(suppressed.fingerprint())) { throw conflict(key); }
-                    if (suppressed.state() == LEFT || (incoming.state() == ALIVE
-                            && (incoming.heartbeat() < suppressed.heartbeat() || (sameVersion && !directRecord)))) {
-                        ignored++;
-                        continue;
-                    }
-                }
-                long lastAdvance = suppressed != null && incoming.state() == ALIVE
-                        && incoming.heartbeat() == suppressed.heartbeat() ? suppressed.lastAdvance() : now;
-                old = new Entry(incoming, lastAdvance, null, false, now);
+                case Admit(var entry) -> admissions.put(key, withDirectEvidence(entry, incoming, evidence, now));
             }
-            if (directRecord && old.record().state() == ALIVE && old.record().sameEndpoint(incoming)) {
-                old = new Entry(old.record(), old.lastAdvance(), now, true, old.stateSince());
-            }
-            (entries.containsKey(key) ? updates : admissions).put(key, old);
         }
         entries.putAll(updates);
+        var admitted = admit(admissions, evidence);
+        admissionsSkipped += Math.min(admitted.skipped(), Long.MAX_VALUE - admissionsSkipped);
+        var result = new MergeResult(admitted.count(), advanced, ignored + admitted.skipped());
+        return new ExchangeMerge(result, senderAdmission(evidence, admitted.senderSkipped()));
+    }
+
+    /** What merging one record would do, judged against the table as it stands. Throws on a conflicting version. */
+    private Decision decide(MemberRecord incoming, long now, Evidence evidence) {
+        Entry known = entries.get(incoming.key());
+        if (incoming.key().equals(localKey)) { return fromLocal(incoming, known.record()); }
+        if (known != null) { return fromKnown(incoming, known, now); }
+        return fromUnknown(incoming, now, evidence.isDirect(incoming.key()));
+    }
+
+    /** Peers forward copies of this process's own record, which only it may change; one that would replace it conflicts. */
+    private static Decision fromLocal(MemberRecord incoming, MemberRecord local) {
+        // Peers can still forward the last ALIVE version after this owner publishes LEFT.
+        boolean staleAlive = local.state() == LEFT && incoming.state() == ALIVE && incoming.heartbeat() <= local.heartbeat();
+        if (!staleAlive && !incoming.equals(local) && incoming.heartbeat() >= local.heartbeat()) { throw conflict(incoming.key()); }
+        return SKIP;
+    }
+
+    /**
+     * A departure is final. Otherwise a LEFT record or a newer heartbeat advances the member, keeping its last direct
+     * success, and keeping its endpoint verified only if the endpoint is unchanged. A record at the same heartbeat must
+     * match the one held.
+     */
+    private static Decision fromKnown(MemberRecord incoming, Entry known, long now) {
+        MemberRecord previous = known.record();
+        if (previous.state() == LEFT) {
+            if (incoming.state() == LEFT && incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) {
+                throw conflict(incoming.key());
+            }
+            return new Keep(known);
+        }
+        if (incoming.state() == LEFT || incoming.heartbeat() > previous.heartbeat()) {
+            boolean stillVerified = known.endpointVerified() && previous.sameEndpoint(incoming);
+            return new Advance(new Entry(incoming, now, known.lastDirectSuccess(), stillVerified, now));
+        }
+        if (incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) { throw conflict(incoming.key()); }
+        return new Keep(known);
+    }
+
+    /**
+     * A member the table does not hold. If it was removed, its tombstone keeps out a departed member and stale copies:
+     * an older version, or the same version unless it comes directly from the member. Readmitting the version the
+     * tombstone remembers keeps its activity time, so it does not count as fresh evidence.
+     */
+    private Decision fromUnknown(MemberRecord incoming, long now, boolean direct) {
+        Suppression tombstone = suppressions.get(incoming.key());
+        if (tombstone != null) {
+            boolean sameVersion = incoming.heartbeat() == tombstone.heartbeat();
+            if (sameVersion && incoming.state() == tombstone.state() && !incoming.fingerprint().equals(tombstone.fingerprint())) {
+                throw conflict(incoming.key());
+            }
+            boolean departedForGood = tombstone.state() == LEFT;
+            boolean staleCopy = incoming.state() == ALIVE
+                    && (incoming.heartbeat() < tombstone.heartbeat() || (sameVersion && !direct));
+            if (departedForGood || staleCopy) { return SKIP; }
+        }
+        boolean remembered = tombstone != null && incoming.state() == ALIVE && incoming.heartbeat() == tombstone.heartbeat();
+        return new Admit(new Entry(incoming, remembered ? tombstone.lastAdvance() : now, null, false, now));
+    }
+
+    /** A peer this process dialled, still ALIVE at the endpoint it answered on, gains direct-success evidence. */
+    private static Entry withDirectEvidence(Entry entry, MemberRecord incoming, Evidence evidence, long now) {
+        if (!evidence.isDirect(incoming.key()) || entry.record().state() != ALIVE || !entry.record().sameEndpoint(incoming)) {
+            return entry;
+        }
+        return new Entry(entry.record(), entry.lastAdvance(), now, true, entry.stateSince());
+    }
+
+    /**
+     * Admits new keys while there is room, retained identities before new ones. A live member needs an active slot and
+     * a new identity a retained-identity slot; a record that finds no room is skipped.
+     */
+    private Admitted admit(Map<MemberKey, Entry> admissions, Evidence evidence) {
+        if (admissions.isEmpty()) { return Admitted.NONE; }
         // Only admitting new keys needs the live count, so a batch of known members skips this pass over the table.
-        long active = admissions.isEmpty() ? 0
-                : entries.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
+        long active = entries.values().stream().filter(entry -> entry.record().state() == ALIVE).count();
         long identities = (long) entries.size() + suppressions.size();
-        var orderedAdmissions = new ArrayList<>(admissions.entrySet());
-        // Restore known retained identities before spending remaining slots on genuinely new keys.
-        orderedAdmissions.sort(Comparator.comparing(entry -> !suppressions.containsKey(entry.getKey())));
-        for (var admission : orderedAdmissions) {
+        var ordered = new ArrayList<>(admissions.entrySet());
+        ordered.sort(Comparator.comparing(admission -> !suppressions.containsKey(admission.getKey())));
+        int count = 0;
+        int skipped = 0;
+        boolean senderSkipped = false;
+        for (var admission : ordered) {
             boolean alive = admission.getValue().record().state() == ALIVE;
             boolean newIdentity = !suppressions.containsKey(admission.getKey());
             if ((alive && active >= config.maxMembers()) || (newIdentity && identities >= config.maxRecords())) {
-                ignored++;
                 skipped++;
-                senderSkipped |= admission.getKey().equals(sender);
+                senderSkipped |= evidence.isSender(admission.getKey());
                 continue;
             }
             entries.put(admission.getKey(), admission.getValue());
             suppressions.remove(admission.getKey());
-            admitted++;
+            count++;
             if (alive) { active++; }
             if (newIdentity) { identities++; }
         }
-        admissionsSkipped += Math.min(skipped, Long.MAX_VALUE - admissionsSkipped);
-        var admission = entries.containsKey(sender) ? Admission.ADMITTED
-                : senderSkipped ? Admission.CAPACITY : Admission.IGNORED;
-        return new ExchangeMerge(new MergeResult(admitted, advanced, ignored), admission);
+        return new Admitted(count, skipped, senderSkipped);
+    }
+
+    /** How an inbound exchange's sender fared: admitted if the table now holds it, otherwise skipped for capacity or ignored. */
+    private Admission senderAdmission(Evidence evidence, boolean senderSkipped) {
+        if (!(evidence instanceof FromSender(var sender))) { return Admission.IGNORED; }
+        if (entries.containsKey(sender)) { return Admission.ADMITTED; }
+        return senderSkipped ? Admission.CAPACITY : Admission.IGNORED;
     }
 
     /** Periodic expiry is explicit so rejected merges cannot mutate the table by pruning it. */
@@ -296,7 +343,7 @@ public final class MembershipTable {
 
     /** Server IDs with more than one reachable boot ID; cheaper than a snapshot when only this is needed. */
     public synchronized Set<String> identityConflicts() {
-        return Set.copyOf(conflicts(assessments(clock.getAsLong())));
+        return Set.copyOf(conflicts(assessed(clock.getAsLong())));
     }
 
     /** Every record but the local one, in table order: what a batch can forward, without a snapshot's assessments. */
@@ -311,14 +358,14 @@ public final class MembershipTable {
 
     public synchronized Snapshot snapshot() {
         long now = clock.getAsLong();
-        var assessments = assessments(now);
-        var conflicts = conflicts(assessments);
-        var members = new ArrayList<MemberView>(entries.size());
+        var assessed = assessed(now);
+        var conflicts = conflicts(assessed);
+        var members = new ArrayList<MemberView>(assessed.size());
         int active = 0;
-        int index = 0;
-        for (Entry entry : entries.values()) {
+        for (var item : assessed) {
+            Entry entry = item.entry();
             if (entry.record().state() == ALIVE) { active++; }
-            members.add(new MemberView(entry.record(), assessments.get(index++), age(now, entry.lastAdvance()),
+            members.add(new MemberView(entry.record(), item.assessment(), age(now, entry.lastAdvance()),
                     entry.lastDirectSuccess() == null ? null : age(now, entry.lastDirectSuccess()),
                     entry.endpointVerified(), conflicts.contains(entry.record().key().serverId())));
         }
@@ -326,19 +373,18 @@ public final class MembershipTable {
                 entries.size() + suppressions.size(), suppressions.size(), admissionsSkipped);
     }
 
-    /** Each entry's assessment at {@code now}, in table order, computed once per caller. */
-    private List<Assessment> assessments(long now) {
-        var assessments = new ArrayList<Assessment>(entries.size());
-        for (Entry entry : entries.values()) { assessments.add(assessment(entry, now)); }
-        return assessments;
+    /** Each entry with its assessment at {@code now}, in table order, computed once per caller. */
+    private List<Assessed> assessed(long now) {
+        var assessed = new ArrayList<Assessed>(entries.size());
+        for (Entry entry : entries.values()) { assessed.add(new Assessed(entry, assessment(entry, now))); }
+        return assessed;
     }
 
-    private Set<String> conflicts(List<Assessment> assessments) {
+    private static Set<String> conflicts(List<Assessed> assessed) {
         var reachableCounts = new HashMap<String, Integer>();
-        int index = 0;
-        for (Entry entry : entries.values()) {
-            if (assessments.get(index++) == Assessment.ALIVE) {
-                reachableCounts.merge(entry.record().key().serverId(), 1, Integer::sum);
+        for (var item : assessed) {
+            if (item.assessment() == Assessment.ALIVE) {
+                reachableCounts.merge(item.entry().record().key().serverId(), 1, Integer::sum);
             }
         }
         var conflicts = new HashSet<String>();
@@ -371,4 +417,51 @@ public final class MembershipTable {
                          boolean endpointVerified, long stateSince) { }
     private record Suppression(MemberRecord.State state, long heartbeat, String fingerprint,
                                long lastAdvance, long retainedAt) { }
+    private record Assessed(Entry entry, Assessment assessment) { }
+
+    /** Where a batch comes from, which decides what evidence its records carry. */
+    private sealed interface Evidence {
+        /** Whether the record with this key is the reply of a peer this process dialled. */
+        default boolean isDirect(MemberKey key) { return false; }
+
+        /** Whether the record with this key is an inbound exchange's sender. */
+        default boolean isSender(MemberKey key) { return false; }
+    }
+
+    /** Records passed on by others: evidence of activity only. */
+    private record Forwarded() implements Evidence { }
+
+    /** An inbound exchange, whose sender learns whether it was admitted. */
+    private record FromSender(MemberKey sender) implements Evidence {
+        @Override public boolean isSender(MemberKey key) { return sender.equals(key); }
+    }
+
+    /** A reply from a peer this process dialled and checked; only that responder gains direct-success evidence. */
+    private record FromResponder(MemberRecord responder) implements Evidence {
+        @Override public boolean isDirect(MemberKey key) { return responder.key().equals(key); }
+    }
+
+    private static final Evidence FORWARDED = new Forwarded();
+
+    /** What merging one record would do. */
+    private sealed interface Decision { }
+
+    /** Nothing: a copy of this process's own record, or a removed member kept out by its tombstone. */
+    private record Skip() implements Decision { }
+
+    /** No new version. The entry held stays, though a direct reply can still refresh its evidence. */
+    private record Keep(Entry entry) implements Decision { }
+
+    /** A newer version of a member the table holds. */
+    private record Advance(Entry entry) implements Decision { }
+
+    /** A member the table does not hold, admitted if there is room. */
+    private record Admit(Entry entry) implements Decision { }
+
+    private static final Decision SKIP = new Skip();
+
+    /** What admission did: how many it admitted and skipped, and whether it skipped the sender. */
+    private record Admitted(int count, int skipped, boolean senderSkipped) {
+        static final Admitted NONE = new Admitted(0, 0, false);
+    }
 }
