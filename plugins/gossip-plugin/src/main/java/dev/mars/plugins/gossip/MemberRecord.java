@@ -43,7 +43,15 @@ public final class MemberRecord {
     public enum State { ALIVE, LEFT }
     public static final int MAX_METADATA_BYTES = 4096;
     public static final int MAX_METADATA_DEPTH = 16;
-    private static final Set<String> FIELDS = Set.of("serverId", "bootId", "host", "port", "heartbeat", "state", "metadata");
+    // The record's fields as peers send them.
+    private static final String SERVER_ID = "serverId";
+    private static final String BOOT_ID = "bootId";
+    private static final String HOST = "host";
+    private static final String PORT = "port";
+    private static final String HEARTBEAT = "heartbeat";
+    private static final String STATE = "state";
+    private static final String METADATA = "metadata";
+    private static final Set<String> FIELDS = Set.of(SERVER_ID, BOOT_ID, HOST, PORT, HEARTBEAT, STATE, METADATA);
     /**
      * Metadata is read back through the host codec only when it holds a number at least this long. Within the
      * metadata limits, the codec's number-length limit (1,000 characters by default) is the only one reachable.
@@ -68,7 +76,8 @@ public final class MemberRecord {
     private volatile GossipConfig.Seed endpoint;
     private volatile Map<String, Object> wire;
 
-    public MemberRecord(MemberKey key, String host, int port, long heartbeat, State state, Map<String, Object> metadata) {
+    public MemberRecord(MemberKey key, String host, int port, long heartbeat, State state,
+            Map<String, Object> metadata) {
         if (key == null || !GossipValidation.validHost(host) || port < 1 || port > 65535
                 || heartbeat < 0 || state == null || metadata == null) {
             throw invalid("Member requires identity, host, port 1-65535, nonnegative heartbeat, state, and metadata");
@@ -114,14 +123,16 @@ public final class MemberRecord {
         if (!(value instanceof Map<?, ?> fields) || !fields.keySet().equals(FIELDS)) {
             throw invalid("Member record requires exactly: " + FIELDS);
         }
-        MemberKey key = MemberKey.fromWire(string(fields, "serverId"), string(fields, "bootId"));
+        MemberKey key = MemberKey.fromWire(string(fields, SERVER_ID), string(fields, BOOT_ID));
         State state;
-        try { state = State.valueOf(string(fields, "state")); }
+        try { state = State.valueOf(string(fields, STATE)); }
         catch (IllegalArgumentException e) { throw invalid("state must be ALIVE or LEFT"); }
-        if (!(fields.get("metadata") instanceof Map<?, ?> metadata)) { throw invalid("metadata must be an object"); }
+        if (!(fields.get(METADATA) instanceof Map<?, ?> metadata)) { throw invalid("metadata must be an object"); }
         // The constructor copies the metadata and checks every key and value, so the cast is never trusted.
-        return new MemberRecord(key, string(fields, "host"), (int) GossipValidation.exactLong(fields.get("port"), "port", 1, 65535),
-                GossipValidation.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
+        return new MemberRecord(key, string(fields, HOST),
+                (int) GossipValidation.exactLong(fields.get(PORT), PORT, 1, 65535),
+                GossipValidation.exactLong(fields.get(HEARTBEAT), HEARTBEAT, 0, Long.MAX_VALUE), state,
+                (Map<String, Object>) metadata);
     }
 
     /** The record's fields for JSON, built once: every exchange that carries the record sends the same map. */
@@ -129,13 +140,13 @@ public final class MemberRecord {
         var fields = wire;
         if (fields == null) {
             var built = new LinkedHashMap<String, Object>();
-            built.put("serverId", key.serverId());
-            built.put("bootId", key.bootId().toString());
-            built.put("host", host);
-            built.put("port", port);
-            built.put("heartbeat", heartbeat);
-            built.put("state", state.name());
-            built.put("metadata", metadata);
+            built.put(SERVER_ID, key.serverId());
+            built.put(BOOT_ID, key.bootId().toString());
+            built.put(HOST, host);
+            built.put(PORT, port);
+            built.put(HEARTBEAT, heartbeat);
+            built.put(STATE, state.name());
+            built.put(METADATA, metadata);
             fields = Collections.unmodifiableMap(built);
             wire = fields;
         }
@@ -156,18 +167,25 @@ public final class MemberRecord {
         return digest;
     }
 
-    /** This member as a peer endpoint, built once: selection asks for it every round, and its fields are already valid. */
+    /**
+     * This member as a peer endpoint, built once: selection asks for it every round, and its fields are already valid.
+     */
     GossipConfig.Seed endpoint() {
         var seed = endpoint;
-        if (seed == null) { seed = new GossipConfig.Seed(key.serverId(), host, port); endpoint = seed; }
+        if (seed == null) {
+            seed = new GossipConfig.Seed(key.serverId(), host, port);
+            endpoint = seed;
+        }
         return seed;
     }
 
     boolean sameEndpoint(MemberRecord other) { return host.equals(other.host) && port == other.port; }
 
     @Override public boolean equals(Object other) {
-        return this == other || other instanceof MemberRecord record && port == record.port && heartbeat == record.heartbeat
-                && key.equals(record.key) && host.equals(record.host) && state == record.state && metadata.equals(record.metadata);
+        return this == other || other instanceof MemberRecord record && port == record.port
+                && heartbeat == record.heartbeat
+                && key.equals(record.key) && host.equals(record.host) && state == record.state
+                && metadata.equals(record.metadata);
     }
 
     @Override public int hashCode() { return Objects.hash(key, host, port, heartbeat, state, metadata); }
@@ -197,13 +215,19 @@ public final class MemberRecord {
 
     private static Object freeze(Object value, int depth, Budget budget) {
         requireDepth(depth);
-        if (value == null) { budget.take(4); return null; }
+        if (value == null) {
+            budget.take(4);
+            return null;
+        }
         if (value instanceof String text) {
             budget.take((long) text.length() + 2);
             requireUnicode(text);
             return text;
         }
-        if (value instanceof Boolean bool) { budget.take(bool ? 4 : 5); return bool; }
+        if (value instanceof Boolean bool) {
+            budget.take(bool ? 4 : 5);
+            return bool;
+        }
         if (value instanceof Map<?, ?> map) { return freezeObject(map, depth, budget); }
         if (value instanceof List<?> list) {
             budget.take(2);
@@ -217,7 +241,8 @@ public final class MemberRecord {
         if (value instanceof BigInteger integer) {
             if (integer.bitLength() > MAX_METADATA_BYTES * 4) { throw invalid("metadata integer is too large"); }
             number = integer;
-        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer
+                || value instanceof Long) {
             number = BigInteger.valueOf(((Number) value).longValue());
         } else if (value instanceof BigDecimal decimal) {
             number = canonicalDecimal(decimal);
@@ -269,7 +294,9 @@ public final class MemberRecord {
         try {
             String json = Json.write(metadata);
             int bytes = json.getBytes(StandardCharsets.UTF_8).length;
-            if (bytes > MAX_METADATA_BYTES) { throw invalid("metadata exceeds " + MAX_METADATA_BYTES + " UTF-8 bytes"); }
+            if (bytes > MAX_METADATA_BYTES) {
+                throw invalid("metadata exceeds " + MAX_METADATA_BYTES + " UTF-8 bytes");
+            }
             // Reading back is the costliest step, and only a long number can fail it within these limits.
             if (longestNumber >= READ_BACK_NUMBER_LENGTH) { Json.read(json); }
             return bytes;
@@ -297,7 +324,9 @@ public final class MemberRecord {
         return digits;
     }
 
-    private static MembershipException invalid(String message) { return new MembershipException(INVALID_RECORD, message); }
+    private static MembershipException invalid(String message) {
+        return new MembershipException(INVALID_RECORD, message);
+    }
 
     /** Cheap allocation bound before exact UTF-8 serialization (escaping can use more bytes). */
     private static final class Budget {

@@ -52,6 +52,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -224,7 +225,7 @@ class GossipTransportTest {
              })) {
             var result = transport.exchange(peer.endpoint());
             assertEquals(1, result.gossipVersion());
-            assertNull(result.senderAdmission());
+            assertEquals(Optional.empty(), result.senderAdmission());
             assertEquals(2, attempts.size());
             assertNotEquals(attempts.getFirst().messageId(), attempts.getLast().messageId());
             assertEquals(attempts.getFirst().parameters().get("members"), attempts.getLast().parameters().get("members"));
@@ -274,7 +275,7 @@ class GossipTransportTest {
             clock.addAndGet(1);
             var current = transport.exchange(peer.endpoint());
             assertEquals(2, current.gossipVersion(), "The upgraded peer is offered version 2 again");
-            assertEquals(MembershipTable.Admission.ADMITTED, current.senderAdmission());
+            assertEquals(Optional.of(MembershipTable.Admission.ADMITTED), current.senderAdmission());
             assertEquals(List.of(2, 1, 1, 2), versions);
             assertEquals(0, transport.version1PeerCount());
         }
@@ -584,7 +585,7 @@ class GossipTransportTest {
             var reply = first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort()));
             assertEquals("Server-B", reply.sender().key().serverId());
             assertEquals(2, reply.gossipVersion());
-            assertEquals(MembershipTable.Admission.CAPACITY, reply.senderAdmission());
+            assertEquals(Optional.of(MembershipTable.Admission.CAPACITY), reply.senderAdmission());
             var status = GossipCommandsTest.execute(first, Map.of("operation", "status"));
             assertEquals(false, status.get("isolated"));
             assertEquals(2, ((Map<?, ?>) status.get("capacity")).get("retainedIdentities"));

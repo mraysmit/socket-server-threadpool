@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -42,11 +43,34 @@ class GossipWireTest {
     @ParameterizedTest @EnumSource(MembershipTable.Admission.class)
     void versionTwoDecodesEachAdmissionOutcomeAndVersionOneHasUnknownAdmission(MembershipTable.Admission admission) {
         var modern = wire.decode(wire.result(peer, List.of(), 2, admission), false);
-        assertEquals(admission, modern.senderAdmission());
+        assertEquals(Optional.of(admission), modern.senderAdmission());
         assertEquals(2, modern.gossipVersion());
         var legacy = wire.decode(wire.result(peer, List.of()), false);
         assertEquals(1, legacy.gossipVersion());
-        assertNull(legacy.senderAdmission(), "Legacy success must not imply admission");
+        assertEquals(Optional.empty(), legacy.senderAdmission(), "Legacy success must not imply admission");
+    }
+
+    @Test void onlyAnExchangeRequestIsDecodedAsOne() {
+        var request = new LinkedHashMap<>(wire.parameters(peer, List.of()));
+        request.put("operation", "members");
+        assertEquals("operation must be exchange", assertThrows(MembershipException.class, () -> wire.decode(request, true)).getMessage());
+    }
+
+    @Test void aBatchOverTheLimitIsRefusedBeforeAnyMemberIsDecoded() {
+        // With max.batch.members at 4, a sender and three members fit.
+        var three = List.of(GossipCommandsTest.member("A", 3), GossipCommandsTest.member("B", 4), GossipCommandsTest.member("C", 5));
+        assertEquals(3, wire.decode(wire.parameters(peer, three), true).members().size());
+        // Four members, none of them a record: the limit must be checked before any is decoded.
+        var four = new LinkedHashMap<>(wire.parameters(peer, three));
+        four.put("members", List.of("not", "a", "member", "record"));
+        assertEquals("Sender and members exceed max.batch.members",
+                assertThrows(MembershipException.class, () -> wire.decode(four, true)).getMessage());
+    }
+
+    @Test void anExchangeThatIsNotAnObjectIsAProtocolFailure() {
+        for (Object value : List.of(List.of(), "exchange", 1)) {
+            assertEquals(GossipFailure.PROTOCOL, GossipFailure.of(assertThrows(MembershipException.class, () -> wire.decode(value, false))));
+        }
     }
 
     @Test void missingMalformedAndUnexpectedAdmissionFieldsAreRejectedBeforeAnyMerge() {

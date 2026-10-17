@@ -32,6 +32,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.UUID;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -171,8 +172,8 @@ class GossipRuntimeTest {
                 var responder = PeerSelectorTest.record(peer.serverId(), 2, peer.port());
                 table.mergeDirect(responder, List.of());
                 metrics.success(true);
-                return new GossipWire.Exchange(responder, List.of(), 2, peer.serverId().equals("A")
-                        ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED);
+                return new GossipWire.Exchange(responder, List.of(), 2, Optional.of(peer.serverId().equals("A")
+                        ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED));
             }
             @Override public void close() { /* Nothing to release. */ }
         };
@@ -333,7 +334,7 @@ class GossipRuntimeTest {
                 var responder = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
                         1, MemberRecord.State.ALIVE, Map.of());
                 table.mergeDirect(responder, List.of());
-                return new GossipWire.Exchange(responder, List.of(), 1, null);
+                return new GossipWire.Exchange(responder, List.of(), 1, Optional.empty());
             }
             @Override public void close() { /* Nothing to release. */ }
         };
@@ -398,7 +399,7 @@ class GossipRuntimeTest {
             try { if (block) { release.await(); } }
             catch (InterruptedException _) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             if (fail) { throw new IOException("Unavailable fixture peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, null);
+            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, Optional.empty());
         }
         @Override public void close() { closed = true; release.countDown(); }
     }

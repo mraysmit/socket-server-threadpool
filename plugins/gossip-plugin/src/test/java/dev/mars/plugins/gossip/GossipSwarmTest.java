@@ -165,6 +165,7 @@ class GossipSwarmTest {
 
     static List<Map<?, ?>> members(GossipPlugin plugin) throws Exception {
         var rows = new ArrayList<Map<?, ?>>();
+        var cursors = new java.util.HashSet<Object>();
         Object cursor = null;
         do {
             var parameters = new java.util.LinkedHashMap<String, Object>(Map.of("operation", "members"));
@@ -172,6 +173,8 @@ class GossipSwarmTest {
             var page = (Map<?, ?>) plugin.execute(parameters);
             for (Object row : (List<?>) page.get("members")) { rows.add((Map<?, ?>) row); }
             cursor = page.get("nextCursor");
+            // A cursor that comes round again would page forever, so fail instead of hanging the build.
+            if (cursor != null) { assertTrue(cursors.add(cursor), "Members cursor repeated"); }
         } while (cursor != null);
         return rows;
     }

@@ -17,19 +17,21 @@ package dev.mars.plugins.gossip;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.OptionalLong;
+
 import static org.junit.jupiter.api.Assertions.*;
 
 class GossipMetricsTest {
     @Test void agesAreUnknownUntilTheFirstRoundAndSuccessThenMeasuredFromThem() {
         var metrics = new GossipMetrics();
         assertTrue(metrics.isolated());
-        assertNull(metrics.lastSuccessAgeMillis());
+        assertEquals(OptionalLong.empty(), metrics.lastSuccessAgeMillis());
         assertTrue(metrics.runtime().containsKey("lastRoundAgeMillis"));
         assertNull(metrics.runtime().get("lastRoundAgeMillis"));
         metrics.success(true);
         metrics.lastRound = System.nanoTime();
         assertFalse(metrics.isolated());
-        assertTrue(metrics.lastSuccessAgeMillis() >= 0);
+        assertTrue(metrics.lastSuccessAgeMillis().getAsLong() >= 0);
         assertTrue((Long) metrics.runtime().get("lastRoundAgeMillis") >= 0);
     }
 
@@ -38,7 +40,7 @@ class GossipMetricsTest {
         metrics.success(true);
         metrics.lastRound = System.nanoTime();
         Thread.sleep(25);
-        long success = metrics.lastSuccessAgeMillis();
+        long success = metrics.lastSuccessAgeMillis().getAsLong();
         long round = (Long) metrics.runtime().get("lastRoundAgeMillis");
         // At least the time slept, and nowhere near the 25,000 it would read if counted in microseconds.
         assertTrue(success >= 20 && success < 10_000, "success age " + success);

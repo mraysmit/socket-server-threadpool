@@ -17,7 +17,9 @@ package dev.mars.plugins.gossip;
 
 import java.io.IOException;
 
-/** An exchange failure the transport detected itself. It carries its metrics category, so nothing parses its message. */
+/**
+ * An exchange failure the transport detected itself. It carries its metrics category, so nothing parses its message.
+ */
 final class GossipExchangeException extends IOException {
     private final GossipFailure kind;
 

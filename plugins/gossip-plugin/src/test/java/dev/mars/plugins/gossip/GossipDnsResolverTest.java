@@ -190,6 +190,41 @@ class GossipDnsResolverTest {
         } finally { release.countDown(); }
     }
 
+    @Test void aLookupThatFinishesAfterItsCallerGaveUpStillCachesItsAnswer() throws Exception {
+        var release = new CountDownLatch(1);
+        try (var resolver = new GossipDnsResolver(4, 1, Duration.ofMillis(150), System::nanoTime, host -> {
+                 lookups.add(Thread.currentThread());
+                 return ignoringInterrupts(release);
+             })) {
+            var peer = new GossipConfig.Seed("Peer", "slow.test", 9000);
+            assertThrows(SocketTimeoutException.class, () -> resolver.resolveAll(peer));
+            release.countDown();
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
+            // The answer came after its caller had gone. The next request must use it rather than look the host up again,
+            // just as a request arriving while another caller is still storing an answer must.
+            assertEquals("127.0.0.1", resolver.resolveAll(peer).getFirst().host());
+            assertEquals(1, lookups.size(), "One lookup for one host");
+        } finally { release.countDown(); }
+    }
+
+    @Test void aClosedResolverKeepsNoAnswerFromALookupThatFinishesLate() throws Exception {
+        var release = new CountDownLatch(1);
+        var resolver = new GossipDnsResolver(4, 1, Duration.ofMillis(150), System::nanoTime, host -> {
+            lookups.add(Thread.currentThread());
+            return ignoringInterrupts(release);
+        });
+        try {
+            assertThrows(SocketTimeoutException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "late.test", 9000)));
+            resolver.close();
+            release.countDown();
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
+            assertEquals(0, resolver.cacheSize(), "A closed resolver keeps nothing");
+        } finally {
+            release.countDown();
+            resolver.close();
+        }
+    }
+
     @Test void timeoutAndInvalidRepliesLeaveNoHelpersOrPoisonedCacheEntries() throws Exception {
         try (var resolver = new GossipDnsResolver(4, 2, Duration.ofMillis(150), System::nanoTime, this::launch)) {
             assertThrows(SocketTimeoutException.class, () -> resolver.resolveAll(new GossipConfig.Seed("Peer", "stall.test", 9000)).getFirst());

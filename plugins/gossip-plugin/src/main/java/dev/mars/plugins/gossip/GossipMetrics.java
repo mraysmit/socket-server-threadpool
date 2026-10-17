@@ -17,6 +17,7 @@ package dev.mars.plugins.gossip;
 
 import java.util.Map;
 import java.util.LinkedHashMap;
+import java.util.OptionalLong;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.TimeUnit;
 
@@ -33,7 +34,7 @@ final class GossipMetrics {
     volatile int dnsHelpers;
     volatile int retryingPeers;
     // Marks a time not yet taken, so recording one boxes nothing; a nanoTime reading of exactly this value would only
-    // read as unknown until the next.
+    // read as unknown until the next. It never leaves this class: ages are reported as OptionalLong.
     private static final long NEVER = Long.MIN_VALUE;
     volatile long lastRound = NEVER;
     private volatile long lastSuccess = NEVER;
@@ -59,7 +60,7 @@ final class GossipMetrics {
         result.put("workers", workers);
         result.put("dnsHelpers", dnsHelpers);
         result.put("retryingPeers", retryingPeers);
-        result.put("lastRoundAgeMillis", ageMillis(lastRound));
+        result.put("lastRoundAgeMillis", GossipWire.orNull(ageMillis(lastRound)));
         result.put("failures", kinds);
         return result;
     }
@@ -70,10 +71,14 @@ final class GossipMetrics {
     }
 
     boolean isolated() { return lastSuccess == NEVER; }
-    Long lastSuccessAgeMillis() { return ageMillis(lastSuccess); }
+    OptionalLong lastSuccessAgeMillis() { return ageMillis(lastSuccess); }
 
-    /** Milliseconds since a nanoTime reading, or null if none has been taken. */
-    private static Long ageMillis(long then) { return then == NEVER ? null : TimeUnit.NANOSECONDS.toMillis(Math.max(0, System.nanoTime() - then)); }
+    /** Milliseconds since a nanoTime reading, or empty if none has been taken. */
+    private static OptionalLong ageMillis(long then) {
+        return then == NEVER
+                ? OptionalLong.empty() : OptionalLong.of(TimeUnit.NANOSECONDS.toMillis(Math.max(0,
+                System.nanoTime() - then)));
+    }
     Map<String, Object> counts(int inflight) {
         return Map.of("inbound", inbound.get(), "outbound", outbound.get(), "outboundFailures", outboundFailures.get(),
                 "rejected", rejectedExchanges.get(), "inflight", inflight);

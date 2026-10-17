@@ -34,7 +34,9 @@ enum GossipFailure {
             if (cause instanceof CharacterCodingException) { return PROTOCOL; }
             if (cause instanceof GossipExchangeException exchange) { return exchange.kind(); }
             if (cause instanceof MembershipException member) { return member.kind(); }
-            if (cause instanceof CommandExecutionException remote) { return ofRemote(remote.reply().error().message()); }
+            if (cause instanceof CommandExecutionException remote) {
+                return ofRemote(remote.reply().error().message());
+            }
         }
         return NETWORK;
     }

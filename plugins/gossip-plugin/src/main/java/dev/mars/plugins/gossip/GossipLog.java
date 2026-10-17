@@ -56,7 +56,9 @@ final class GossipLog {
 
     void roundFailure(RuntimeException failure) {
         long suppressed = permit(Repeated.ROUND_FAILED);
-        if (suppressed >= 0) { emit("WARN", "ROUND_FAILED", " | error=" + error(failure) + " | suppressed=" + suppressed); }
+        if (suppressed >= 0) {
+            emit("WARN", "ROUND_FAILED", " | error=" + error(failure) + " | suppressed=" + suppressed);
+        }
     }
 
     void cleanupFailure(String resource, Throwable failure) {
@@ -89,7 +91,9 @@ final class GossipLog {
     }
 
     private void emit(String level, String event, String details) {
-        try { sink.accept("[" + Instant.now() + "] " + level + " | plugin=gossip | event=" + event + context + details); }
+        try {
+            sink.accept("[" + Instant.now() + "] " + level + " | plugin=gossip | event=" + event + context + details);
+        }
         catch (RuntimeException unavailable) { /* Diagnostic output must not replace protocol or cleanup failures. */ }
     }
 
@@ -101,7 +105,10 @@ final class GossipLog {
         String text = value == null ? "-" : value;
         var escaped = new StringBuilder();
         for (int i = 0; i < text.length(); i++) {
-            if (escaped.length() >= FIELD_LIMIT) { escaped.append("..."); break; }
+            if (escaped.length() >= FIELD_LIMIT) {
+                escaped.append("...");
+                break;
+            }
             char character = text.charAt(i);
             if (character == '\\') { escaped.append("\\\\"); }
             else if (character == '|') { escaped.append("\\u007c"); }

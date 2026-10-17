@@ -27,11 +27,28 @@ import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
 
+import static dev.mars.plugins.gossip.GossipFields.ACTIVE_MEMBERS;
+import static dev.mars.plugins.gossip.GossipFields.ADMISSIONS_SKIPPED;
+import static dev.mars.plugins.gossip.GossipFields.CAPACITY;
+import static dev.mars.plugins.gossip.GossipFields.CURSOR;
+import static dev.mars.plugins.gossip.GossipFields.EXCHANGE_OPERATION;
+import static dev.mars.plugins.gossip.GossipFields.GOSSIP_VERSION;
+import static dev.mars.plugins.gossip.GossipFields.LIMIT;
+import static dev.mars.plugins.gossip.GossipFields.OPERATION;
+import static dev.mars.plugins.gossip.GossipFields.RETAINED_IDENTITIES;
+import static dev.mars.plugins.gossip.GossipFields.SELF;
+import static dev.mars.plugins.gossip.GossipFields.SWARM_ID;
+import static dev.mars.plugins.gossip.GossipFields.TOMBSTONES;
+
 /** Handlers validate, merge, inspect, or request asynchronous departure. Never dial peers here. */
 final class GossipCommands {
-    private static final Pattern CURSOR = Pattern.compile("[A-Za-z0-9_-]+");
+    private static final Pattern CURSOR_CHARACTERS = Pattern.compile("[A-Za-z0-9_-]+");
     private static final Pattern OFFSET = Pattern.compile("\\d{1,10}");
     private static final int DEFAULT_PAGE_LIMIT = 32; // Rows in a members page when the caller sets no limit.
+    // The operations besides an exchange.
+    private static final String MEMBERS_OPERATION = "members";
+    private static final String STATUS_OPERATION = "status";
+    private static final String LEAVE_OPERATION = "leave";
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -42,7 +59,8 @@ final class GossipCommands {
     private final String serverId;
     private final GossipBatchSelector responses = new GossipBatchSelector();
 
-    GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport, GossipRuntime runtime) {
+    GossipCommands(GossipConfig config, MembershipTable table, GossipMetrics metrics, GossipTransport transport,
+            GossipRuntime runtime) {
         this.config = config;
         this.table = table;
         this.metrics = metrics;
@@ -66,17 +84,18 @@ final class GossipCommands {
     }
 
     Object execute(Map<String, Object> parameters) throws InvalidParametersException {
-        String operation = PluginParameters.string(parameters, "operation");
+        String operation = PluginParameters.string(parameters, OPERATION);
         try {
             return switch (operation) {
-                case "exchange" -> exchange(parameters);
-                case "members" -> members(parameters);
-                case "leave" -> operationOnly(parameters, () -> Map.of("departure", runtime.leave()));
-                case "status" -> operationOnly(parameters, this::status);
-                default -> throw new InvalidParametersException("Supported operations: exchange, members, status, leave");
+                case EXCHANGE_OPERATION -> exchange(parameters);
+                case MEMBERS_OPERATION -> members(parameters);
+                case LEAVE_OPERATION -> operationOnly(parameters, () -> Map.of("departure", runtime.leave()));
+                case STATUS_OPERATION -> operationOnly(parameters, this::status);
+                default ->
+                        throw new InvalidParametersException("Supported operations: exchange, members, status, leave");
             };
         } catch (MembershipException e) {
-            if (operation.equals("exchange")) { metrics.rejectedExchanges.incrementAndGet(); }
+            if (operation.equals(EXCHANGE_OPERATION)) { metrics.rejectedExchanges.incrementAndGet(); }
             throw new InvalidParametersException(e.reason() + ": " + e.getMessage());
         }
     }
@@ -84,7 +103,7 @@ final class GossipCommands {
     /** For operations that take no parameters besides their name; exchange and members check their own replies. */
     private Object operationOnly(Map<String, Object> parameters, java.util.function.Supplier<Object> result)
             throws InvalidParametersException {
-        PluginParameters.requireKeys(parameters, "operation");
+        PluginParameters.requireKeys(parameters, OPERATION);
         var reply = result.get();
         wire.requireReplyFits(serverId, reply);
         return reply;
@@ -96,7 +115,8 @@ final class GossipCommands {
         MembershipTable.ExchangeMerge merge;
         try {
             if (incoming.sender().key().equals(self.key())) {
-                throw new MembershipException(MembershipException.Reason.CONFLICT, "Exchange sender must not be the local process");
+                throw new MembershipException(MembershipException.Reason.CONFLICT,
+                        "Exchange sender must not be the local process");
             }
             wire.requireForwardable(self, incoming.records());
             merge = table.mergeExchange(incoming.sender(), incoming.members());
@@ -119,13 +139,13 @@ final class GossipCommands {
     }
 
     private Object members(Map<String, Object> parameters) {
-        if (!Set.of("operation", "limit", "cursor").containsAll(parameters.keySet())) {
+        if (!Set.of(OPERATION, LIMIT, CURSOR).containsAll(parameters.keySet())) {
             throw MembershipException.invalidRecord("Unknown members parameter");
         }
-        int limit = parameters.containsKey("limit") ? GossipValidation.exactInteger(parameters.get("limit"), "limit", 1,
+        int limit = parameters.containsKey(LIMIT) ? GossipValidation.exactInteger(parameters.get(LIMIT), LIMIT, 1,
                 config.maxBatchMembers()) : Math.min(DEFAULT_PAGE_LIMIT, config.maxBatchMembers());
         var snapshot = table.snapshot();
-        int start = parameters.containsKey("cursor") ? decodeCursor(parameters.get("cursor"), snapshot.self().key()) : 0;
+        int start = parameters.containsKey(CURSOR) ? decodeCursor(parameters.get(CURSOR), snapshot.self().key()) : 0;
         return membersPage(snapshot, start, limit);
     }
 
@@ -144,7 +164,9 @@ final class GossipCommands {
             int rowBytes = GossipWire.bytes(row).length + (rows.isEmpty() ? 0 : 1);
             if (size + rowBytes + cursorBytes(cursor(self, position + 1, members.size())) > config.maxExchangeBytes()) {
                 // Cannot happen: every record was checked as a page row, at its widest, before it was merged.
-                if (rows.isEmpty()) { throw MembershipException.invalidRecord("Single membership row exceeds the reply budget"); }
+                if (rows.isEmpty()) {
+                    throw MembershipException.invalidRecord("Single membership row exceeds the reply budget");
+                }
                 break;
             }
             rows.add(row);
@@ -155,7 +177,9 @@ final class GossipCommands {
     }
 
     /** The cursor to the page that starts at {@code next}, or none when no members are left. */
-    private static String cursor(MemberKey self, int next, int end) { return next < end ? encodeCursor(self, next) : null; }
+    private static String cursor(MemberKey self, int next, int end) {
+        return next < end ? encodeCursor(self, next) : null;
+    }
 
     /**
      * What a cursor adds to a page measured without one: its quoted string, in place of the four bytes of null. A
@@ -163,7 +187,8 @@ final class GossipCommands {
      */
     private static int cursorBytes(String cursor) { return cursor == null ? 0 : cursor.length() + 2 - "null".length(); }
 
-    private Map<String, Object> pageResult(MembershipTable.Snapshot snapshot, List<Map<String, Object>> selected, String cursor) {
+    private Map<String, Object> pageResult(MembershipTable.Snapshot snapshot, List<Map<String, Object>> selected,
+            String cursor) {
         return wire.page(snapshot.self(), selected, cursor, capacity(snapshot));
     }
 
@@ -173,17 +198,18 @@ final class GossipCommands {
         for (var assessment : MembershipTable.Assessment.values()) { assessments.put(assessment.name(), 0); }
         for (var member : snapshot.members()) { assessments.merge(member.assessment().name(), 1, Integer::sum); }
         var result = new LinkedHashMap<String, Object>();
-        result.put("gossipVersion", 1);
-        result.put("swarmId", config.swarmId());
-        result.put("self", snapshot.self().toWire());
+        result.put(GOSSIP_VERSION, 1);
+        result.put(SWARM_ID, config.swarmId());
+        result.put(SELF, snapshot.self().toWire());
         result.put("workerState", runtime.state().name());
         result.put("isolated", metrics.isolated());
         result.put("implementationStage", "departure-runtime");
-        result.put("supportedOperations", List.of("exchange", "members", "status", "leave"));
+        result.put("supportedOperations",
+                List.of(EXCHANGE_OPERATION, MEMBERS_OPERATION, STATUS_OPERATION, LEAVE_OPERATION));
         result.put("departure", runtime.departure());
         result.put("exchanges", metrics.counts(transport.inflight()));
-        result.put("lastSuccessfulExchangeAgeMillis", metrics.lastSuccessAgeMillis());
-        result.put("capacity", capacity(snapshot));
+        result.put("lastSuccessfulExchangeAgeMillis", GossipWire.orNull(metrics.lastSuccessAgeMillis()));
+        result.put(CAPACITY, capacity(snapshot));
         result.put("assessments", assessments);
         result.put("identityConflictCount", snapshot.identityConflicts().size());
         result.put("runtime", metrics.runtime());
@@ -191,16 +217,17 @@ final class GossipCommands {
     }
 
     private static Map<String, Object> capacity(MembershipTable.Snapshot snapshot) {
-        return Map.of("activeMembers", snapshot.activeMembers(), "retainedIdentities", snapshot.retainedIdentities(),
-                "tombstones", snapshot.tombstones(), "admissionsSkipped", snapshot.admissionsSkipped());
+        return Map.of(ACTIVE_MEMBERS, snapshot.activeMembers(), RETAINED_IDENTITIES, snapshot.retainedIdentities(),
+                TOMBSTONES, snapshot.tombstones(), ADMISSIONS_SKIPPED, snapshot.admissionsSkipped());
     }
 
     private static String encodeCursor(MemberKey self, int next) {
-        return Base64.getUrlEncoder().withoutPadding().encodeToString((self.bootId() + "/" + next).getBytes(StandardCharsets.UTF_8));
+        return Base64.getUrlEncoder().withoutPadding()
+                .encodeToString((self.bootId() + "/" + next).getBytes(StandardCharsets.UTF_8));
     }
 
     private int decodeCursor(Object value, MemberKey self) {
-        if (!(value instanceof String text) || text.length() > 128 || !CURSOR.matcher(text).matches()) {
+        if (!(value instanceof String text) || text.length() > 128 || !CURSOR_CHARACTERS.matcher(text).matches()) {
             throw MembershipException.invalidRecord("Invalid membership cursor");
         }
         String decoded;

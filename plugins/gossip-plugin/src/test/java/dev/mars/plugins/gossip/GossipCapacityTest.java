@@ -69,6 +69,7 @@ class GossipCapacityTest {
 
     static Map<MemberKey, MemberRecord> records(TextMessageClient client, GossipConfig config) throws Exception {
         var records = new LinkedHashMap<MemberKey, MemberRecord>();
+        var cursors = new java.util.HashSet<Object>();
         Object cursor = null;
         do {
             var parameters = new LinkedHashMap<String, Object>(Map.of("operation", "members"));
@@ -81,6 +82,8 @@ class GossipCapacityTest {
                 assertNull(records.put(record.key(), record), "Inspection cursor repeated a record");
             }
             cursor = page.get("nextCursor");
+            // A cursor that comes round again would page forever, so fail instead of hanging the build.
+            if (cursor != null) { assertTrue(cursors.add(cursor), "Inspection cursor repeated"); }
         } while (cursor != null);
         return records;
     }

@@ -39,6 +39,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
+import java.util.Optional;
 
 import static dev.mars.protocol.CommandError.Code.INVALID_PARAMETERS;
 import static org.junit.jupiter.api.Assertions.*;
@@ -165,12 +166,12 @@ class GossipPluginIT {
             var exchange = wire.decode(reply.result(), false);
             assertEquals("Server-B", exchange.sender().key().serverId());
             assertEquals(1, exchange.gossipVersion());
-            assertNull(exchange.senderAdmission());
+            assertEquals(Optional.empty(), exchange.senderAdmission());
             var modern = second.execute("gossip", wire.parameters(firstSelf, List.of(), 2));
-            assertEquals(MembershipTable.Admission.ADMITTED, wire.decode(modern.result(), false).senderAdmission());
+            assertEquals(Optional.of(MembershipTable.Admission.ADMITTED), wire.decode(modern.result(), false).senderAdmission());
             assertTrue(GossipWire.bytes(modern).length <= config.maxExchangeBytes());
             var full = second.execute("gossip", wire.parameters(GossipCommandsTest.member("Third", 3), List.of(), 2));
-            assertEquals(MembershipTable.Admission.CAPACITY, wire.decode(full.result(), false).senderAdmission());
+            assertEquals(Optional.of(MembershipTable.Admission.CAPACITY), wire.decode(full.result(), false).senderAdmission());
             assertTrue(GossipWire.bytes(full).length <= config.maxExchangeBytes());
             assertEquals(BigInteger.ONE, ((Map<?, ?>) status(second).get("capacity")).get("admissionsSkipped"));
             first.execute("gossip", wire.parameters(exchange.sender(), exchange.members()));

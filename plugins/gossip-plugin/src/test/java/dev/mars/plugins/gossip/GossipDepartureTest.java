@@ -31,6 +31,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -366,7 +367,7 @@ class GossipDepartureTest {
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             }
             if (peer.serverId().equals("Bad")) { throw new IOException("Unavailable peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, null);
+            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, Optional.empty());
         }
         @Override public void close() { closed = true; release.countDown(); }
     }

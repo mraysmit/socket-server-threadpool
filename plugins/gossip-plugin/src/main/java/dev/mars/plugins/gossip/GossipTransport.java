@@ -57,7 +57,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      */
     private static final Set<String> VERSION_1_REJECTIONS = Set.of(
             "INVALID_RECORD: gossipVersion must be between 1 and 1", "INVALID_RECORD: Unsupported gossipVersion");
-    /** How long a version-1 peer is sent version 1 directly before version 2 is tried again, in case it was upgraded. */
+    /**
+     * How long a version-1 peer is sent version 1 directly before version 2 is tried again, in case it was upgraded.
+     */
     static final Duration VERSION_1_RECHECK = Duration.ofMinutes(10);
     /** How often the watchdog checks whether a caller on a platform thread has been interrupted. */
     private static final long INTERRUPT_CHECK_MILLIS = 50;
@@ -90,7 +92,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     }
 
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics) {
-        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15), System::nanoTime);
+        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15),
+                System::nanoTime);
     }
 
     /** The clock times only the version-1 memory; socket deadlines always use System.nanoTime. */
@@ -123,7 +126,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      */
     @Override public GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
         var peer = endpoints.getFirst();
-        if (endpoints.stream().anyMatch(endpoint -> !endpoint.serverId().equals(peer.serverId()) || endpoint.port() != peer.port())) {
+        if (endpoints.stream()
+                .anyMatch(endpoint -> !endpoint.serverId().equals(peer.serverId()) || endpoint.port() != peer.port())) {
             throw new IllegalArgumentException("Fallback addresses must share the peer's server ID and port");
         }
         synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed"); } }
@@ -139,7 +143,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             throw new IOException("Gossip " + e.reason() + ": " + e.getMessage(), e);
         } catch (IOException e) {
             metrics.outboundFailures.incrementAndGet();
-            if (GossipFailure.of(e) == GossipFailure.IDENTITY) { log.identity(OUTBOUND, peer, conversation.messageId, e.getMessage()); }
+            if (GossipFailure.of(e) == GossipFailure.IDENTITY) {
+                log.identity(OUTBOUND, peer, conversation.messageId, e.getMessage());
+            }
             throw e;
         } finally { permits.release(); }
     }
@@ -167,7 +173,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             if (PeerSelector.isSelf(self, peer)) { throw new IOException("Cannot exchange with the local endpoint"); }
             var members = requests.select(table.peers(), config.maxBatchMembers(), wire.requestMemberBudget(self));
             // Resolve once. Every attempt and address fallback shares one deadline, which starts after resolving.
-            candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port())).toList();
+            candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port()))
+                    .toList();
             deadline = System.nanoTime() + exchangeNanos;
             int version = knownVersion1(peerKey) ? 1 : 2;
             var reply = send(self, members, version);
@@ -181,16 +188,24 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             // Remember only after a correlated, identity-checked version-1 exchange has fully succeeded.
             if (downgraded) { rememberVersion1(peerKey); }
             var conflicts = table.identityConflicts();
-            if (!conflicts.isEmpty()) { log.identity(OUTBOUND, peer, messageId, "Reachable duplicate server IDs: " + conflicts); }
+            if (!conflicts.isEmpty()) {
+                log.identity(OUTBOUND, peer, messageId, "Reachable duplicate server IDs: " + conflicts);
+            }
             return result;
         }
 
-        /** Sends one request and returns its reply, once the reply is correlated and comes from the peer it was meant for. */
+        /**
+         * Sends one request and returns its reply, once the reply is correlated and comes from the peer it was meant
+         * for.
+         */
         private CommandReply send(MemberRecord self, List<MemberRecord> members, int version) throws IOException {
             messageId = UUID.randomUUID();
-            byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.parameters(self, members, version)));
+            byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip",
+                    wire.parameters(self, members, version)));
             // The batch was chosen to fit, so this only guards against an error in that arithmetic.
-            if (payload.length > config.maxExchangeBytes()) { throw new IOException("Outgoing exchange exceeds byte budget"); }
+            if (payload.length > config.maxExchangeBytes()) {
+                throw new IOException("Outgoing exchange exceeds byte budget");
+            }
             var line = exchangeOverFirstReachable(candidates, payload, deadline);
             candidates = List.of(line.address()); // A retry reuses the address that answered.
             CommandReply reply;
@@ -207,15 +222,20 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             return reply;
         }
 
-        /** The exchange a reply carries, once the reply is a success, in the version asked for, from the sender it names. */
+        /**
+         * The exchange a reply carries, once the reply is a success, in the version asked for, from the sender it
+         * names.
+         */
         private GossipWire.Exchange accepted(CommandReply reply, int version) throws IOException {
             if (reply.error() != null) { throw new CommandExecutionException(reply); }
             var result = wire.decode(reply.result(), false);
             if (result.gossipVersion() != version) {
-                throw MembershipException.invalidRecord(GossipFailure.VERSION, "Reply gossipVersion does not match request");
+                throw MembershipException.invalidRecord(GossipFailure.VERSION,
+                        "Reply gossipVersion does not match request");
             }
             if (!reply.serverId().equals(result.sender().key().serverId())) {
-                throw new GossipExchangeException(GossipFailure.IDENTITY, "Outer serverId disagrees with gossip sender");
+                throw new GossipExchangeException(GossipFailure.IDENTITY,
+                        "Outer serverId disagrees with gossip sender");
             }
             // Every record must be forwardable before any is merged, so that one cannot break later replies.
             wire.requireForwardable(table.self(), result.records());
@@ -232,7 +252,10 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         }
     }
 
-    /** A version-2 request rejected in the exact words a deployed version-1 peer uses, so it is asked again in version 1. */
+    /**
+     * A version-2 request rejected in the exact words a deployed version-1 peer uses, so it is asked again in version
+     * 1.
+     */
     private static boolean rejectsVersion2(CommandReply reply) {
         return reply.error() != null && reply.error().code() == CommandError.Code.INVALID_PARAMETERS
                 && VERSION_1_REJECTIONS.contains(reply.error().message());
@@ -242,7 +265,10 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         synchronized (version1Peers) {
             Long learned = version1Peers.get(peerKey);
             if (learned == null) { return false; }
-            if (clock.getAsLong() - learned >= VERSION_1_RECHECK.toNanos()) { version1Peers.remove(peerKey); return false; }
+            if (clock.getAsLong() - learned >= VERSION_1_RECHECK.toNanos()) {
+                version1Peers.remove(peerKey);
+                return false;
+            }
             return true;
         }
     }
@@ -252,7 +278,9 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         synchronized (version1Peers) {
             version1Peers.remove(peerKey);
             version1Peers.put(peerKey, clock.getAsLong());
-            while (version1Peers.size() > config.maxMembers() + config.seeds().size()) { version1Peers.pollFirstEntry(); }
+            while (version1Peers.size() > config.maxMembers() + config.seeds().size()) {
+                version1Peers.pollFirstEntry();
+            }
         }
     }
 
@@ -261,7 +289,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private record Reply(String text, InetSocketAddress address) { }
 
     /** Tries each address in order; if none connects, throws the first connection error with the rest suppressed. */
-    private Reply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload, long deadline) throws IOException {
+    private Reply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload,
+            long deadline) throws IOException {
         SocketException unreachable = null;
         for (var address : candidates) {
             try { return new Reply(exchangeOver(address, payload, deadline), address); }
@@ -311,9 +340,12 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 output.flush();
                 return readLine(socket, deadline);
             } catch (SocketException closedUnderneath) {
-                // Closed by the watchdog, by an interrupt, or by close(): report which, rather than a bare socket error.
+                // Closed by the watchdog, by an interrupt, or by close(): report which, rather than a bare socket
+                // error.
                 checkDeadline(deadline);
-                synchronized (this) { if (closed) { throw new IOException("Gossip transport is closed", closedUnderneath); } }
+                synchronized (this) {
+                    if (closed) { throw new IOException("Gossip transport is closed", closedUnderneath); }
+                }
                 throw closedUnderneath;
             } finally {
                 watchdog.interrupt();
@@ -344,13 +376,16 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 if (bytes[scanned] == '\n' || bytes[scanned] == '\r') { return decodeUtf8(bytes, scanned); }
             }
             if (length == bytes.length) {
-                throw new GossipExchangeException(GossipFailure.PROTOCOL, "Gossip reply exceeds max.exchange.bytes before parsing");
+                throw new GossipExchangeException(GossipFailure.PROTOCOL,
+                        "Gossip reply exceeds max.exchange.bytes before parsing");
             }
         }
     }
 
     /** Socket timeouts are whole milliseconds, and zero would mean no timeout at all. */
-    private static int millis(long nanos) { return (int) Math.max(1, Math.min(Integer.MAX_VALUE, TimeUnit.NANOSECONDS.toMillis(nanos))); }
+    private static int millis(long nanos) {
+        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, TimeUnit.NANOSECONDS.toMillis(nanos)));
+    }
 
     private static String decodeUtf8(byte[] bytes, int length) throws IOException {
         return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)

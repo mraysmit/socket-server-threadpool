@@ -33,7 +33,10 @@ public final class GossipPlugin implements CommandPlugin {
     private volatile boolean stopped;
 
     /** ServiceLoader constructor; configuration is read when this instance starts. */
-    public GossipPlugin() { suppliedConfig = null; schedule = true; }
+    public GossipPlugin() {
+        suppliedConfig = null;
+        schedule = true;
+    }
 
     /** Explicit per-instance configuration for embedded applications and tests. */
     public GossipPlugin(GossipConfig config) { this(config, true); }

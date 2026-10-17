@@ -38,7 +38,8 @@ final class GossipValidation {
         if (value == null || value.isEmpty() || value.length() > 128) { return false; }
         for (int i = 0; i < value.length(); i++) {
             char c = value.charAt(i);
-            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-')) {
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_'
+                    || c == '-')) {
                 return false;
             }
         }
@@ -86,7 +87,9 @@ final class GossipValidation {
         } catch (URISyntaxException e) { return false; }
     }
 
-    static int exactInteger(Object value, String field, int min, int max) { return (int) exactLong(value, field, min, max); }
+    static int exactInteger(Object value, String field, int min, int max) {
+        return (int) exactLong(value, field, min, max);
+    }
 
     /**
      * An exact JSON integer in [min, max]: fractions, strings and other coercions are rejected. The range message is
@@ -97,7 +100,8 @@ final class GossipValidation {
         if (value instanceof BigInteger integer) {
             try { number = integer.longValueExact(); }
             catch (ArithmeticException e) { throw invalidRecord(field + " is outside the supported integer range"); }
-        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer
+                || value instanceof Long) {
             number = ((Number) value).longValue();
         } else { throw invalidRecord(field + " must be an integer"); }
         if (number < min || number > max) { throw invalidRecord(field + " must be between " + min + " and " + max); }

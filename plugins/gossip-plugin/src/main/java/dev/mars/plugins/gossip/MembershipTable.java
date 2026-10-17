@@ -68,7 +68,9 @@ public final class MembershipTable {
         this.config = Objects.requireNonNull(config, "config");
         this.clock = Objects.requireNonNull(clock, "clock");
         Objects.requireNonNull(self, "self");
-        if (self.state() != ALIVE) { throw new MembershipException(INVALID_RECORD, "Initial local record must be ALIVE"); }
+        if (self.state() != ALIVE) {
+            throw new MembershipException(INVALID_RECORD, "Initial local record must be ALIVE");
+        }
         checkRecordSize(self);
         localKey = self.key();
         suspectNanos = TimeUnit.MILLISECONDS.toNanos(config.suspectAfterMillis());
@@ -121,7 +123,9 @@ public final class MembershipTable {
         var keys = new HashSet<MemberKey>();
         for (MemberRecord record : records) {
             if (record == null) { throw new MembershipException(INVALID_RECORD, "Member record must not be null"); }
-            if (!keys.add(record.key())) { throw new MembershipException(INVALID_RECORD, "Duplicate member key: " + record.key()); }
+            if (!keys.add(record.key())) {
+                throw new MembershipException(INVALID_RECORD, "Duplicate member key: " + record.key());
+            }
             checkRecordSize(record);
         }
         return records;
@@ -183,11 +187,16 @@ public final class MembershipTable {
         return fromUnknown(incoming, now, evidence.isDirect(incoming.key()));
     }
 
-    /** Peers forward copies of this process's own record, which only it may change; one that would replace it conflicts. */
+    /**
+     * Peers forward copies of this process's own record, which only it may change; one that would replace it conflicts.
+     */
     private static Decision fromLocal(MemberRecord incoming, MemberRecord local) {
         // Peers can still forward the last ALIVE version after this owner publishes LEFT.
-        boolean staleAlive = local.state() == LEFT && incoming.state() == ALIVE && incoming.heartbeat() <= local.heartbeat();
-        if (!staleAlive && !incoming.equals(local) && incoming.heartbeat() >= local.heartbeat()) { throw conflict(incoming.key()); }
+        boolean staleAlive = local.state() == LEFT && incoming.state() == ALIVE
+                && incoming.heartbeat() <= local.heartbeat();
+        if (!staleAlive && !incoming.equals(local) && incoming.heartbeat() >= local.heartbeat()) {
+            throw conflict(incoming.key());
+        }
         return SKIP;
     }
 
@@ -199,7 +208,8 @@ public final class MembershipTable {
     private static Decision fromKnown(MemberRecord incoming, Entry known, long now) {
         MemberRecord previous = known.record();
         if (previous.state() == LEFT) {
-            if (incoming.state() == LEFT && incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) {
+            if (incoming.state() == LEFT && incoming.heartbeat() == previous.heartbeat()
+                    && !incoming.equals(previous)) {
                 throw conflict(incoming.key());
             }
             return new Keep(known);
@@ -208,7 +218,9 @@ public final class MembershipTable {
             boolean stillVerified = known.endpointVerified() && previous.sameEndpoint(incoming);
             return new Advance(new Entry(incoming, now, known.lastDirectSuccess(), stillVerified, now));
         }
-        if (incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) { throw conflict(incoming.key()); }
+        if (incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) {
+            throw conflict(incoming.key());
+        }
         return new Keep(known);
     }
 
@@ -221,7 +233,8 @@ public final class MembershipTable {
         Suppression tombstone = suppressions.get(incoming.key());
         if (tombstone != null) {
             boolean sameVersion = incoming.heartbeat() == tombstone.heartbeat();
-            if (sameVersion && incoming.state() == tombstone.state() && !incoming.fingerprint().equals(tombstone.fingerprint())) {
+            if (sameVersion && incoming.state() == tombstone.state()
+                    && !incoming.fingerprint().equals(tombstone.fingerprint())) {
                 throw conflict(incoming.key());
             }
             boolean departedForGood = tombstone.state() == LEFT;
@@ -229,13 +242,16 @@ public final class MembershipTable {
                     && (incoming.heartbeat() < tombstone.heartbeat() || (sameVersion && !direct));
             if (departedForGood || staleCopy) { return SKIP; }
         }
-        boolean remembered = tombstone != null && incoming.state() == ALIVE && incoming.heartbeat() == tombstone.heartbeat();
-        return new Admit(new Entry(incoming, remembered ? tombstone.lastAdvance() : now, OptionalLong.empty(), false, now));
+        boolean remembered = tombstone != null && incoming.state() == ALIVE
+                && incoming.heartbeat() == tombstone.heartbeat();
+        return new Admit(new Entry(incoming, remembered ? tombstone.lastAdvance() : now, OptionalLong.empty(), false,
+                now));
     }
 
     /** A peer this process dialled, still ALIVE at the endpoint it answered on, gains direct-success evidence. */
     private static Entry withDirectEvidence(Entry entry, MemberRecord incoming, Evidence evidence, long now) {
-        if (!evidence.isDirect(incoming.key()) || entry.record().state() != ALIVE || !entry.record().sameEndpoint(incoming)) {
+        if (!evidence.isDirect(incoming.key()) || entry.record().state() != ALIVE
+                || !entry.record().sameEndpoint(incoming)) {
             return entry;
         }
         return new Entry(entry.record(), entry.lastAdvance(), OptionalLong.of(now), true, entry.stateSince());
@@ -272,7 +288,10 @@ public final class MembershipTable {
         return new Admitted(count, skipped, senderSkipped);
     }
 
-    /** How an inbound exchange's sender fared: admitted if the table now holds it, otherwise skipped for capacity or ignored. */
+    /**
+     * How an inbound exchange's sender fared: admitted if the table now holds it, otherwise skipped for capacity or
+     * ignored.
+     */
     private Admission senderAdmission(Evidence evidence, boolean senderSkipped) {
         if (!(evidence instanceof FromSender(var sender))) { return Admission.IGNORED; }
         if (entries.containsKey(sender)) { return Admission.ADMITTED; }

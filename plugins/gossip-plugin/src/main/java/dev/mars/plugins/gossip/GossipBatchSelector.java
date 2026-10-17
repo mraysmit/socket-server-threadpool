@@ -55,7 +55,9 @@ final class GossipBatchSelector {
     GossipBatchSelector() { this(MemberRecord::serializedBytes); }
 
     /** Tests supply sizes of their own, to count the reads or to make a batch fill up at a chosen point. */
-    GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) { this.encodedSize = java.util.Objects.requireNonNull(encodedSize); }
+    GossipBatchSelector(ToIntFunction<MemberRecord> encodedSize) {
+        this.encodedSize = java.util.Objects.requireNonNull(encodedSize);
+    }
 
     /**
      * Picks the members for one message, in the order they are to be encoded. Records are the table's records without
@@ -65,7 +67,9 @@ final class GossipBatchSelector {
      */
     synchronized List<MemberRecord> select(List<MemberRecord> records, int maxBatch, int memberByteBudget) {
         if (maxBatch < 1) { throw new IllegalArgumentException("Batch limit must include the sender"); }
-        if (memberByteBudget < 0) { throw MembershipException.invalidRecord("Local sender exceeds the exchange budget"); }
+        if (memberByteBudget < 0) {
+            throw MembershipException.invalidRecord("Local sender exceeds the exchange budget");
+        }
         Diff diff = tracker.update(records);
         queues.apply(diff);
         Selection selection = queues.choose(maxBatch - 1, memberByteBudget, encodedSize);
@@ -120,7 +124,10 @@ final class GossipBatchSelector {
                 if (entry == null || entry.record != record) {
                     var key = record.key();
                     if (entry == null || !entry.record.key().equals(key)) { entry = tracked.get(key); }
-                    if (entry == null) { entry = new Tracked(new Member(key)); tracked.put(key, entry); }
+                    if (entry == null) {
+                        entry = new Tracked(new Member(key));
+                        tracked.put(key, entry);
+                    }
                     if (entry.record != record) {
                         boolean news = entry.record == null || entry.record.heartbeat() != record.heartbeat()
                                 || entry.record.state() != record.state();
@@ -137,10 +144,14 @@ final class GossipBatchSelector {
                 var iterator = tracked.values().iterator();
                 while (iterator.hasNext()) {
                     var entry = iterator.next();
-                    if (entry.generation != current) { removed.add(entry.member); iterator.remove(); }
+                    if (entry.generation != current) {
+                        removed.add(entry.member);
+                        iterator.remove();
+                    }
                 }
             }
-            return changes.isEmpty() && removed.isEmpty() ? Diff.NONE : new Diff(List.copyOf(changes), List.copyOf(removed));
+            return changes.isEmpty() && removed.isEmpty()
+                    ? Diff.NONE : new Diff(List.copyOf(changes), List.copyOf(removed));
         }
 
         /** The tracker's private bookkeeping for one member. */
@@ -218,7 +229,9 @@ final class GossipBatchSelector {
                 if (bytes > remaining) {
                     // The member keeps its place, since nothing is recorded and the turn does not pass. If not even the
                     // first member fits, it would block every later batch the same way, so that is an error.
-                    if (batch.isEmpty()) { throw MembershipException.invalidRecord("Single member cannot fit beside the local sender"); }
+                    if (batch.isEmpty()) {
+                        throw MembershipException.invalidRecord("Single member cannot fit beside the local sender");
+                    }
                     break;
                 }
                 members.add(candidate);

@@ -48,7 +48,9 @@ final class Departure {
     private boolean reported;
 
     Departure(Duration budget) {
-        if (budget.isNegative() || budget.isZero()) { throw new IllegalArgumentException("Positive departure timeout required"); }
+        if (budget.isNegative() || budget.isZero()) {
+            throw new IllegalArgumentException("Positive departure timeout required");
+        }
         budgetNanos = budget.toNanos();
     }
 
@@ -100,7 +102,9 @@ final class Departure {
     /** The scheduler stopped without deciding how the departure ended. */
     void failIfUndecided() { if (ending == null) { ending = State.FAILED; } }
 
-    /** The runtime has stopped: report how the departure ended, or that it failed if cleanup did, and drop what is left. */
+    /**
+     * The runtime has stopped: report how the departure ended, or that it failed if cleanup did, and drop what is left.
+     */
     void publish(boolean cleanupFailed) {
         state = cleanupFailed ? State.FAILED : ending;
         pending.clear();
@@ -114,7 +118,8 @@ final class Departure {
     }
 
     Map<String, Object> result() {
-        return Map.of("state", state.name(), "budgetMillis", TimeUnit.NANOSECONDS.toMillis(budgetNanos), "targets", targets,
-                "attempts", attempts, "successes", successes, "failures", failures, "skipped", skipped, "cancelled", cancelled);
+        return Map.of("state", state.name(), "budgetMillis", TimeUnit.NANOSECONDS.toMillis(budgetNanos),
+                "targets", targets, "attempts", attempts, "successes", successes, "failures", failures,
+                "skipped", skipped, "cancelled", cancelled);
     }
 }

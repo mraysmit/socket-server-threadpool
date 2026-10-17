@@ -59,20 +59,23 @@ final class PeerSelector {
         roundNanos = TimeUnit.MILLISECONDS.toNanos(config.roundMillis());
     }
 
-    synchronized List<GossipConfig.Seed> select(MembershipTable.Snapshot snapshot, Set<GossipConfig.Seed> busy, int slots) {
+    synchronized List<GossipConfig.Seed> select(MembershipTable.Snapshot snapshot, Set<GossipConfig.Seed> busy,
+            int slots) {
         long now = clock.getAsLong();
         aliases.values().removeIf(alias -> now - alias.verifiedAt() >= ALIAS_NANOS);
         var candidates = candidates(snapshot);
         var busyKeys = busy.stream().map(this::canonical).collect(Collectors.toSet());
         retries.keySet().removeIf(peer -> !candidates.containsKey(peer) && !busyKeys.contains(peer));
-        recoveryTurns.keySet().removeIf(peer -> !(candidates.get(peer) instanceof Candidate candidate && candidate.recovery()));
+        recoveryTurns.keySet()
+                .removeIf(peer -> !(candidates.get(peer) instanceof Candidate candidate && candidate.recovery()));
         var ordinary = new ArrayList<GossipConfig.Seed>();
         var recovery = new ArrayList<Waiting>();
         for (var item : candidates.entrySet()) {
             var key = item.getKey();
             var candidate = item.getValue();
             if (candidate.recovery()) {
-                // A peer joins the back of the queue when it first needs recovery, and keeps its place while busy or backing off.
+                // A peer joins the back of the queue when it first needs recovery, and keeps its place while busy or
+                // backing off.
                 long turn = recoveryTurns.computeIfAbsent(key, _ -> ++lastTurn);
                 if (available(key, busyKeys, now)) { recovery.add(new Waiting(key, candidate.peer(), turn)); }
             } else if (available(key, busyKeys, now)) {
@@ -143,7 +146,8 @@ final class PeerSelector {
      * DNS may confirm an alias of an endpoint whose identity is already directly verified. The snapshot is taken only
      * for a configured seed whose resolved address differs from it.
      */
-    synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint, Supplier<MembershipTable.Snapshot> snapshots) {
+    synchronized void resolved(GossipConfig.Seed peer, GossipConfig.Seed endpoint,
+            Supplier<MembershipTable.Snapshot> snapshots) {
         var resolved = normalized(endpoint);
         if (!config.seeds().contains(peer) || normalized(peer).equals(resolved)) { return; }
         var snapshot = snapshots.get();
@@ -167,7 +171,8 @@ final class PeerSelector {
     synchronized void capacity(GossipConfig.Seed peer, GossipConfig.Seed endpoint) {
         Retry retry = retries.remove(canonical(peer));
         rememberAlias(peer, normalized(endpoint));
-        // Selection looks for the backoff under the peer's canonical endpoint, which a seed's new alias may just have moved.
+        // Selection looks for the backoff under the peer's canonical endpoint, which a seed's new alias may just have
+        // moved.
         if (retry != null) { retries.put(canonical(peer), retry); }
         failure(peer);
     }
@@ -181,7 +186,8 @@ final class PeerSelector {
     synchronized void failure(GossipConfig.Seed peer) {
         peer = canonical(peer);
         Retry old = retries.get(peer);
-        int failures = old == null ? 1 : Math.min(31, old.failures() + 1); // The count stops long after the backoff does.
+        // The count stops long after the backoff does.
+        int failures = old == null ? 1 : Math.min(31, old.failures() + 1);
         long delay = backoff(failures);
         if (retries.containsKey(peer) || retries.size() < (long) config.maxMembers() + config.seeds().size()) {
             retries.put(peer, new Retry(failures, clock.getAsLong(), delay));
@@ -218,7 +224,9 @@ final class PeerSelector {
         return alias != null && clock.getAsLong() - alias.verifiedAt() < ALIAS_NANOS ? alias.endpoint() : normalized;
     }
 
-    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) { return normalized(peer, Host.of(peer.host())); }
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) {
+        return normalized(peer, Host.of(peer.host()));
+    }
 
     /** The peer with its host in normal form. */
     private static GossipConfig.Seed normalized(GossipConfig.Seed peer, Host host) {
@@ -268,8 +276,10 @@ final class PeerSelector {
     /** A peer to gossip with, and whether it needs a recovery probe rather than a place in the healthy fanout. */
     private record Candidate(GossipConfig.Seed peer, boolean recovery) {
         /**
-         * Which of two candidates at one endpoint to keep: the known one if it is healthy, so that a healthy member stays
-         * in the fanout; otherwise the later one, so that a recovering seed keeps its hostname and with it the DNS fallback.
+         * Which of two candidates at one endpoint to keep: the known one if it is healthy, so that a healthy member
+         * stays
+         * in the fanout; otherwise the later one, so that a recovering seed keeps its hostname and with it the DNS
+         * fallback.
          */
         static Candidate preferred(Candidate known, Candidate later) { return known.recovery() ? later : known; }
     }
