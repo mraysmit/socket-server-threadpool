@@ -131,24 +131,79 @@ class GossipSizeAccountingTest {
                 for (var peer : List.of(record("Peer", 2, length, metadata(Math.min(length, 700), length % 6)),
                         record("Peer", 2, 7, ascii(length)))) {
                     for (var records : List.of(List.of(peer), List.of(self, peer))) {
-                        String expected = outcome(() -> referenceRequireForwardable(reference, config, self, records));
-                        assertEquals(expected, outcome(() -> wire.requireForwardable(self, records)), "batch=" + batch + " peer=" + peer);
-                        outcomes.add(expected);
+                        decidesAsReference(wire, reference, config, self, records, outcomes, "batch=" + batch + " peer=" + peer);
                     }
                 }
             }
-            // Sweep the local record itself; its cached overheads must follow every change except the heartbeat.
+            // Sweep the local record itself; its limits must follow every change except the heartbeat. Beside the smallest
+            // peer, the local record's own page row decides, so it must be budgeted at its widest heartbeat.
             for (int length = 0; length <= 900; length++) {
                 for (var changed : List.of(record("Self", 1, length, metadata(Math.min(length, 700), length % 6)),
                         record("Self", 1, length, ascii(length)))) {
-                    var records = List.of(changed, record("Peer", 2, 1, metadata(2, 0)));
-                    String expected = outcome(() -> referenceRequireForwardable(reference, config, changed, records));
-                    assertEquals(expected, outcome(() -> wire.requireForwardable(changed, records)), "batch=" + batch + " self=" + changed);
+                    for (var peer : List.of(record("Peer", 2, 1, metadata(2, 0)), record("Peer", 2, 1, ascii(0)))) {
+                        decidesAsReference(wire, reference, config, changed, List.of(changed, peer), outcomes, "batch=" + batch + " self=" + changed);
+                    }
+                }
+            }
+        }
+        assertEquals(Set.of("OK", SINGLE_SENDER, LOCAL_ALONE, PAGE_ROW), outcomes, "The sweep must cross each limit, and each says which it is");
+    }
+
+    @Test void forwardingLimitsFollowTheLocalRecordsStateHostAndPort() {
+        var config = GossipCommandsTest.config(1024, 4, 8);
+        var wire = new GossipWire(config);
+        var reference = new GossipWire(config);
+        var peer = record("Peer", 2, 1, ascii(0));
+        var outcomes = new HashSet<String>();
+        for (int length = 0; length <= 300; length++) {
+            var self = record("Self", 1, 3, ascii(length));
+            // Each record differs from the one before it in one field besides the heartbeat, so nothing may carry over.
+            var left = moved(self, self.host(), self.port(), MemberRecord.State.LEFT);
+            var renamed = moved(left, "host-self-renamed.example", left.port(), left.state());
+            var renumbered = moved(renamed, renamed.host(), 65535, renamed.state());
+            for (var changed : List.of(self, left, renamed, renumbered)) {
+                decidesAsReference(wire, reference, config, changed, List.of(changed, peer), outcomes, "self=" + changed);
+            }
+        }
+        assertTrue(outcomes.contains("OK") && outcomes.size() > 1, "The sweep must cross the limit: " + outcomes);
+    }
+
+    private static MemberRecord moved(MemberRecord original, String host, int port, MemberRecord.State state) {
+        return new MemberRecord(original.key(), host, port, original.heartbeat(), state, original.metadata());
+    }
+
+    /** Asserts that the wire decides these records exactly as the reference does, and collects the outcome. */
+    private static void decidesAsReference(GossipWire wire, GossipWire reference, GossipConfig config, MemberRecord self,
+                                           List<MemberRecord> records, Set<String> outcomes, String context) {
+        String expected = outcome(() -> referenceRequireForwardable(reference, config, self, records));
+        assertEquals(expected, outcome(() -> wire.requireForwardable(self, records)), context);
+        outcomes.add(expected);
+    }
+
+    @Test void commandsRefuseToStartExactlyWhenTheLocalRecordOrStatusCannotBeSent() throws Exception {
+        var roomy = GossipCommandsTest.config(65536, 4, 8);
+        var outcomes = new HashSet<String>();
+        for (int bytes : List.of(1024, 2048)) {
+            var config = GossipCommandsTest.config(bytes, 4, 8);
+            try (var host = new PageHost(config)) {
+                for (int length = 0; length <= 900; length++) {
+                    var self = record("Self", 1, 3, ascii(length));
+                    if (self.serializedBytes() > config.maxExchangeBytes()) { break; } // The table refuses it before any commands exist.
+                    var table = new MembershipTable(config, self);
+                    // The status this process would report, from commands given room to start.
+                    Object status = new GossipCommands(roomy, table, host.metrics, host.transport, host.runtime).execute(Map.of("operation", "status"));
+                    String expected = outcome(() -> {
+                        host.wire.requireForwardable(self, List.of(self));
+                        host.wire.requireReplyFits(self.key().serverId(), status);
+                    });
+                    assertEquals(expected, outcome(() -> new GossipCommands(config, table, host.metrics, host.transport, host.runtime)),
+                            "bytes=" + bytes + " length=" + length);
                     outcomes.add(expected);
                 }
             }
         }
-        assertTrue(outcomes.contains("OK") && outcomes.size() >= 3, "The sweep must cross each limit: " + outcomes);
+        // At the smallest limit status fails first for a small local record; at a larger one small records start.
+        assertEquals(Set.of("OK", STATUS_TOO_LARGE, LOCAL_ALONE, PAGE_ROW), outcomes);
     }
 
     @Test void inboundRequestSizeCheckDecidesExactlyAsEncodingTheRequestWould() {
@@ -223,7 +278,7 @@ class GossipSizeAccountingTest {
     }
 
     @Test void aRecordTooLargeForTheReplyIsAlsoTooLargeForTheMembersPage() {
-        // requireForwardable checks both; the page check is the stricter one, so the reply check never decides alone.
+        // requireForwardable checks only the page row: it is the stricter, so a record that fits there fits the reply too.
         for (int bytes : List.of(1024, 4096, 32768, 65536)) {
             var config = GossipCommandsTest.config(bytes, 4, 8);
             var wire = new GossipWire(config);
@@ -298,27 +353,35 @@ class GossipSizeAccountingTest {
         @Override public void close() throws Exception { runtime.close(); }
     }
 
-    /** The original algorithm: encode the complete reply envelopes for every record. */
+    private static final String SINGLE_SENDER = "Single sender exceeds the complete request budget";
+    private static final String STATUS_TOO_LARGE = "Complete reply exceeds max.exchange.bytes";
+    private static final String LOCAL_ALONE = "Complete reply exceeds max.exchange.bytes: the local record alone does not fit";
+    private static final String PAGE_ROW = "Complete reply exceeds max.exchange.bytes: a record does not fit as a members-page row";
+
+    /**
+     * The original algorithm: encode the complete reply envelopes for every record. A record beside the local sender
+     * in a reply is not checked: it costs less than the same record as a members-page row, which
+     * {@link #aRecordTooLargeForTheReplyIsAlsoTooLargeForTheMembersPage} shows.
+     */
     private static void referenceRequireForwardable(GossipWire wire, GossipConfig config, MemberRecord self, List<MemberRecord> records) {
         var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
-        wire.requireReplyFits(self.key().serverId(), wire.result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY));
+        fits(wire, self, wire.result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY), LOCAL_ALONE);
         for (MemberRecord record : records) {
-            if (!record.key().equals(self.key())) {
-                if (wire.requestBytes(wire.parameters(record, List.of())).length > config.maxExchangeBytes()) {
-                    throw GossipWire.invalid("Single sender exceeds the complete request budget");
-                }
-                if (config.maxBatchMembers() > 1) {
-                    wire.requireReplyFits(self.key().serverId(), wire.result(budgetSelf, List.of(record), 2, MembershipTable.Admission.CAPACITY));
-                }
+            if (!record.key().equals(self.key()) && wire.requestBytes(wire.parameters(record, List.of())).length > config.maxExchangeBytes()) {
+                throw new MembershipException(MembershipException.Reason.INVALID_RECORD, SINGLE_SENDER);
             }
             var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record,
                     MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, Long.MAX_VALUE, false, false);
             String cursor = Base64.getUrlEncoder().withoutPadding().encodeToString(
                     (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
-            wire.requireReplyFits(self.key().serverId(), wire.page(budgetSelf, List.of(GossipWire.memberView(worst)), cursor,
+            fits(wire, self, wire.page(budgetSelf, List.of(GossipWire.memberView(worst)), cursor,
                     Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
-                            "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE)));
+                            "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE)), PAGE_ROW);
         }
+    }
+
+    private static void fits(GossipWire wire, MemberRecord self, Object result, String failure) {
+        if (!wire.replyFits(self.key().serverId(), result)) { throw new MembershipException(MembershipException.Reason.INVALID_RECORD, failure); }
     }
 
     /** The original members() loop: re-encode the growing page for every row. */

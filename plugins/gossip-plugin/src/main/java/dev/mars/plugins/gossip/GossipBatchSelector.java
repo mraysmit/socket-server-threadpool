@@ -65,7 +65,7 @@ final class GossipBatchSelector {
      */
     synchronized List<MemberRecord> select(List<MemberRecord> records, int maxBatch, int memberByteBudget) {
         if (maxBatch < 1) { throw new IllegalArgumentException("Batch limit must include the sender"); }
-        if (memberByteBudget < 0) { throw GossipWire.invalid("Local sender exceeds the exchange budget"); }
+        if (memberByteBudget < 0) { throw MembershipException.invalidRecord("Local sender exceeds the exchange budget"); }
         Diff diff = tracker.update(records);
         queues.apply(diff);
         Selection selection = queues.choose(maxBatch - 1, memberByteBudget, encodedSize);
@@ -218,7 +218,7 @@ final class GossipBatchSelector {
                 if (bytes > remaining) {
                     // The member keeps its place, since nothing is recorded and the turn does not pass. If not even the
                     // first member fits, it would block every later batch the same way, so that is an error.
-                    if (batch.isEmpty()) { throw GossipWire.invalid("Single member cannot fit beside the local sender"); }
+                    if (batch.isEmpty()) { throw MembershipException.invalidRecord("Single member cannot fit beside the local sender"); }
                     break;
                 }
                 members.add(candidate);

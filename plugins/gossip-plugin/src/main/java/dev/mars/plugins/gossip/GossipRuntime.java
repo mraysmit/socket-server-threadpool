@@ -153,7 +153,7 @@ final class GossipRuntime implements AutoCloseable {
     /** Publish locally and wake the owned scheduler; no DNS, sockets, or joins on the caller. */
     synchronized Map<String, Object> leave() {
         if (departure.requested()) { return departure.result(); }
-        if (stopped) { throw GossipWire.invalid("Cannot leave a stopped gossip runtime"); }
+        if (stopped) { throw MembershipException.invalidRecord("Cannot leave a stopped gossip runtime"); }
         // Every live member and every seed is a candidate, in that order; the departure keeps the first it may tell.
         var snapshot = table.snapshot();
         var candidates = new ArrayList<GossipConfig.Seed>();

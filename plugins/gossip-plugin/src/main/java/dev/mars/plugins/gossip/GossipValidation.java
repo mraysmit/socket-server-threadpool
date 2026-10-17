@@ -15,11 +15,14 @@
  */
 package dev.mars.plugins.gossip;
 
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+
+import static dev.mars.plugins.gossip.MembershipException.invalidRecord;
 
 /** Shared lexical checks; never resolve advertised addresses during validation. */
 final class GossipValidation {
@@ -81,5 +84,23 @@ final class GossipValidation {
                     && endpoint.getRawPath().isEmpty() && endpoint.getRawQuery() == null
                     && endpoint.getRawFragment() == null;
         } catch (URISyntaxException e) { return false; }
+    }
+
+    static int exactInteger(Object value, String field, int min, int max) { return (int) exactLong(value, field, min, max); }
+
+    /**
+     * An exact JSON integer in [min, max]: fractions, strings and other coercions are rejected. The range message is
+     * also what deployed version-1 peers send for an unsupported gossipVersion, so its wording must not change.
+     */
+    static long exactLong(Object value, String field, long min, long max) {
+        long number;
+        if (value instanceof BigInteger integer) {
+            try { number = integer.longValueExact(); }
+            catch (ArithmeticException e) { throw invalidRecord(field + " is outside the supported integer range"); }
+        } else if (value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long) {
+            number = ((Number) value).longValue();
+        } else { throw invalidRecord(field + " must be an integer"); }
+        if (number < min || number > max) { throw invalidRecord(field + " must be between " + min + " and " + max); }
+        return number;
     }
 }

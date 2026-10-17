@@ -120,8 +120,8 @@ public final class MemberRecord {
         catch (IllegalArgumentException e) { throw invalid("state must be ALIVE or LEFT"); }
         if (!(fields.get("metadata") instanceof Map<?, ?> metadata)) { throw invalid("metadata must be an object"); }
         // The constructor copies the metadata and checks every key and value, so the cast is never trusted.
-        return new MemberRecord(key, string(fields, "host"), (int) GossipWire.exactLong(fields.get("port"), "port", 1, 65535),
-                GossipWire.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
+        return new MemberRecord(key, string(fields, "host"), (int) GossipValidation.exactLong(fields.get("port"), "port", 1, 65535),
+                GossipValidation.exactLong(fields.get("heartbeat"), "heartbeat", 0, Long.MAX_VALUE), state, (Map<String, Object>) metadata);
     }
 
     /** The record's fields for JSON, built once: every exchange that carries the record sends the same map. */

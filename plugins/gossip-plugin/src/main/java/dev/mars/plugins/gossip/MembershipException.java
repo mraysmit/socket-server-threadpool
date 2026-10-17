@@ -36,6 +36,14 @@ public final class MembershipException extends IllegalArgumentException {
     /** The metrics category this failure is counted under. */
     GossipFailure kind() { return kind; }
 
+    /** A record or message that breaks the gossip format, counted as a protocol failure. */
+    static MembershipException invalidRecord(String message) { return new MembershipException(Reason.INVALID_RECORD, message); }
+
+    /** As {@link #invalidRecord(String)}, counted under a more specific metrics category, such as a version mismatch. */
+    static MembershipException invalidRecord(GossipFailure kind, String message) {
+        return new MembershipException(Reason.INVALID_RECORD, kind, message);
+    }
+
     private static GossipFailure defaultKind(Reason reason) {
         return switch (reason) {
             case INVALID_RECORD -> GossipFailure.PROTOCOL;

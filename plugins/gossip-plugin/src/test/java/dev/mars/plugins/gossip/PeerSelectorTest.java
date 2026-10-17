@@ -379,6 +379,12 @@ class PeerSelectorTest {
         assertTrue(PeerSelector.isSelf(at("Self", 1, "Node.Example", 9000), new GossipConfig.Seed("Self", "node.example", 9000)));
     }
 
+    @Test void aLocalHostnameIsNotMistakenForAnotherHostOnItsPort() {
+        var named = at("Self", 1, "node-a.example", 9000);
+        assertFalse(PeerSelector.isSelf(named, new GossipConfig.Seed("Other", "node-b.example", 9000)));
+        assertFalse(PeerSelector.isSelf(named, new GossipConfig.Seed("Other", "127.0.0.1", 9000)));
+    }
+
     @Test void aFailureAfterAnAliasExpiresIsChargedToTheHostnameNotTheOldAddress() {
         var config = config(2, "Peer@peer.example.test:9010");
         var table = new MembershipTable(config, self, clock::get);

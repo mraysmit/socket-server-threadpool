@@ -148,6 +148,19 @@ class GossipCommandsTest {
         } finally { plugin.stop(); }
     }
 
+    @Test void aMembersPageWithoutALimitHoldsUpToThirtyTwoRows() throws Exception {
+        for (int batch : List.of(16, 64)) {
+            var config = config(65536, batch, 128);
+            var plugin = plugin(config);
+            try {
+                var wire = new GossipWire(config);
+                for (int i = 0; i < 40; i++) { plugin.execute(wire.parameters(member("Peer-" + i, 2 + i), List.of())); }
+                var page = execute(plugin, Map.of("operation", "members"));
+                assertEquals(Math.min(32, batch), ((List<?>) page.get("members")).size(), "batch=" + batch);
+            } finally { plugin.stop(); }
+        }
+    }
+
     @Test void cursorsAreInstanceBoundAndLimitsAreExactIntegers() throws Exception {
         var config = config(32768, 2, 128);
         var first = plugin(config);

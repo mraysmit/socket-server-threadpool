@@ -99,22 +99,22 @@ final class PeerSelector {
         var candidates = new LinkedHashMap<GossipConfig.Seed, Candidate>();
         var self = snapshot.self();
         // Every candidate is checked against the local host, so it is parsed once; each candidate's host once too.
-        var selfAddress = GossipValidation.literal(self.host());
+        var selfHost = Host.of(self.host());
         for (var member : snapshot.members()) {
             var known = member.record();
             if (known.key().equals(self.key()) || known.state() == MemberRecord.State.LEFT) { continue; }
             var peer = known.endpoint();
-            var address = GossipValidation.literal(peer.host());
-            if (!isSelf(self, selfAddress, peer, address)) {
+            var host = Host.of(peer.host());
+            if (!isSelf(self, selfHost, peer, host)) {
                 // Only a member assessed alive is healthy; an unverified, suspect or dead one needs recovery probes.
                 boolean recovery = member.assessment() != MembershipTable.Assessment.ALIVE;
-                candidates.merge(canonical(peer, address), new Candidate(peer, recovery), Candidate::preferred);
+                candidates.merge(canonical(peer, host), new Candidate(peer, recovery), Candidate::preferred);
             }
         }
         for (var seed : config.seeds()) {
-            var address = GossipValidation.literal(seed.host());
-            if (!isSelf(self, selfAddress, seed, address)) {
-                candidates.merge(canonical(seed, address), new Candidate(seed, true), Candidate::preferred);
+            var host = Host.of(seed.host());
+            if (!isSelf(self, selfHost, seed, host)) {
+                candidates.merge(canonical(seed, host), new Candidate(seed, true), Candidate::preferred);
             }
         }
         return candidates;
@@ -207,33 +207,56 @@ final class PeerSelector {
     }
     synchronized int retryCount() { return retries.size(); }
 
-    private GossipConfig.Seed canonical(GossipConfig.Seed peer) { return canonical(peer, GossipValidation.literal(peer.host())); }
+    /** The key a peer's retry state and selection are kept by: its normal form, or the address its alias confirmed. */
+    private GossipConfig.Seed canonical(GossipConfig.Seed peer) { return canonical(peer, Host.of(peer.host())); }
 
-    /** {@code address} is the peer's host already parsed, or null for a hostname. */
-    private GossipConfig.Seed canonical(GossipConfig.Seed peer, InetAddress address) {
-        var normalized = normalized(peer, address);
+    /** As above, with the peer's host already parsed. */
+    private GossipConfig.Seed canonical(GossipConfig.Seed peer, Host host) {
+        var normalized = normalized(peer, host);
         Alias alias = aliases.get(normalized);
         return alias != null && clock.getAsLong() - alias.verifiedAt() < ALIAS_NANOS ? alias.endpoint() : normalized;
     }
 
-    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) { return normalized(peer, GossipValidation.literal(peer.host())); }
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer) { return normalized(peer, Host.of(peer.host())); }
 
-    private static GossipConfig.Seed normalized(GossipConfig.Seed peer, InetAddress address) {
-        String host = address != null ? address.getHostAddress() : peer.host().toLowerCase(Locale.ROOT);
+    /** The peer with its host in normal form. */
+    private static GossipConfig.Seed normalized(GossipConfig.Seed peer, Host host) {
+        String normal = host.normal();
         // Most hosts are already in this form; reusing the seed avoids validating an identical copy.
-        return host.equals(peer.host()) ? peer : new GossipConfig.Seed(peer.serverId(), host, peer.port());
+        return normal.equals(peer.host()) ? peer : new GossipConfig.Seed(peer.serverId(), normal, peer.port());
     }
 
+    /** Whether the peer is this process: the same port, at the same address or hostname however it is written. */
     static boolean isSelf(MemberRecord self, GossipConfig.Seed peer) {
-        return self.port() == peer.port()
-                && isSelf(self, GossipValidation.literal(self.host()), peer, GossipValidation.literal(peer.host()));
+        // The hosts are parsed only when the ports match.
+        return self.port() == peer.port() && isSelf(self, Host.of(self.host()), peer, Host.of(peer.host()));
     }
 
-    /** As above, with both hosts already parsed (null for a hostname). */
-    private static boolean isSelf(MemberRecord self, InetAddress selfAddress, GossipConfig.Seed peer, InetAddress peerAddress) {
-        if (self.port() != peer.port()) { return false; }
-        if (self.host().equalsIgnoreCase(peer.host())) { return true; }
-        return selfAddress != null && selfAddress.equals(peerAddress);
+    /** As above, with both hosts already parsed. */
+    private static boolean isSelf(MemberRecord self, Host selfHost, GossipConfig.Seed peer, Host peerHost) {
+        return self.port() == peer.port() && selfHost.equals(peerHost);
+    }
+
+    /**
+     * A host as a record or seed writes it: an IP literal, compared as an address, or a hostname, compared without
+     * case. Each is parsed once and passed along, so no host is parsed twice in a round.
+     */
+    private sealed interface Host {
+        static Host of(String text) {
+            var address = GossipValidation.literal(text);
+            return address != null ? new Literal(address) : new Name(text.toLowerCase(Locale.ROOT));
+        }
+
+        /** The host in normal form: an address in its standard notation, or a hostname in lower case. */
+        String normal();
+    }
+
+    private record Literal(InetAddress address) implements Host {
+        @Override public String normal() { return address.getHostAddress(); }
+    }
+
+    private record Name(String name) implements Host {
+        @Override public String normal() { return name; }
     }
 
     private record Retry(int failures, long attempted, long delay) { }

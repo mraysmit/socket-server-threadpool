@@ -212,7 +212,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             if (reply.error() != null) { throw new CommandExecutionException(reply); }
             var result = wire.decode(reply.result(), false);
             if (result.gossipVersion() != version) {
-                throw GossipWire.invalid(GossipFailure.VERSION, "Reply gossipVersion does not match request");
+                throw MembershipException.invalidRecord(GossipFailure.VERSION, "Reply gossipVersion does not match request");
             }
             if (!reply.serverId().equals(result.sender().key().serverId())) {
                 throw new GossipExchangeException(GossipFailure.IDENTITY, "Outer serverId disagrees with gossip sender");

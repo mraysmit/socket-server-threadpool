@@ -30,7 +30,8 @@ import java.util.regex.Pattern;
 /** Handlers validate, merge, inspect, or request asynchronous departure. Never dial peers here. */
 final class GossipCommands {
     private static final Pattern CURSOR = Pattern.compile("[A-Za-z0-9_-]+");
-    private static final Pattern OFFSET = Pattern.compile("[0-9]{1,10}");
+    private static final Pattern OFFSET = Pattern.compile("\\d{1,10}");
+    private static final int DEFAULT_PAGE_LIMIT = 32; // Rows in a members page when the caller sets no limit.
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -48,13 +49,20 @@ final class GossipCommands {
         this.transport = transport;
         this.runtime = runtime;
         wire = new GossipWire(config);
-        serverId = table.localKey().serverId();
-        var snapshot = table.snapshot();
-        log = metrics.log(config, snapshot.self());
-        wire.requireForwardable(snapshot.self(), List.of(snapshot.self()));
-        wire.requireReplyFits(serverId, wire.result(snapshot.self(), List.of()));
+        var self = table.self();
+        serverId = self.key().serverId();
+        log = metrics.log(config, self);
+        requireRepliesFit(self);
+    }
+
+    /**
+     * Fails at start, rather than on the first request, when max.exchange.bytes cannot hold this process's replies.
+     * A forwardable local record fits every exchange reply and members page, at their widest, so only status, whose
+     * size it does not bound, is checked besides.
+     */
+    private void requireRepliesFit(MemberRecord self) {
+        wire.requireForwardable(self, List.of(self));
         wire.requireReplyFits(serverId, status());
-        wire.requireReplyFits(serverId, pageResult(snapshot, List.of(GossipWire.memberView(snapshot.members().getFirst())), null));
     }
 
     Object execute(Map<String, Object> parameters) throws InvalidParametersException {
@@ -112,37 +120,48 @@ final class GossipCommands {
 
     private Object members(Map<String, Object> parameters) {
         if (!Set.of("operation", "limit", "cursor").containsAll(parameters.keySet())) {
-            throw GossipWire.invalid("Unknown members parameter");
+            throw MembershipException.invalidRecord("Unknown members parameter");
         }
-        int limit = parameters.containsKey("limit") ? GossipWire.exactInteger(parameters.get("limit"), "limit", 1,
-                config.maxBatchMembers()) : Math.min(32, config.maxBatchMembers());
+        int limit = parameters.containsKey("limit") ? GossipValidation.exactInteger(parameters.get("limit"), "limit", 1,
+                config.maxBatchMembers()) : Math.min(DEFAULT_PAGE_LIMIT, config.maxBatchMembers());
         var snapshot = table.snapshot();
-        int position = parameters.containsKey("cursor") ? decodeCursor(parameters.get("cursor"), snapshot.self().key()) : 0;
-        String serverId = snapshot.self().key().serverId();
-        // Page sizes are additive (see GossipWire): measure the empty page once and each row once, instead of
-        // re-encoding the growing page per row. A cursor string replaces the four bytes of null and, being
-        // base64url, needs no JSON escaping.
+        int start = parameters.containsKey("cursor") ? decodeCursor(parameters.get("cursor"), snapshot.self().key()) : 0;
+        return membersPage(snapshot, start, limit);
+    }
+
+    /**
+     * Up to {@code limit} rows from {@code start}, as many as fit. Page sizes are additive (see GossipWire), so the
+     * empty page is measured once and each row once, and the page is sized exactly; it is not encoded again to check.
+     */
+    private Map<String, Object> membersPage(MembershipTable.Snapshot snapshot, int start, int limit) {
+        var members = snapshot.members();
+        var self = snapshot.self().key();
         long size = wire.replyBytes(serverId, pageResult(snapshot, List.of(), null));
-        var selected = new ArrayList<Map<String, Object>>();
-        while (position < snapshot.members().size() && selected.size() < limit) {
-            var row = GossipWire.memberView(snapshot.members().get(position));
-            int rowBytes = GossipWire.bytes(row).length + (selected.isEmpty() ? 0 : 1);
-            int next = position + 1;
-            String cursor = next < snapshot.members().size() ? encodeCursor(snapshot.self().key(), next) : null;
-            long withRow = size + rowBytes + (cursor == null ? 0 : cursor.length() + 2 - 4);
-            if (withRow > config.maxExchangeBytes()) {
-                if (selected.isEmpty()) { throw GossipWire.invalid("Single membership row exceeds the reply budget"); }
+        var rows = new ArrayList<Map<String, Object>>();
+        int position = start;
+        while (position < members.size() && rows.size() < limit) {
+            var row = GossipWire.memberView(members.get(position));
+            int rowBytes = GossipWire.bytes(row).length + (rows.isEmpty() ? 0 : 1);
+            if (size + rowBytes + cursorBytes(cursor(self, position + 1, members.size())) > config.maxExchangeBytes()) {
+                // Cannot happen: every record was checked as a page row, at its widest, before it was merged.
+                if (rows.isEmpty()) { throw MembershipException.invalidRecord("Single membership row exceeds the reply budget"); }
                 break;
             }
-            selected.add(row);
+            rows.add(row);
             size += rowBytes;
-            position = next;
+            position++;
         }
-        String next = position < snapshot.members().size() ? encodeCursor(snapshot.self().key(), position) : null;
-        var result = pageResult(snapshot, selected, next);
-        wire.requireReplyFits(snapshot.self().key().serverId(), result);
-        return result;
+        return pageResult(snapshot, rows, cursor(self, position, members.size()));
     }
+
+    /** The cursor to the page that starts at {@code next}, or none when no members are left. */
+    private static String cursor(MemberKey self, int next, int end) { return next < end ? encodeCursor(self, next) : null; }
+
+    /**
+     * What a cursor adds to a page measured without one: its quoted string, in place of the four bytes of null. A
+     * cursor is base64url, so it needs no JSON escaping.
+     */
+    private static int cursorBytes(String cursor) { return cursor == null ? 0 : cursor.length() + 2 - "null".length(); }
 
     private Map<String, Object> pageResult(MembershipTable.Snapshot snapshot, List<Map<String, Object>> selected, String cursor) {
         return wire.page(snapshot.self(), selected, cursor, capacity(snapshot));
@@ -182,16 +201,16 @@ final class GossipCommands {
 
     private int decodeCursor(Object value, MemberKey self) {
         if (!(value instanceof String text) || text.length() > 128 || !CURSOR.matcher(text).matches()) {
-            throw GossipWire.invalid("Invalid membership cursor");
+            throw MembershipException.invalidRecord("Invalid membership cursor");
         }
         String decoded;
         try { decoded = new String(Base64.getUrlDecoder().decode(text), StandardCharsets.UTF_8); }
-        catch (IllegalArgumentException e) { throw GossipWire.invalid("Invalid membership cursor"); }
+        catch (IllegalArgumentException _) { throw MembershipException.invalidRecord("Invalid membership cursor"); }
         String[] fields = decoded.split("/", -1);
         if (fields.length != 2 || !fields[0].equals(self.bootId().toString()) || !OFFSET.matcher(fields[1]).matches()) {
-            throw GossipWire.invalid("Membership cursor belongs to another instance or is malformed");
+            throw MembershipException.invalidRecord("Membership cursor belongs to another instance or is malformed");
         }
         // At most ten digits, so parsing cannot overflow a long.
-        return GossipWire.exactInteger(Long.parseLong(fields[1]), "cursor offset", 0, config.maxRecords());
+        return GossipValidation.exactInteger(Long.parseLong(fields[1]), "cursor offset", 0, config.maxRecords());
     }
 }
