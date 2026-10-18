@@ -167,13 +167,13 @@ class GossipRuntimeTest {
         var calls = new CopyOnWriteArrayList<String>();
         var threads = new CopyOnWriteArrayList<Thread>();
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) {
                 calls.add(peer.serverId()); threads.add(Thread.currentThread());
                 var responder = PeerSelectorTest.record(peer.serverId(), 2, peer.port());
                 table.mergeDirect(responder, List.of());
                 metrics.success(true);
-                return new GossipWire.Exchange(responder, List.of(), 2, Optional.of(peer.serverId().equals("A")
-                        ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED));
+                return new GossipWire.ExchangeReply(responder, List.of(), peer.serverId().equals("A")
+                        ? MembershipTable.Admission.CAPACITY : MembershipTable.Admission.ADMITTED);
             }
             @Override public void close() { /* Nothing to release. */ }
         };
@@ -202,8 +202,8 @@ class GossipRuntimeTest {
         var threads = new CopyOnWriteArrayList<Thread>();
         var helpers = new CopyOnWriteArrayList<Thread>();
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Fallback addresses were not offered"); }
-            @Override public GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("Fallback addresses were not offered"); }
+            @Override public GossipWire.ExchangeReply exchange(List<GossipConfig.Seed> endpoints) throws IOException {
                 threads.add(Thread.currentThread());
                 offered.add(endpoints.stream().map(GossipConfig.Seed::host).toList());
                 throw new java.net.ConnectException("Connection refused");
@@ -228,7 +228,7 @@ class GossipRuntimeTest {
         var metrics = new GossipMetrics();
         var calls = new CopyOnWriteArrayList<Thread>();
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
                 calls.add(Thread.currentThread());
                 throw new dev.mars.client.CommandExecutionException(dev.mars.protocol.CommandReply.failure(UUID.randomUUID(), "A", 1,
                         dev.mars.protocol.CommandError.Code.INVALID_PARAMETERS, "CAPACITY: membership is full"));
@@ -275,7 +275,7 @@ class GossipRuntimeTest {
         var table = new MembershipTable(config, PeerSelectorTest.record("Self", 1, 9000));
         var seen = new java.util.concurrent.CompletableFuture<ClassLoader>();
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
                 seen.complete(Thread.currentThread().getContextClassLoader());
                 throw new IOException("Only the exchange thread's context class loader matters here");
             }
@@ -329,12 +329,12 @@ class GossipRuntimeTest {
         var calls = new CopyOnWriteArrayList<GossipConfig.Seed>();
         var threads = new CopyOnWriteArrayList<Thread>();
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) {
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) {
                 calls.add(peer); threads.add(Thread.currentThread());
                 var responder = new MemberRecord(new MemberKey(peer.serverId(), new UUID(0, 2)), peer.host(), peer.port(),
                         1, MemberRecord.State.ALIVE, Map.of());
                 table.mergeDirect(responder, List.of());
-                return new GossipWire.Exchange(responder, List.of(), 1, Optional.empty());
+                return new GossipWire.ExchangeReply(responder, List.of(), MembershipTable.Admission.ADMITTED);
             }
             @Override public void close() { /* Nothing to release. */ }
         };
@@ -393,13 +393,13 @@ class GossipRuntimeTest {
         volatile boolean closed;
         boolean busy;
         Client(boolean block, boolean fail) { this.block = block; this.fail = fail; }
-        @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+        @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
             calls.add(peer); threads.add(Thread.currentThread());
             if (busy) { throw new GossipTransport.BusyException(); }
             try { if (block) { release.await(); } }
             catch (InterruptedException _) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             if (fail) { throw new IOException("Unavailable fixture peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, Optional.empty());
+            return new GossipWire.ExchangeReply(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), MembershipTable.Admission.ADMITTED);
         }
         @Override public void close() { closed = true; release.countDown(); }
     }

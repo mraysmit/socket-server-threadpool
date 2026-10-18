@@ -262,7 +262,7 @@ class GossipDnsResolverTest {
             return launch(host);
         });
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
             @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime, new java.util.Random(1), resolver)) {
@@ -286,7 +286,7 @@ class GossipDnsResolverTest {
             return launch(host);
         });
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("Stalled DNS must not reach TCP"); }
             @Override public void close() { /* Nothing to release. */ }
         };
         try (var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,

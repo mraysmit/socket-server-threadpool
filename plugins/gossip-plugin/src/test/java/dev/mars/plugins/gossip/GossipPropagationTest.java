@@ -68,8 +68,8 @@ class GossipPropagationTest {
                     assertTrue(sample.requestBytes() <= config.maxExchangeBytes());
                     assertTrue(sample.replyBytes() <= config.maxExchangeBytes());
                     assertEquals(sample.request().messageId(), sample.reply().messageId());
-                    var request = wire.decode(sample.request().parameters(), true);
-                    var response = wire.decode(sample.reply().result(), false);
+                    var request = wire.decodeRequest(sample.request().parameters());
+                    var response = wire.decodeReply(sample.reply().result());
                     assertTrue(request.records().size() <= config.maxBatchMembers());
                     assertTrue(response.records().size() <= config.maxBatchMembers());
                     assertEquals(request.records().size(), request.records().stream().map(MemberRecord::key).distinct().count());
@@ -116,7 +116,7 @@ class GossipPropagationTest {
                 var old = callers.submit(() -> transport.exchange(peer.endpoint()));
                 try {
                     var captured = delay.captured.get(3, TimeUnit.SECONDS);
-                    var oldSender = new GossipWire(config).decode(captured.result(), false).sender();
+                    var oldSender = new GossipWire(config).decodeReply(captured.result()).sender();
                     GossipTestNetwork.await(Duration.ofSeconds(3), () -> peer.self().heartbeat() > oldSender.heartbeat());
                     var current = transport.exchange(peer.endpoint()).sender();
                     assertTrue(current.heartbeat() > oldSender.heartbeat());

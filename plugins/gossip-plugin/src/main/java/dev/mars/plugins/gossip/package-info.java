@@ -27,8 +27,7 @@
  *   <li>{@code GossipTransport}, which merges a reply into the table under its own lock, and {@code PeerSelector}.
  *       They are never held together.</li>
  *   <li>{@code MembershipTable}, which takes no other lock while holding its own.</li>
- *   <li>{@code GossipBatchSelector}, {@code GossipDnsResolver}, {@code GossipMetrics} and the transport's map of
- *       version-1 peers.</li>
+ *   <li>{@code GossipBatchSelector}, {@code GossipDnsResolver} and {@code GossipMetrics}.</li>
  *   <li>{@code GossipLog}.</li>
  * </ol>
  * The order holds because no class keeps a reference to one above it, which {@code GossipLockOrderTest} checks. A

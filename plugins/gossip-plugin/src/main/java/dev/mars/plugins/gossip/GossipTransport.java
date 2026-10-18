@@ -19,7 +19,6 @@ import dev.mars.client.CommandExecutionException;
 import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.CommandRequest;
-import dev.mars.protocol.CommandError;
 
 import java.io.IOException;
 import java.io.InterruptedIOException;
@@ -32,13 +31,11 @@ import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
-import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 /** One bounded UTF-8 JSON exchange per owned connection. Its only threads are watchdogs that each exchange joins. */
@@ -51,16 +48,6 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         ConnectFailure(SocketException cause) { super(cause); }
         SocketException socketError() { return (SocketException) getCause(); }
     }
-    /**
-     * Version-1 peers predate structured error codes, so these exact rejections are the only way to recognise one.
-     * Their wording is fixed by the deployed version-1 code; version-2 peers accept both versions and never send them.
-     */
-    private static final Set<String> VERSION_1_REJECTIONS = Set.of(
-            "INVALID_RECORD: gossipVersion must be between 1 and 1", "INVALID_RECORD: Unsupported gossipVersion");
-    /**
-     * How long a version-1 peer is sent version 1 directly before version 2 is tried again, in case it was upgraded.
-     */
-    static final Duration VERSION_1_RECHECK = Duration.ofMinutes(10);
     /** How often the watchdog checks whether a caller on a platform thread has been interrupted. */
     private static final long INTERRUPT_CHECK_MILLIS = 50;
     private static final String OUTBOUND = "outbound"; // The direction identity log lines name.
@@ -75,10 +62,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final long connectNanos;
     private final long idleNanos;
     private final long exchangeNanos;
-    private final LongSupplier clock;
     private final Supplier<Socket> sockets;
-    // serverId:port of peers that completed a version-1 exchange after rejecting version 2, to when that was learned.
-    private final LinkedHashMap<String, Long> version1Peers = new LinkedHashMap<>();
     private boolean closed;
 
     /** For callers that own a standalone table, as the design document describes. */
@@ -88,26 +72,23 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     public GossipTransport(GossipConfig config, MembershipTable table, Duration connectTimeout,
                            Duration readIdleTimeout, Duration exchangeTimeout) {
-        this(config, table, new GossipMetrics(), connectTimeout, readIdleTimeout, exchangeTimeout, System::nanoTime);
+        this(config, table, new GossipMetrics(), connectTimeout, readIdleTimeout, exchangeTimeout);
     }
 
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics) {
-        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15),
-                System::nanoTime);
+        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15));
     }
 
-    /** The clock times only the version-1 memory; socket deadlines always use System.nanoTime. */
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
-                    Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock) {
-        this(config, table, metrics, connectTimeout, readIdleTimeout, exchangeTimeout, clock, Socket::new);
+                    Duration connectTimeout, Duration readIdleTimeout, Duration exchangeTimeout) {
+        this(config, table, metrics, connectTimeout, readIdleTimeout, exchangeTimeout, Socket::new);
     }
 
     /** Tests replace {@code sockets} to stall a write, which a real loopback socket cannot be relied on to do. */
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics, Duration connectTimeout,
-                    Duration readIdleTimeout, Duration exchangeTimeout, LongSupplier clock, Supplier<Socket> sockets) {
+                    Duration readIdleTimeout, Duration exchangeTimeout, Supplier<Socket> sockets) {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
-        this.clock = java.util.Objects.requireNonNull(clock);
         this.sockets = java.util.Objects.requireNonNull(sockets);
         this.metrics = metrics;
         log = metrics.log(config, table.self());
@@ -118,13 +99,15 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         exchangeNanos = positiveNanos(exchangeTimeout);
     }
 
-    public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException { return exchange(List.of(peer)); }
+    public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
+        return exchange(List.of(peer));
+    }
 
     /**
      * Exchanges with one peer whose host has several resolved addresses, tried in order. Only a socket error while
      * connecting moves on to the next address; timeouts, protocol and identity failures end the exchange.
      */
-    @Override public GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
+    @Override public GossipWire.ExchangeReply exchange(List<GossipConfig.Seed> endpoints) throws IOException {
         var peer = endpoints.getFirst();
         if (endpoints.stream()
                 .anyMatch(endpoint -> !endpoint.serverId().equals(peer.serverId()) || endpoint.port() != peer.port())) {
@@ -150,43 +133,27 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         } finally { permits.release(); }
     }
 
-    /**
-     * One outbound exchange with a peer: a request, its reply checked and merged, and at most one retry, at gossip
-     * version 1, when the peer rejects version 2. Both attempts share the caller's permit and one deadline.
-     */
+    /** One outbound exchange with a peer: a request, and its reply checked and merged, all within one deadline. */
     private final class Conversation {
         private final GossipConfig.Seed peer;
         private final List<GossipConfig.Seed> endpoints;
-        private final String peerKey;
-        private List<InetSocketAddress> candidates;
-        private long deadline;
-        private UUID messageId; // The latest request's, for logging a failure.
+        private UUID messageId; // The request's, for logging a failure.
 
         Conversation(GossipConfig.Seed peer, List<GossipConfig.Seed> endpoints) {
             this.peer = peer;
             this.endpoints = endpoints;
-            peerKey = peer.serverId() + ":" + peer.port();
         }
 
-        GossipWire.Exchange run() throws IOException {
+        GossipWire.ExchangeReply run() throws IOException {
             var self = table.self();
             if (PeerSelector.isSelf(self, peer)) { throw new IOException("Cannot exchange with the local endpoint"); }
             var members = requests.select(table.peers(), config.maxBatchMembers(), wire.requestMemberBudget(self));
-            // Resolve once. Every attempt and address fallback shares one deadline, which starts after resolving.
-            candidates = endpoints.stream().map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port()))
-                    .toList();
-            deadline = System.nanoTime() + exchangeNanos;
-            int version = knownVersion1(peerKey) ? 1 : 2;
-            var reply = send(self, members, version);
-            boolean downgraded = version == 2 && rejectsVersion2(reply);
-            if (downgraded) {
-                version = 1;
-                reply = send(self, members, version);
-            }
-            var result = accepted(reply, version);
+            // Resolve once. Every address fallback shares one deadline, which starts after resolving.
+            var candidates = endpoints.stream()
+                    .map(endpoint -> new InetSocketAddress(endpoint.host(), endpoint.port())).toList();
+            long deadline = System.nanoTime() + exchangeNanos;
+            var result = accepted(send(new GossipWire.ExchangeRequest(self, members), candidates, deadline));
             merge(result);
-            // Remember only after a correlated, identity-checked version-1 exchange has fully succeeded.
-            if (downgraded) { rememberVersion1(peerKey); }
             var conflicts = table.identityConflicts();
             if (!conflicts.isEmpty()) {
                 log.identity(OUTBOUND, peer, messageId, "Reachable duplicate server IDs: " + conflicts);
@@ -195,19 +162,18 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         }
 
         /**
-         * Sends one request and returns its reply, once the reply is correlated and comes from the peer it was meant
+         * Sends the request and returns its reply, once the reply is correlated and comes from the peer it was meant
          * for.
          */
-        private CommandReply send(MemberRecord self, List<MemberRecord> members, int version) throws IOException {
+        private CommandReply send(GossipWire.ExchangeRequest request, List<InetSocketAddress> candidates,
+                long deadline) throws IOException {
             messageId = UUID.randomUUID();
-            byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip",
-                    wire.parameters(self, members, version)));
+            byte[] payload = GossipWire.bytes(new CommandRequest(1, messageId, "gossip", wire.toWire(request)));
             // The batch was chosen to fit, so this only guards against an error in that arithmetic.
             if (payload.length > config.maxExchangeBytes()) {
                 throw new IOException("Outgoing exchange exceeds byte budget");
             }
             var line = exchangeOverFirstReachable(candidates, payload, deadline);
-            candidates = List.of(line.address()); // A retry reuses the address that answered.
             CommandReply reply;
             try { reply = CommandProtocol.parseReply(line.text()); }
             catch (IOException unreadable) {
@@ -222,17 +188,10 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             return reply;
         }
 
-        /**
-         * The exchange a reply carries, once the reply is a success, in the version asked for, from the sender it
-         * names.
-         */
-        private GossipWire.Exchange accepted(CommandReply reply, int version) throws IOException {
+        /** The exchange a reply carries, once the reply is a success from the sender it names. */
+        private GossipWire.ExchangeReply accepted(CommandReply reply) throws IOException {
             if (reply.error() != null) { throw new CommandExecutionException(reply); }
-            var result = wire.decode(reply.result(), false);
-            if (result.gossipVersion() != version) {
-                throw MembershipException.invalidRecord(GossipFailure.VERSION,
-                        "Reply gossipVersion does not match request");
-            }
+            var result = wire.decodeReply(reply.result());
             if (!reply.serverId().equals(result.sender().key().serverId())) {
                 throw new GossipExchangeException(GossipFailure.IDENTITY,
                         "Outer serverId disagrees with gossip sender");
@@ -243,7 +202,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         }
 
         /** Closing cancels uncommitted work as well as sockets, so no merge may start after close returns. */
-        private void merge(GossipWire.Exchange result) throws IOException {
+        private void merge(GossipWire.ExchangeReply result) throws IOException {
             synchronized (GossipTransport.this) {
                 if (closed) { throw new IOException("Gossip transport is closed"); }
                 table.mergeDirect(result.sender(), result.members());
@@ -251,40 +210,6 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             }
         }
     }
-
-    /**
-     * A version-2 request rejected in the exact words a deployed version-1 peer uses, so it is asked again in version
-     * 1.
-     */
-    private static boolean rejectsVersion2(CommandReply reply) {
-        return reply.error() != null && reply.error().code() == CommandError.Code.INVALID_PARAMETERS
-                && VERSION_1_REJECTIONS.contains(reply.error().message());
-    }
-
-    private boolean knownVersion1(String peerKey) {
-        synchronized (version1Peers) {
-            Long learned = version1Peers.get(peerKey);
-            if (learned == null) { return false; }
-            if (clock.getAsLong() - learned >= VERSION_1_RECHECK.toNanos()) {
-                version1Peers.remove(peerKey);
-                return false;
-            }
-            return true;
-        }
-    }
-
-    /** Bounded like the peer selector's retry state: at most one entry per member or seed. */
-    private void rememberVersion1(String peerKey) {
-        synchronized (version1Peers) {
-            version1Peers.remove(peerKey);
-            version1Peers.put(peerKey, clock.getAsLong());
-            while (version1Peers.size() > config.maxMembers() + config.seeds().size()) {
-                version1Peers.pollFirstEntry();
-            }
-        }
-    }
-
-    int version1PeerCount() { synchronized (version1Peers) { return version1Peers.size(); } }
 
     private record Reply(String text, InetSocketAddress address) { }
 

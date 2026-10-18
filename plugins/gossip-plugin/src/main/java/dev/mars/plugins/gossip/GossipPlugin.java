@@ -28,9 +28,10 @@ import java.util.UUID;
 public final class GossipPlugin implements CommandPlugin {
     private final GossipConfig suppliedConfig;
     private final boolean schedule;
+    // Written only by the synchronized start and stop; read without the lock by execute and exchangeWith.
     private volatile Started started;
     private boolean startupAttempted;
-    private volatile boolean stopped;
+    private boolean stopped;
 
     /** ServiceLoader constructor; configuration is read when this instance starts. */
     public GossipPlugin() {
@@ -64,9 +65,10 @@ public final class GossipPlugin implements CommandPlugin {
         try {
             runtime = new GossipRuntime(config, table, transport, metrics);
             var commands = new GossipCommands(config, table, metrics, transport, runtime);
-            started = new Started(transport, commands, runtime);
             if (schedule) { runtime.start(); }
             else { runtime.manual(); }
+            // Published last, so a caller sees only a plugin whose start succeeded.
+            started = new Started(transport, commands, runtime);
         } catch (IOException | RuntimeException | Error e) {
             try { if (runtime == null) { transport.close(); } else { runtime.close(); } }
             catch (IOException cleanup) { e.addSuppressed(cleanup); }
@@ -81,7 +83,7 @@ public final class GossipPlugin implements CommandPlugin {
     }
 
     /** For embedded callers. Never invoked by an incoming command handler. */
-    public GossipWire.Exchange exchangeWith(GossipConfig.Seed peer) throws IOException {
+    public GossipWire.ExchangeReply exchangeWith(GossipConfig.Seed peer) throws IOException {
         Started local = started;
         if (local == null) { throw new IOException("Gossip plugin has not started successfully"); }
         local.runtime().requireActiveExchange();

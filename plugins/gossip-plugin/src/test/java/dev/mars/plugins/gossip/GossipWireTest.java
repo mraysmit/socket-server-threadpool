@@ -25,7 +25,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.TimeUnit;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -41,40 +40,36 @@ class GossipWireTest {
     }
 
     @ParameterizedTest @EnumSource(MembershipTable.Admission.class)
-    void versionTwoDecodesEachAdmissionOutcomeAndVersionOneHasUnknownAdmission(MembershipTable.Admission admission) {
-        var modern = wire.decode(wire.result(peer, List.of(), 2, admission), false);
-        assertEquals(Optional.of(admission), modern.senderAdmission());
-        assertEquals(2, modern.gossipVersion());
-        var legacy = wire.decode(wire.result(peer, List.of()), false);
-        assertEquals(1, legacy.gossipVersion());
-        assertEquals(Optional.empty(), legacy.senderAdmission(), "Legacy success must not imply admission");
+    void eachAdmissionOutcomeDecodesAsItWasSent(MembershipTable.Admission admission) {
+        var reply = wire.decodeReply(wire.toWire(new GossipWire.ExchangeReply(peer, List.of(), admission)));
+        assertEquals(admission, reply.senderAdmission());
     }
 
     @Test void onlyAnExchangeRequestIsDecodedAsOne() {
-        var request = new LinkedHashMap<>(wire.parameters(peer, List.of()));
+        var request = new LinkedHashMap<>(wire.toWire(new GossipWire.ExchangeRequest(peer, List.of())));
         request.put("operation", "members");
-        assertEquals("operation must be exchange", assertThrows(MembershipException.class, () -> wire.decode(request, true)).getMessage());
+        assertEquals("operation must be exchange", assertThrows(MembershipException.class, () -> wire.decodeRequest(request)).getMessage());
     }
 
     @Test void aBatchOverTheLimitIsRefusedBeforeAnyMemberIsDecoded() {
         // With max.batch.members at 4, a sender and three members fit.
         var three = List.of(GossipCommandsTest.member("A", 3), GossipCommandsTest.member("B", 4), GossipCommandsTest.member("C", 5));
-        assertEquals(3, wire.decode(wire.parameters(peer, three), true).members().size());
+        assertEquals(3, wire.decodeRequest(wire.toWire(new GossipWire.ExchangeRequest(peer, three))).members().size());
         // Four members, none of them a record: the limit must be checked before any is decoded.
-        var four = new LinkedHashMap<>(wire.parameters(peer, three));
+        var four = new LinkedHashMap<>(wire.toWire(new GossipWire.ExchangeRequest(peer, three)));
         four.put("members", List.of("not", "a", "member", "record"));
         assertEquals("Sender and members exceed max.batch.members",
-                assertThrows(MembershipException.class, () -> wire.decode(four, true)).getMessage());
+                assertThrows(MembershipException.class, () -> wire.decodeRequest(four)).getMessage());
     }
 
     @Test void anExchangeThatIsNotAnObjectIsAProtocolFailure() {
         for (Object value : List.of(List.of(), "exchange", 1)) {
-            assertEquals(GossipFailure.PROTOCOL, GossipFailure.of(assertThrows(MembershipException.class, () -> wire.decode(value, false))));
+            assertEquals(GossipFailure.PROTOCOL, GossipFailure.of(assertThrows(MembershipException.class, () -> wire.decodeReply(value))));
         }
     }
 
     @Test void missingMalformedAndUnexpectedAdmissionFieldsAreRejectedBeforeAnyMerge() {
-        var valid = wire.result(peer, List.of(), 2, MembershipTable.Admission.ADMITTED);
+        var valid = wire.toWire(new GossipWire.ExchangeReply(peer, List.of(), MembershipTable.Admission.ADMITTED));
         var cases = new ArrayList<Map<String, Object>>();
         for (Object value : List.of(true, 1, "UNKNOWN", "admitted", Map.of("state", "ADMITTED"))) {
             var changed = new LinkedHashMap<>(valid);
@@ -87,21 +82,19 @@ class GossipWireTest {
         var nullValue = new LinkedHashMap<>(valid);
         nullValue.put("senderAdmission", null);
         cases.add(nullValue);
-        var legacyWithHint = new LinkedHashMap<>(valid);
-        legacyWithHint.put("gossipVersion", 1);
-        cases.add(legacyWithHint);
+        var older = new LinkedHashMap<>(valid);
+        older.put("gossipVersion", 1);
+        cases.add(older);
         var future = new LinkedHashMap<>(valid);
         future.put("gossipVersion", 3);
         cases.add(future);
         var unknown = new LinkedHashMap<>(valid);
         unknown.put("capacity", true);
         cases.add(unknown);
-        for (var value : cases) { assertThrows(MembershipException.class, () -> wire.decode(value, false)); }
-        for (int version : List.of(1, 2)) {
-            var request = new LinkedHashMap<>(wire.parameters(peer, List.of(), version));
-            assertEquals(version, wire.decode(request, true).gossipVersion());
-            request.put("senderAdmission", "ADMITTED");
-            assertThrows(MembershipException.class, () -> wire.decode(request, true));
-        }
+        for (var value : cases) { assertThrows(MembershipException.class, () -> wire.decodeReply(value)); }
+        var request = new LinkedHashMap<>(wire.toWire(new GossipWire.ExchangeRequest(peer, List.of())));
+        assertEquals(peer, wire.decodeRequest(request).sender());
+        request.put("senderAdmission", "ADMITTED");
+        assertThrows(MembershipException.class, () -> wire.decodeRequest(request));
     }
 }

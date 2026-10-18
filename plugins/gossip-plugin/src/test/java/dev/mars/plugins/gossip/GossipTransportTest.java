@@ -52,7 +52,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -72,8 +71,7 @@ class GossipTransportTest {
     }
 
     private static byte[] reply(GossipConfig config, CommandRequest request, MemberRecord sender) {
-        return line(GossipWire.bytes(CommandReply.success(request, "Peer", 1, new GossipWire(config).result(sender, List.of(),
-                ((Number) request.parameters().get("gossipVersion")).intValue(), MembershipTable.Admission.ADMITTED))));
+        return line(GossipWire.bytes(CommandReply.success(request, "Peer", 1, new GossipWire(config).toWire(new GossipWire.ExchangeReply(sender, List.of(), MembershipTable.Admission.ADMITTED)))));
     }
 
     private static byte[] line(byte[] body) {
@@ -176,8 +174,7 @@ class GossipTransportTest {
                     CommandError.Code.INVALID_PARAMETERS, "CAPACITY: membership is full")));
         }
         var sender = responder(port, 2);
-        var result = new LinkedHashMap<>(new GossipWire(config).result(sender, List.of(),
-                ((Number) request.parameters().get("gossipVersion")).intValue(), MembershipTable.Admission.ADMITTED));
+        var result = new LinkedHashMap<>(new GossipWire(config).toWire(new GossipWire.ExchangeReply(sender, List.of(), MembershipTable.Admission.ADMITTED)));
         var fields = new LinkedHashMap<>(sender.toWire());
         UUID id = request.messageId();
         String outer = "Peer";
@@ -205,130 +202,26 @@ class GossipTransportTest {
         return line(body);
     }
 
-    @ParameterizedTest @ValueSource(strings = {"INVALID_RECORD: gossipVersion must be between 1 and 1", "INVALID_RECORD: Unsupported gossipVersion"})
-    void legacyVersionRejectionRetriesOnceWithFreshCorrelationAndPreservesSuccessfulMetrics(String rejection) throws Exception {
+    @Test void uncorrelatedRepliesErrorsAndRepliesInAnotherVersionMergeNothing() throws Exception {
         var config = GossipCommandsTest.config(32768, 4, 8);
-        var table = table(config);
-        var metrics = new GossipMetrics();
-        var attempts = new java.util.concurrent.CopyOnWriteArrayList<CommandRequest>();
-        try (var transport = new GossipTransport(config, table, metrics);
-             var peer = new ProtocolPeer(2, (socket, port, request) -> {
-                 attempts.add(request);
-                 if (attempts.size() == 1) {
-                     assertEquals(2, ((Number) request.parameters().get("gossipVersion")).intValue());
-                     socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
-                             CommandError.Code.INVALID_PARAMETERS, rejection))));
-                 } else {
-                     assertEquals(1, ((Number) request.parameters().get("gossipVersion")).intValue());
-                     socket.getOutputStream().write(reply(config, request, responder(port, 2)));
-                 }
-             })) {
-            var result = transport.exchange(peer.endpoint());
-            assertEquals(1, result.gossipVersion());
-            assertEquals(Optional.empty(), result.senderAdmission());
-            assertEquals(2, attempts.size());
-            assertNotEquals(attempts.getFirst().messageId(), attempts.getLast().messageId());
-            assertEquals(attempts.getFirst().parameters().get("members"), attempts.getLast().parameters().get("members"));
-            assertEquals(1, metrics.outbound.get());
-            assertEquals(0, metrics.outboundFailures.get());
-            assertEquals(0, transport.inflight());
-            System.out.println("Admission compatibility test PASSED | attemptedVersion=2 | fallbackVersion=1 | admission=unknown");
-        }
-    }
-
-    /** Rejects version 2 exactly as deployed version-1 code does, unless upgraded; answers version 1 normally. */
-    private static Answer version1Peer(GossipConfig config, List<Integer> versions, java.util.function.BooleanSupplier upgraded, long boot) {
-        return (socket, port, request) -> {
-            int version = ((Number) request.parameters().get("gossipVersion")).intValue();
-            versions.add(version);
-            if (version == 2 && !upgraded.getAsBoolean()) {
-                socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
-                        CommandError.Code.INVALID_PARAMETERS, "INVALID_RECORD: Unsupported gossipVersion"))));
-            } else { socket.getOutputStream().write(reply(config, request, responder(port, boot))); }
-        };
-    }
-
-    @Test void aPeerThatRejectsVersion2IsSentVersion1DirectlyAfterwards() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-        // Four connections in total: the peer fixture fails on close if the transport opens more or fewer.
-        try (var transport = new GossipTransport(config, table(config), new GossipMetrics());
-             var peer = new ProtocolPeer(4, version1Peer(config, versions, () -> false, 2))) {
-            for (int i = 0; i < 3; i++) { assertEquals(1, transport.exchange(peer.endpoint()).gossipVersion()); }
-            assertEquals(List.of(2, 1, 1, 1), versions, "Only the first exchange pays for the rejected version-2 attempt");
-            assertEquals(1, transport.version1PeerCount());
-        }
-    }
-
-    @Test void aRememberedVersion1PeerIsTriedWithVersion2AgainAfterTheRecheckInterval() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        var clock = new java.util.concurrent.atomic.AtomicLong();
-        var upgraded = new java.util.concurrent.atomic.AtomicBoolean();
-        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-        try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), Duration.ofSeconds(5),
-                Duration.ofSeconds(10), Duration.ofSeconds(15), clock::get);
-             var peer = new ProtocolPeer(4, version1Peer(config, versions, upgraded::get, 2))) {
-            transport.exchange(peer.endpoint());
-            clock.addAndGet(GossipTransport.VERSION_1_RECHECK.toNanos() - 1);
-            assertEquals(1, transport.exchange(peer.endpoint()).gossipVersion(), "Still within the recheck interval");
-            upgraded.set(true);
-            clock.addAndGet(1);
-            var current = transport.exchange(peer.endpoint());
-            assertEquals(2, current.gossipVersion(), "The upgraded peer is offered version 2 again");
-            assertEquals(Optional.of(MembershipTable.Admission.ADMITTED), current.senderAdmission());
-            assertEquals(List.of(2, 1, 1, 2), versions);
-            assertEquals(0, transport.version1PeerCount());
-        }
-    }
-
-    @Test void aFailedVersion1RetryIsNotRememberedAsAVersion1Peer() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-        try (var transport = new GossipTransport(config, table(config), new GossipMetrics());
-             var peer = new ProtocolPeer(4, (socket, port, request) -> {
-                 int version = ((Number) request.parameters().get("gossipVersion")).intValue();
-                 versions.add(version);
-                 socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
-                         CommandError.Code.INVALID_PARAMETERS, version == 2 ? "INVALID_RECORD: Unsupported gossipVersion" : "CAPACITY: full"))));
-             })) {
-            for (int i = 0; i < 2; i++) { assertThrows(CommandExecutionException.class, () -> transport.exchange(peer.endpoint())); }
-            assertEquals(List.of(2, 1, 2, 1), versions, "Without a completed version-1 exchange, version 2 is tried first again");
-            assertEquals(0, transport.version1PeerCount());
-        }
-    }
-
-    @Test void version1MemoryHoldsAtMostOneEntryPerMemberOrSeed() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 2);
-        assertEquals(2, config.maxMembers() + config.seeds().size());
-        try (var transport = new GossipTransport(config, table(config), new GossipMetrics())) {
-            for (int i = 0; i < 3; i++) {
-                var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-                try (var peer = new ProtocolPeer(2, version1Peer(config, versions, () -> false, 10L + i))) {
-                    transport.exchange(peer.endpoint());
-                    assertEquals(List.of(2, 1), versions);
-                }
-                assertEquals(Math.min(i + 1, 2), transport.version1PeerCount());
-            }
-        }
-    }
-
-    @Test void uncorrelatedVersionErrorsAndUnsolicitedLegacySuccessCannotDowngradeTheExchange() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        for (String kind : List.of("messageId", "serverId", "errorCode", "unrelatedError", "legacySuccess")) {
+        for (String kind : List.of("messageId", "serverId", "errorCode", "versionError", "otherVersion")) {
             var table = table(config);
             try (var transport = new GossipTransport(config, table, Duration.ofMillis(200), Duration.ofMillis(200), Duration.ofMillis(400));
                  var peer = new ProtocolPeer((socket, port, request) -> {
-                     Object response = kind.equals("legacySuccess")
-                             ? CommandReply.success(request, "Peer", 1, new GossipWire(config).result(responder(port, 2), List.of()))
+                     var older = new java.util.LinkedHashMap<>(new GossipWire(config).toWire(
+                             new GossipWire.ExchangeReply(responder(port, 2), List.of(), MembershipTable.Admission.ADMITTED)));
+                     older.put("gossipVersion", 1);
+                     Object response = kind.equals("otherVersion")
+                             ? CommandReply.success(request, "Peer", 1, older)
                              : CommandReply.failure(kind.equals("messageId") ? UUID.randomUUID() : request.messageId(),
                              kind.equals("serverId") ? "Other" : "Peer", 1,
                              kind.equals("errorCode") ? CommandError.Code.UNKNOWN_INSTRUCTION : CommandError.Code.INVALID_PARAMETERS,
-                             kind.equals("unrelatedError") ? "INVALID_RECORD: Invalid exchange fields" : "INVALID_RECORD: Unsupported gossipVersion");
+                             "INVALID_RECORD: gossipVersion must be 2");
                      socket.getOutputStream().write(line(GossipWire.bytes(response)));
                  })) {
                 var failure = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
-                if (kind.equals("errorCode") || kind.equals("unrelatedError")) { assertInstanceOf(CommandExecutionException.class, failure); }
-                else if (kind.equals("legacySuccess")) { assertEquals(GossipFailure.VERSION, GossipFailure.of(failure)); }
+                if (kind.equals("errorCode") || kind.equals("versionError")) { assertInstanceOf(CommandExecutionException.class, failure); }
+                else if (kind.equals("otherVersion")) { assertEquals(GossipFailure.VERSION, GossipFailure.of(failure)); }
                 else { assertEquals(GossipFailure.IDENTITY, GossipFailure.of(failure)); }
                 assertEquals(1, table.snapshot().retainedIdentities());
                 assertEquals(0, transport.inflight());
@@ -384,24 +277,6 @@ class GossipTransportTest {
                     new GossipConfig.Seed("Peer", "127.0.0.1", 9100), new GossipConfig.Seed("Other", "127.0.0.2", 9100))));
             assertThrows(IllegalArgumentException.class, () -> transport.exchange(List.of(
                     new GossipConfig.Seed("Peer", "127.0.0.1", 9100), new GossipConfig.Seed("Peer", "127.0.0.2", 9200))));
-            assertEquals(0, transport.inflight());
-        }
-    }
-
-    @Test void versionFallbackSharesTheOriginalOverallDeadlineAndReleasesItsPermit() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        var attempts = new java.util.concurrent.atomic.AtomicInteger();
-        try (var transport = new GossipTransport(config, table(config), Duration.ofSeconds(1), Duration.ofSeconds(2), Duration.ofSeconds(1));
-             var peer = new ProtocolPeer(2, (socket, port, request) -> {
-                 int attempt = attempts.incrementAndGet();
-                 TimeUnit.MILLISECONDS.sleep(600);
-                 if (attempt == 1) {
-                     socket.getOutputStream().write(line(GossipWire.bytes(CommandReply.failure(request.messageId(), "Peer", 1,
-                             CommandError.Code.INVALID_PARAMETERS, "INVALID_RECORD: Unsupported gossipVersion"))));
-                 } else { socket.getOutputStream().write(reply(config, request, responder(port, 2))); }
-             })) {
-            assertThrows(SocketTimeoutException.class, () -> transport.exchange(peer.endpoint()));
-            assertEquals(2, attempts.get());
             assertEquals(0, transport.inflight());
         }
     }
@@ -543,7 +418,7 @@ class GossipTransportTest {
             var third = new MemberRecord(new MemberKey("Third", new UUID(0, 3)), "127.0.0.1", 1, 7,
                     MemberRecord.State.ALIVE, metadata);
             var bClient = new TextMessageClient("127.0.0.1", b.getPort(), "Server-B");
-            bClient.execute("gossip", new GossipWire(config).parameters(third, List.of()));
+            bClient.execute("gossip", new GossipWire(config).toWire(new GossipWire.ExchangeRequest(third, List.of())));
             for (int i = 0; i < 3; i++) { first.exchangeWith(bEndpoint); }
             var aClient = new TextMessageClient("127.0.0.1", a.getPort(), "Server-A");
             var status = assertInstanceOf(Map.class, aClient.execute("gossip", Map.of("operation", "status")).result());
@@ -581,11 +456,10 @@ class GossipTransportTest {
         var second = new GossipPlugin(config, false);
         try (var _ = TestServer.start("Server-A", first); var b = TestServer.start("Server-B", second)) {
             var client = new TextMessageClient("127.0.0.1", b.getPort(), "Server-B");
-            client.execute("gossip", new GossipWire(config).parameters(GossipCommandsTest.member("Third", 3), List.of()));
+            client.execute("gossip", new GossipWire(config).toWire(new GossipWire.ExchangeRequest(GossipCommandsTest.member("Third", 3), List.of())));
             var reply = first.exchangeWith(new GossipConfig.Seed("Server-B", "127.0.0.1", b.getPort()));
             assertEquals("Server-B", reply.sender().key().serverId());
-            assertEquals(2, reply.gossipVersion());
-            assertEquals(Optional.of(MembershipTable.Admission.CAPACITY), reply.senderAdmission());
+            assertEquals(MembershipTable.Admission.CAPACITY, reply.senderAdmission());
             var status = GossipCommandsTest.execute(first, Map.of("operation", "status"));
             assertEquals(false, status.get("isolated"));
             assertEquals(2, ((Map<?, ?>) status.get("capacity")).get("retainedIdentities"));
@@ -617,7 +491,7 @@ class GossipTransportTest {
             for (int i = 0; i < 5; i++) {
                 int boot = 100 + i;
                 try (var peer = new ProtocolPeer((socket, port, request) -> {
-                    var incoming = new GossipWire(config).decode(request.parameters(), true);
+                    var incoming = new GossipWire(config).decodeRequest(request.parameters());
                     assertEquals(1, incoming.members().size());
                     assertEquals("Self", incoming.sender().key().serverId());
                     seen.add(incoming.members().getFirst().key().serverId());
@@ -662,7 +536,7 @@ class GossipTransportTest {
             Future<Socket> accepted = acceptor.submit(listener::accept);
             var peer = new GossipConfig.Seed("Peer", "127.0.0.1", listener.getLocalPort());
             try (var transport = new GossipTransport(config, table(config), new GossipMetrics(), Duration.ofSeconds(1),
-                    Duration.ofSeconds(10), Duration.ofSeconds(1), System::nanoTime, () -> new StalledWriteSocket(writing))) {
+                    Duration.ofSeconds(10), Duration.ofSeconds(1), () -> new StalledWriteSocket(writing))) {
                 var completed = new CompletableFuture<Throwable>();
                 long start = System.nanoTime();
                 Thread.ofVirtual().start(() -> {
@@ -778,28 +652,6 @@ class GossipTransportTest {
         }
     }
 
-    @Test void aVersion1RetryGoesOnlyToTheAddressThatAnswered() throws Exception {
-        var config = GossipCommandsTest.config(32768, 4, 8);
-        var versions = new java.util.concurrent.CopyOnWriteArrayList<Integer>();
-        var stray = new java.util.concurrent.atomic.AtomicReference<ServerSocket>();
-        var legacy = version1Peer(config, versions, () -> false, 2);
-        try (var peer = new ProtocolPeer(2, (socket, port, request) -> {
-                 // The address that refused the first connection listens from now on, so a retry there would reach it.
-                 if (stray.get() == null) { stray.set(new ServerSocket(port, 1, java.net.InetAddress.getByAddress(new byte[] {127, 0, 0, 2}))); }
-                 legacy.run(socket, port, request);
-             });
-             var transport = new GossipTransport(config, table(config), Duration.ofSeconds(5), Duration.ofSeconds(2), Duration.ofSeconds(15))) {
-            var answering = peer.endpoint();
-            var refusing = new GossipConfig.Seed(answering.serverId(), "127.0.0.2", answering.port());
-            try {
-                transport.exchange(List.of(refusing, answering));
-                assertEquals(List.of(2, 1), versions);
-                stray.get().setSoTimeout(1);
-                assertThrows(SocketTimeoutException.class, () -> stray.get().accept().close(), "The retry must not try the address that refused");
-            } finally { if (stray.get() != null) { stray.get().close(); } }
-        }
-    }
-
     @Test void recordsThatCouldNotBeForwardedAreRejectedBeforeMerging() throws Exception {
         var config = GossipCommandsTest.config(4096, 4, 8);
         // A large local record leaves too little room beside it, in this process's own replies, for the large member.
@@ -810,8 +662,7 @@ class GossipTransportTest {
                 Map.of("text", "y".repeat(2300)));
         try (var transport = new GossipTransport(config, table);
              var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(line(GossipWire.bytes(
-                     CommandReply.success(request, "Peer", 1, new GossipWire(config).result(responder(port, 2), List.of(large),
-                             ((Number) request.parameters().get("gossipVersion")).intValue(), MembershipTable.Admission.ADMITTED))))))) {
+                     CommandReply.success(request, "Peer", 1, new GossipWire(config).toWire(new GossipWire.ExchangeReply(responder(port, 2), List.of(large), MembershipTable.Admission.ADMITTED)))))))) {
             var rejected = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
             assertTrue(rejected.getMessage().contains("Complete reply exceeds max.exchange.bytes"), rejected.getMessage());
             assertEquals(1, table.snapshot().retainedIdentities(), "Neither the responder nor the large member is merged");
@@ -827,7 +678,7 @@ class GossipTransportTest {
         };
         try (var peer = new ProtocolPeer((socket, port, request) -> socket.getOutputStream().write(reply(config, request, responder(port, 2))));
              var transport = new GossipTransport(config, table, new GossipMetrics(), Duration.ofSeconds(1), Duration.ofSeconds(2),
-                     Duration.ofSeconds(5), System::nanoTime, () -> new CloseOnReplySocket(closeTransport))) {
+                     Duration.ofSeconds(5), () -> new CloseOnReplySocket(closeTransport))) {
             owner.set(transport);
             var refused = assertThrows(IOException.class, () -> transport.exchange(peer.endpoint()));
             assertEquals("Gossip transport is closed", refused.getMessage());

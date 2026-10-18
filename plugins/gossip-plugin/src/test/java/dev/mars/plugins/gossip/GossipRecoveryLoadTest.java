@@ -96,7 +96,7 @@ class GossipRecoveryLoadTest {
                 return true;
             });
             var wire = new GossipWire(nodes.getFirst().config());
-            nodes.getFirst().client().execute("gossip", wire.parameters(nodes.get(3).self(), List.of(departed)));
+            nodes.getFirst().client().execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(nodes.get(3).self(), List.of(departed))));
             assertEquals("LEFT", rows(nodes.getFirst()).get("Node-5").get("state"), "Stale ALIVE revived a departed boot after healing");
             for (var node : nodes) {
                 var capacity = (Map<?, ?>) node.status().get("capacity");

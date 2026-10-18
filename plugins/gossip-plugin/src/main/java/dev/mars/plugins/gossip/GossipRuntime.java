@@ -35,9 +35,9 @@ import java.util.random.RandomGenerator;
 /** Per-instance jittered rounds and a bounded set of owned virtual exchange workers; no task queue. */
 final class GossipRuntime implements AutoCloseable {
     interface ExchangeClient extends AutoCloseable {
-        GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException;
+        GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException;
         /** Addresses of one host, tried in order on connection failure. Clients without fallback use the first. */
-        default GossipWire.Exchange exchange(List<GossipConfig.Seed> endpoints) throws IOException {
+        default GossipWire.ExchangeReply exchange(List<GossipConfig.Seed> endpoints) throws IOException {
             return exchange(endpoints.getFirst());
         }
         default int inflight() { return 0; }
@@ -316,9 +316,9 @@ final class GossipRuntime implements AutoCloseable {
     }
 
     /** A correlated reply: a peer that had no room for this process is backed off; any other counts as a success. */
-    private void answered(GossipConfig.Seed peer, GossipConfig.Seed endpoint, GossipWire.Exchange reply,
+    private void answered(GossipConfig.Seed peer, GossipConfig.Seed endpoint, GossipWire.ExchangeReply reply,
             boolean departing) {
-        if (!departing && reply.senderAdmission().equals(Optional.of(MembershipTable.Admission.CAPACITY))) {
+        if (!departing && reply.senderAdmission() == MembershipTable.Admission.CAPACITY) {
             selector.capacity(peer, endpoint);
             metrics.failure(GossipFailure.CAPACITY);
         } else { selector.success(peer, endpoint); }

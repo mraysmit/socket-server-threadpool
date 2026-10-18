@@ -24,21 +24,18 @@ import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
-import static dev.mars.plugins.gossip.GossipFields.ACTIVE_MEMBERS;
-import static dev.mars.plugins.gossip.GossipFields.ADMISSIONS_SKIPPED;
 import static dev.mars.plugins.gossip.GossipFields.CAPACITY;
 import static dev.mars.plugins.gossip.GossipFields.CURSOR;
 import static dev.mars.plugins.gossip.GossipFields.EXCHANGE_OPERATION;
 import static dev.mars.plugins.gossip.GossipFields.GOSSIP_VERSION;
 import static dev.mars.plugins.gossip.GossipFields.LIMIT;
 import static dev.mars.plugins.gossip.GossipFields.OPERATION;
-import static dev.mars.plugins.gossip.GossipFields.RETAINED_IDENTITIES;
 import static dev.mars.plugins.gossip.GossipFields.SELF;
 import static dev.mars.plugins.gossip.GossipFields.SWARM_ID;
-import static dev.mars.plugins.gossip.GossipFields.TOMBSTONES;
 
 /** Handlers validate, merge, inspect, or request asynchronous departure. Never dial peers here. */
 final class GossipCommands {
@@ -110,7 +107,7 @@ final class GossipCommands {
     }
 
     private Object exchange(Map<String, Object> parameters) {
-        var incoming = wire.decode(parameters, true);
+        var incoming = wire.decodeRequest(parameters);
         var self = table.self();
         MembershipTable.ExchangeMerge merge;
         try {
@@ -132,8 +129,8 @@ final class GossipCommands {
         // The batch stays within what the empty reply leaves, and sizes are additive, so the reply fits without
         // being encoded again just to check; the host encodes it once, to send it.
         var batch = responses.select(table.peers(), config.maxBatchMembers(),
-                wire.replyMemberBudget(self, incoming.gossipVersion(), admission));
-        var result = wire.result(self, batch, incoming.gossipVersion(), admission);
+                wire.replyMemberBudget(self, admission));
+        var result = wire.toWire(new GossipWire.ExchangeReply(self, batch, admission));
         metrics.success(false);
         return result;
     }
@@ -146,22 +143,24 @@ final class GossipCommands {
                 config.maxBatchMembers()) : Math.min(DEFAULT_PAGE_LIMIT, config.maxBatchMembers());
         var snapshot = table.snapshot();
         int start = parameters.containsKey(CURSOR) ? decodeCursor(parameters.get(CURSOR), snapshot.self().key()) : 0;
-        return membersPage(snapshot, start, limit);
+        return wire.toWire(membersPage(snapshot, start, limit));
     }
 
     /**
      * Up to {@code limit} rows from {@code start}, as many as fit. Page sizes are additive (see GossipWire), so the
      * empty page is measured once and each row once, and the page is sized exactly; it is not encoded again to check.
      */
-    private Map<String, Object> membersPage(MembershipTable.Snapshot snapshot, int start, int limit) {
+    private GossipWire.MembersPage membersPage(MembershipTable.Snapshot snapshot, int start, int limit) {
         var members = snapshot.members();
         var self = snapshot.self().key();
-        long size = wire.replyBytes(serverId, pageResult(snapshot, List.of(), null));
-        var rows = new ArrayList<Map<String, Object>>();
+        var capacity = GossipWire.Capacity.of(snapshot);
+        var empty = new GossipWire.MembersPage(snapshot.self(), List.of(), Optional.empty(), capacity);
+        long size = wire.replyBytes(serverId, wire.toWire(empty));
+        var rows = new ArrayList<MembershipTable.MemberView>();
         int position = start;
         while (position < members.size() && rows.size() < limit) {
-            var row = GossipWire.memberView(members.get(position));
-            int rowBytes = GossipWire.bytes(row).length + (rows.isEmpty() ? 0 : 1);
+            var row = members.get(position);
+            int rowBytes = GossipWire.rowBytes(row) + (rows.isEmpty() ? 0 : 1);
             if (size + rowBytes + cursorBytes(cursor(self, position + 1, members.size())) > config.maxExchangeBytes()) {
                 // Cannot happen: every record was checked as a page row, at its widest, before it was merged.
                 if (rows.isEmpty()) {
@@ -173,23 +172,20 @@ final class GossipCommands {
             size += rowBytes;
             position++;
         }
-        return pageResult(snapshot, rows, cursor(self, position, members.size()));
+        return new GossipWire.MembersPage(snapshot.self(), rows, cursor(self, position, members.size()), capacity);
     }
 
     /** The cursor to the page that starts at {@code next}, or none when no members are left. */
-    private static String cursor(MemberKey self, int next, int end) {
-        return next < end ? encodeCursor(self, next) : null;
+    private static Optional<String> cursor(MemberKey self, int next, int end) {
+        return next < end ? Optional.of(encodeCursor(self, next)) : Optional.empty();
     }
 
     /**
      * What a cursor adds to a page measured without one: its quoted string, in place of the four bytes of null. A
      * cursor is base64url, so it needs no JSON escaping.
      */
-    private static int cursorBytes(String cursor) { return cursor == null ? 0 : cursor.length() + 2 - "null".length(); }
-
-    private Map<String, Object> pageResult(MembershipTable.Snapshot snapshot, List<Map<String, Object>> selected,
-            String cursor) {
-        return wire.page(snapshot.self(), selected, cursor, capacity(snapshot));
+    private static int cursorBytes(Optional<String> cursor) {
+        return cursor.map(text -> text.length() + 2 - "null".length()).orElse(0);
     }
 
     private Map<String, Object> status() {
@@ -198,7 +194,7 @@ final class GossipCommands {
         for (var assessment : MembershipTable.Assessment.values()) { assessments.put(assessment.name(), 0); }
         for (var member : snapshot.members()) { assessments.merge(member.assessment().name(), 1, Integer::sum); }
         var result = new LinkedHashMap<String, Object>();
-        result.put(GOSSIP_VERSION, 1);
+        result.put(GOSSIP_VERSION, GossipWire.VERSION);
         result.put(SWARM_ID, config.swarmId());
         result.put(SELF, snapshot.self().toWire());
         result.put("workerState", runtime.state().name());
@@ -209,16 +205,11 @@ final class GossipCommands {
         result.put("departure", runtime.departure());
         result.put("exchanges", metrics.counts(transport.inflight()));
         result.put("lastSuccessfulExchangeAgeMillis", GossipWire.orNull(metrics.lastSuccessAgeMillis()));
-        result.put(CAPACITY, capacity(snapshot));
+        result.put(CAPACITY, GossipWire.toWire(GossipWire.Capacity.of(snapshot)));
         result.put("assessments", assessments);
         result.put("identityConflictCount", snapshot.identityConflicts().size());
         result.put("runtime", metrics.runtime());
         return result;
-    }
-
-    private static Map<String, Object> capacity(MembershipTable.Snapshot snapshot) {
-        return Map.of(ACTIVE_MEMBERS, snapshot.activeMembers(), RETAINED_IDENTITIES, snapshot.retainedIdentities(),
-                TOMBSTONES, snapshot.tombstones(), ADMISSIONS_SKIPPED, snapshot.admissionsSkipped());
     }
 
     private static String encodeCursor(MemberKey self, int next) {

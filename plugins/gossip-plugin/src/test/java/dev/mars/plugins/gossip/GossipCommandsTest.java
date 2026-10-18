@@ -61,8 +61,8 @@ class GossipCommandsTest {
         try {
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
-            var result = execute(plugin, wire.parameters(peer, List.of(member("Forwarded", 3))));
-            assertEquals(Set.of("gossipVersion", "swarmId", "sender", "members"), result.keySet());
+            var result = execute(plugin, wire.toWire(new GossipWire.ExchangeRequest(peer, List.of(member("Forwarded", 3)))));
+            assertEquals(Set.of("gossipVersion", "swarmId", "sender", "members", "senderAdmission"), result.keySet());
             assertEquals("Self", ((Map<?, ?>) result.get("sender")).get("serverId"));
             var status = execute(plugin, Map.of("operation", "status"));
             assertEquals(false, status.get("isolated"));
@@ -86,7 +86,7 @@ class GossipCommandsTest {
         try {
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
-            var valid = wire.parameters(peer, List.of());
+            var valid = wire.toWire(new GossipWire.ExchangeRequest(peer, List.of()));
             var cases = new ArrayList<Map<String, Object>>();
             for (var change : Map.<String, Object>of("gossipVersion", new BigDecimal("1.0"), "swarmId", "other",
                     "sender", "not-an-object", "members", "not-an-array", "unknown", true).entrySet()) {
@@ -94,7 +94,7 @@ class GossipCommandsTest {
                 parameters.put(change.getKey(), change.getValue());
                 cases.add(parameters);
             }
-            cases.add(wire.parameters(peer, List.of(peer)));
+            cases.add(wire.toWire(new GossipWire.ExchangeRequest(peer, List.of(peer))));
             var malformed = new LinkedHashMap<>(member("Bad", 3).toWire());
             malformed.put("heartbeat", -1);
             var partial = new LinkedHashMap<>(valid);
@@ -116,7 +116,7 @@ class GossipCommandsTest {
             var base = member("Peer", 2);
             var peer = new MemberRecord(base.key(), base.host(), base.port(), 1, base.state(), Map.of("text", "a".repeat(1250)));
             assertTrue(peer.serializedBytes() < config.maxExchangeBytes());
-            var parameters = new GossipWire(config).parameters(peer, List.of());
+            var parameters = new GossipWire(config).toWire(new GossipWire.ExchangeRequest(peer, List.of()));
             assertTrue(new GossipWire(config).requestBytes(parameters).length > config.maxExchangeBytes());
             assertThrows(InvalidParametersException.class, () -> plugin.execute(parameters));
             assertEquals(1, ((List<?>) execute(plugin, Map.of("operation", "members")).get("members")).size());
@@ -128,7 +128,7 @@ class GossipCommandsTest {
         var plugin = plugin(config);
         try {
             var wire = new GossipWire(config);
-            for (int i = 0; i < 10; i++) { plugin.execute(wire.parameters(member("Peer-" + i, 2 + i), List.of())); }
+            for (int i = 0; i < 10; i++) { plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(member("Peer-" + i, 2 + i), List.of()))); }
             var seen = new HashSet<String>();
             Object cursor = null;
             var cursors = new HashSet<Object>();
@@ -154,7 +154,7 @@ class GossipCommandsTest {
             var plugin = plugin(config);
             try {
                 var wire = new GossipWire(config);
-                for (int i = 0; i < 40; i++) { plugin.execute(wire.parameters(member("Peer-" + i, 2 + i), List.of())); }
+                for (int i = 0; i < 40; i++) { plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(member("Peer-" + i, 2 + i), List.of()))); }
                 var page = execute(plugin, Map.of("operation", "members"));
                 assertEquals(Math.min(32, batch), ((List<?>) page.get("members")).size(), "batch=" + batch);
             } finally { plugin.stop(); }
@@ -166,7 +166,7 @@ class GossipCommandsTest {
         var first = plugin(config);
         var second = plugin(config);
         try {
-            first.execute(new GossipWire(config).parameters(member("Peer", 2), List.of()));
+            first.execute(new GossipWire(config).toWire(new GossipWire.ExchangeRequest(member("Peer", 2), List.of())));
             var firstPage = execute(first, Map.of("operation", "members", "limit", 1));
             Object cursor = firstPage.get("nextCursor");
             assertNotNull(cursor);
@@ -187,10 +187,10 @@ class GossipCommandsTest {
         var plugin = plugin(config);
         try {
             var wire = new GossipWire(config);
-            for (int i = 0; i < 5; i++) { plugin.execute(wire.parameters(member("Peer-" + i, i + 2), List.of())); }
+            for (int i = 0; i < 5; i++) { plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(member("Peer-" + i, i + 2), List.of()))); }
             var seen = new HashSet<MemberKey>();
             for (int i = 0; i < 5; i++) {
-                var response = wire.decode(plugin.execute(wire.parameters(member("Peer-0", 2), List.of())), false);
+                var response = wire.decodeReply(plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(member("Peer-0", 2), List.of()))));
                 assertEquals(1, response.members().size());
                 seen.add(response.members().getFirst().key());
             }
@@ -209,12 +209,12 @@ class GossipCommandsTest {
             var commands = new GossipCommands(config, table, metrics, transport, runtime);
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
-            commands.execute(wire.parameters(peer, List.of()));
+            commands.execute(wire.toWire(new GossipWire.ExchangeRequest(peer, List.of())));
             var before = table.snapshot();
             var changed = new MemberRecord(peer.key(), "changed.invalid", 9010, peer.heartbeat(), peer.state(), Map.of());
             for (int attempt = 0; attempt < 3; attempt++) {
                 var failure = assertThrows(InvalidParametersException.class,
-                        () -> commands.execute(wire.parameters(changed, List.of(member("Uncommitted", 3)))));
+                        () -> commands.execute(wire.toWire(new GossipWire.ExchangeRequest(changed, List.of(member("Uncommitted", 3))))));
                 assertTrue(failure.getMessage().startsWith("CONFLICT:"));
                 assertEquals(before, table.snapshot());
             }
@@ -233,7 +233,7 @@ class GossipCommandsTest {
         var entered = new java.util.concurrent.CountDownLatch(1);
         var release = new java.util.concurrent.CountDownLatch(1);
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
             @Override public void close() throws java.io.IOException {
                 entered.countDown();
                 try { release.await(); }
@@ -258,24 +258,24 @@ class GossipCommandsTest {
         }
     }
 
-    @Test void versionTwoAdmissionHintsKeepLegacyReplyShapeAndExposeCommittedSkipCounts() throws Exception {
+    @Test void admissionHintsReportEachOutcomeAndExposeCommittedSkipCounts() throws Exception {
         var config = config(32768, 4, 2);
         var plugin = plugin(config);
         try {
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
-            var first = execute(plugin, wire.parameters(peer, List.of(), 2));
+            var first = execute(plugin, wire.toWire(new GossipWire.ExchangeRequest(peer, List.of())));
             assertEquals("ADMITTED", first.get("senderAdmission"));
             assertEquals(2, first.get("gossipVersion"));
-            var full = execute(plugin, wire.parameters(member("Other", 3), List.of(), 2));
+            var full = execute(plugin, wire.toWire(new GossipWire.ExchangeRequest(member("Other", 3), List.of())));
             assertEquals("CAPACITY", full.get("senderAdmission"));
-            var known = execute(plugin, wire.parameters(peer, List.of(member("Forwarded", 4)), 2));
+            var known = execute(plugin, wire.toWire(new GossipWire.ExchangeRequest(peer, List.of(member("Forwarded", 4)))));
             assertEquals("ADMITTED", known.get("senderAdmission"));
-            var legacy = execute(plugin, wire.parameters(member("Legacy", 5), List.of()));
-            assertEquals(Set.of("gossipVersion", "swarmId", "sender", "members"), legacy.keySet());
+            var another = execute(plugin, wire.toWire(new GossipWire.ExchangeRequest(member("Another", 5), List.of())));
+            assertEquals("CAPACITY", another.get("senderAdmission"));
             assertEquals(3L, ((Map<?, ?>) execute(plugin, Map.of("operation", "status")).get("capacity")).get("admissionsSkipped"));
             var before = execute(plugin, Map.of("operation", "status"));
-            var invalid = new LinkedHashMap<>(wire.parameters(member("Bad", 6), List.of(), 2));
+            var invalid = new LinkedHashMap<>(wire.toWire(new GossipWire.ExchangeRequest(member("Bad", 6), List.of())));
             invalid.put("senderAdmission", "ADMITTED");
             assertThrows(InvalidParametersException.class, () -> plugin.execute(invalid));
             assertEquals(((Map<?, ?>) before.get("capacity")).get("admissionsSkipped"),
@@ -289,10 +289,10 @@ class GossipCommandsTest {
         try {
             var wire = new GossipWire(config);
             var peer = member("Peer", 2);
-            plugin.execute(wire.parameters(peer, List.of()));
-            assertNotNull(plugin.execute(wire.parameters(member("Other", 3), List.of())));
+            plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(peer, List.of())));
+            assertNotNull(plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(member("Other", 3), List.of()))));
             var changed = new MemberRecord(peer.key(), "elsewhere.invalid", 9000, 1, peer.state(), Map.of());
-            var conflict = assertThrows(InvalidParametersException.class, () -> plugin.execute(wire.parameters(changed, List.of())));
+            var conflict = assertThrows(InvalidParametersException.class, () -> plugin.execute(wire.toWire(new GossipWire.ExchangeRequest(changed, List.of()))));
             assertTrue(conflict.getMessage().startsWith("CONFLICT:"));
             assertEquals(2, ((Map<?, ?>) execute(plugin, Map.of("operation", "status")).get("capacity")).get("retainedIdentities"));
         } finally { plugin.stop(); }

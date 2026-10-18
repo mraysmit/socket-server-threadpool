@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.UUID;
@@ -85,12 +86,12 @@ class GossipSizeAccountingTest {
                 var members = new ArrayList<MemberRecord>();
                 for (int count = 0; count <= 4; count++) {
                     for (int version = 1; version <= 2; version++) {
-                        assertEquals(wire.requestBytes(wire.parameters(sender, members, version)).length, wire.requestSize(sender, members),
+                        assertEquals(wire.requestBytes(wire.toWire(new GossipWire.ExchangeRequest(sender, members))).length, wire.requestSize(sender, members),
                                 "length=" + length + " variant=" + variant + " members=" + count + " version=" + version);
                     }
                     members.add(record("Member-" + count, 10 + count, count, metadata(length / (count + 1), variant + count)));
                 }
-                assertEquals(config.maxExchangeBytes() - wire.requestBytes(wire.parameters(sender, List.of())).length,
+                assertEquals(config.maxExchangeBytes() - wire.requestBytes(wire.toWire(new GossipWire.ExchangeRequest(sender, List.of()))).length,
                         wire.requestMemberBudget(sender));
             }
         }
@@ -107,11 +108,9 @@ class GossipSizeAccountingTest {
                     for (var state : MemberRecord.State.values()) {
                         var self = new MemberRecord(new MemberKey(id, new UUID(7, 1)), "host.example", 9000, length * 1_000_003L,
                                 state, metadata(length, variant));
-                        for (int slot = 0; slot <= admissions.length; slot++) {
-                            int version = slot == 0 ? 1 : 2;
-                            var admission = slot == 0 ? null : admissions[slot - 1];
-                            int encoded = wire.replyBytes(id, wire.result(self, List.of(), version, admission));
-                            assertEquals(config.maxExchangeBytes() - encoded, wire.replyMemberBudget(self, version, admission),
+                        for (var admission : admissions) {
+                            int encoded = wire.replyBytes(id, wire.toWire(new GossipWire.ExchangeReply(self, List.of(), admission)));
+                            assertEquals(config.maxExchangeBytes() - encoded, wire.replyMemberBudget(self, admission),
                                     "id=" + id.length() + " length=" + length + " variant=" + variant + " " + state + " admission=" + admission);
                         }
                     }
@@ -216,9 +215,9 @@ class GossipSizeAccountingTest {
             var sender = record("Sender", 1, length, exact ? ascii(length / 2) : metadata(Math.min(length / 2, 300), length % 6));
             var members = List.of(record("Member", 2, 1, exact ? ascii(length / 2) : metadata(Math.min(length / 2, 300), (length + 1) % 6)));
             for (int version = 1; version <= 2; version++) {
-                var parameters = wire.parameters(sender, members, version);
+                var parameters = wire.toWire(new GossipWire.ExchangeRequest(sender, members));
                 boolean tooLarge = wire.requestBytes(parameters).length > config.maxExchangeBytes();
-                String result = outcome(() -> wire.decode(parameters, true));
+                String result = outcome(() -> wire.decodeRequest(parameters));
                 assertEquals(tooLarge ? "Complete canonical request exceeds max.exchange.bytes" : "OK", result, "length=" + length);
                 decisions.add(tooLarge);
             }
@@ -261,18 +260,16 @@ class GossipSizeAccountingTest {
         try (var host = new PageHost(config)) {
             for (int length = 0; length <= 600; length++) {
                 var self = record("Self", 0, 1, ascii(length));
-                for (int version = 1; version <= 2; version++) {
-                    var reply = host.exchange(self, records, sender, version);
-                    int encoded = wire.replyBytes("Self", reply);
-                    assertTrue(encoded <= config.maxExchangeBytes(), "length=" + length + " version=" + version + " bytes=" + encoded);
-                    // The reply is exactly its empty envelope plus its members and their commas.
-                    var members = (List<?>) reply.get("members");
-                    var admission = version == 1 ? null : MembershipTable.Admission.valueOf((String) reply.get("senderAdmission"));
-                    int expected = wire.replyBytes("Self", wire.result(self, List.of(), version, admission)) + Math.max(0, members.size() - 1);
-                    for (var member : members) { expected += GossipWire.bytes(member).length; }
-                    assertEquals(expected, encoded);
-                    if (encoded == config.maxExchangeBytes()) { exactFits++; }
-                }
+                var reply = host.exchange(self, records, sender);
+                int encoded = wire.replyBytes("Self", reply);
+                assertTrue(encoded <= config.maxExchangeBytes(), "length=" + length + " bytes=" + encoded);
+                // The reply is exactly its empty envelope plus its members and their commas.
+                var members = (List<?>) reply.get("members");
+                var admission = MembershipTable.Admission.valueOf((String) reply.get("senderAdmission"));
+                int expected = wire.replyBytes("Self", wire.toWire(new GossipWire.ExchangeReply(self, List.of(), admission))) + Math.max(0, members.size() - 1);
+                for (var member : members) { expected += GossipWire.bytes(member).length; }
+                assertEquals(expected, encoded);
+                if (encoded == config.maxExchangeBytes()) { exactFits++; }
             }
         }
         assertTrue(exactFits > 0, "Some reply must fill the byte limit exactly");
@@ -288,12 +285,11 @@ class GossipSizeAccountingTest {
             var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
             String cursor = Base64.getUrlEncoder().withoutPadding().encodeToString(
                     (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
-            var capacity = Map.<String, Object>of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
-                    "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE);
-            int reply = wire.replyBytes("Self", wire.result(budgetSelf, List.of(peer), 2, MembershipTable.Admission.CAPACITY));
-            var row = GossipWire.memberView(new MembershipTable.MemberView(peer, MembershipTable.Assessment.CANDIDATE,
-                    Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false));
-            int page = wire.replyBytes("Self", wire.page(budgetSelf, List.of(row), cursor, capacity));
+            var capacity = new GossipWire.Capacity(config.maxMembers(), config.maxRecords(), config.maxRecords(), Long.MAX_VALUE);
+            int reply = wire.replyBytes("Self", wire.toWire(new GossipWire.ExchangeReply(budgetSelf, List.of(peer), MembershipTable.Admission.CAPACITY)));
+            var row = new MembershipTable.MemberView(peer, MembershipTable.Assessment.CANDIDATE,
+                    Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false);
+            int page = wire.replyBytes("Self", wire.toWire(new GossipWire.MembersPage(budgetSelf, List.of(row), Optional.of(cursor), capacity)));
             assertTrue(page > reply, "bytes=" + bytes + " page=" + page + " reply=" + reply);
         }
     }
@@ -326,9 +322,9 @@ class GossipSizeAccountingTest {
         }
 
         /** One inbound exchange from {@code sender}, carrying no members, answered by a fresh table. */
-        Map<?, ?> exchange(MemberRecord self, List<MemberRecord> records, MemberRecord sender, int version) throws Exception {
+        Map<?, ?> exchange(MemberRecord self, List<MemberRecord> records, MemberRecord sender) throws Exception {
             var commands = new GossipCommands(config, table(self, records), metrics, transport, runtime);
-            return (Map<?, ?>) commands.execute(wire.parameters(sender, List.of(), version));
+            return (Map<?, ?>) commands.execute(wire.toWire(new GossipWire.ExchangeRequest(sender, List.of())));
         }
 
         void assertPagesMatch(MemberRecord self, List<MemberRecord> records, int limit, PageStats pages) throws Exception {
@@ -366,18 +362,17 @@ class GossipSizeAccountingTest {
      */
     private static void referenceRequireForwardable(GossipWire wire, GossipConfig config, MemberRecord self, List<MemberRecord> records) {
         var budgetSelf = new MemberRecord(self.key(), self.host(), self.port(), Long.MAX_VALUE, self.state(), self.metadata());
-        fits(wire, self, wire.result(budgetSelf, List.of(), 2, MembershipTable.Admission.CAPACITY), LOCAL_ALONE);
+        fits(wire, self, wire.toWire(new GossipWire.ExchangeReply(budgetSelf, List.of(), MembershipTable.Admission.CAPACITY)), LOCAL_ALONE);
         for (MemberRecord record : records) {
-            if (!record.key().equals(self.key()) && wire.requestBytes(wire.parameters(record, List.of())).length > config.maxExchangeBytes()) {
+            if (!record.key().equals(self.key()) && wire.requestBytes(wire.toWire(new GossipWire.ExchangeRequest(record, List.of()))).length > config.maxExchangeBytes()) {
                 throw new MembershipException(MembershipException.Reason.INVALID_RECORD, SINGLE_SENDER);
             }
             var worst = new MembershipTable.MemberView(record.key().equals(self.key()) ? budgetSelf : record,
                     MembershipTable.Assessment.CANDIDATE, Long.MAX_VALUE, OptionalLong.of(Long.MAX_VALUE), false, false);
             String cursor = Base64.getUrlEncoder().withoutPadding().encodeToString(
                     (self.key().bootId() + "/" + config.maxRecords()).getBytes(StandardCharsets.UTF_8));
-            fits(wire, self, wire.page(budgetSelf, List.of(GossipWire.memberView(worst)), cursor,
-                    Map.of("activeMembers", config.maxMembers(), "retainedIdentities", config.maxRecords(),
-                            "tombstones", config.maxRecords(), "admissionsSkipped", Long.MAX_VALUE)), PAGE_ROW);
+            fits(wire, self, wire.toWire(new GossipWire.MembersPage(budgetSelf, List.of(worst), Optional.of(cursor),
+                    new GossipWire.Capacity(config.maxMembers(), config.maxRecords(), config.maxRecords(), Long.MAX_VALUE))), PAGE_ROW);
         }
     }
 
@@ -387,22 +382,23 @@ class GossipSizeAccountingTest {
 
     /** The original members() loop: re-encode the growing page for every row. */
     private static Map<String, Object> referencePage(GossipWire wire, MembershipTable.Snapshot snapshot, int limit, int position) {
-        var capacity = Map.<String, Object>of("activeMembers", snapshot.activeMembers(), "retainedIdentities", snapshot.retainedIdentities(),
-                "tombstones", snapshot.tombstones(), "admissionsSkipped", snapshot.admissionsSkipped());
+        var capacity = GossipWire.Capacity.of(snapshot);
         int size = snapshot.members().size();
-        var selected = new ArrayList<Map<String, Object>>();
+        var selected = new ArrayList<MembershipTable.MemberView>();
         while (position < size && selected.size() < limit) {
-            selected.add(GossipWire.memberView(snapshot.members().get(position)));
+            selected.add(snapshot.members().get(position));
             int next = position + 1;
-            String cursor = next < size ? cursor(snapshot, next) : null;
-            if (!wire.replyFits(snapshot.self().key().serverId(), wire.page(snapshot.self(), selected, cursor, capacity))) {
+            var cursor = next < size ? Optional.of(cursor(snapshot, next)) : Optional.<String>empty();
+            if (!wire.replyFits(snapshot.self().key().serverId(),
+                    wire.toWire(new GossipWire.MembersPage(snapshot.self(), selected, cursor, capacity)))) {
                 selected.removeLast();
                 assertFalse(selected.isEmpty(), "Every row in this table fits on its own");
                 break;
             }
             position = next;
         }
-        return wire.page(snapshot.self(), selected, position < size ? cursor(snapshot, position) : null, capacity);
+        var cursor = position < size ? Optional.of(cursor(snapshot, position)) : Optional.<String>empty();
+        return wire.toWire(new GossipWire.MembersPage(snapshot.self(), selected, cursor, capacity));
     }
 
     private static String cursor(MembershipTable.Snapshot snapshot, int next) {

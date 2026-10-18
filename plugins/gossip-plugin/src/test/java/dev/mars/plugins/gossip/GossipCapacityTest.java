@@ -53,10 +53,10 @@ class GossipCapacityTest {
             var batch = new ArrayList<MemberRecord>();
             while (cursor < records.size() && batch.size() < config.maxBatchMembers() - 1) {
                 batch.add(records.get(cursor));
-                if (wire.requestBytes(wire.parameters(sender, batch)).length > config.maxExchangeBytes()) { batch.removeLast(); break; }
+                if (wire.requestBytes(wire.toWire(new GossipWire.ExchangeRequest(sender, batch))).length > config.maxExchangeBytes()) { batch.removeLast(); break; }
                 cursor++;
             }
-            var reply = client.execute("gossip", wire.parameters(sender, batch));
+            var reply = client.execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(sender, batch)));
             assertTrue(GossipWire.bytes(reply).length <= config.maxExchangeBytes());
         }
     }
@@ -106,7 +106,7 @@ class GossipCapacityTest {
                 var advancedSender = version(peers.getFirst(), heartbeat);
                 var advancedOther = version(peers.get(1), heartbeat);
                 var batch = heartbeat == 2 ? List.of(excess, advancedOther) : List.of(advancedOther, excess);
-                assertEquals("OK", client.execute("gossip", wire.parameters(advancedSender, batch)).status());
+                assertEquals("OK", client.execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(advancedSender, batch))).status());
                 var updated = records(client, config);
                 assertEquals(128, updated.size());
                 assertEquals(advancedSender, updated.get(advancedSender.key()));
@@ -116,7 +116,7 @@ class GossipCapacityTest {
             var retiring = peers.getLast();
             var left = new MemberRecord(retiring.key(), retiring.host(), retiring.port(), retiring.heartbeat(), MemberRecord.State.LEFT, retiring.metadata());
             var nextSender = version(peers.getFirst(), 4);
-            client.execute("gossip", wire.parameters(nextSender, departureFirst ? List.of(left, excess) : List.of(excess, left)));
+            client.execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(nextSender, departureFirst ? List.of(left, excess) : List.of(excess, left))));
             var updated = records(client, config);
             assertEquals(nextSender, updated.get(nextSender.key()));
             assertEquals(left, updated.get(left.key()));
@@ -145,11 +145,11 @@ class GossipCapacityTest {
             var newTwo = record("New-Two", 4, 1);
             var first = workers.submit(() -> {
                 gate.await();
-                return client.execute("gossip", wire.parameters(version(one, 2), List.of(newOne)));
+                return client.execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(version(one, 2), List.of(newOne))));
             });
             var second = workers.submit(() -> {
                 gate.await();
-                return client.execute("gossip", wire.parameters(version(two, 2), List.of(newTwo)));
+                return client.execute("gossip", wire.toWire(new GossipWire.ExchangeRequest(version(two, 2), List.of(newTwo))));
             });
             gate.countDown();
             assertEquals("OK", first.get(3, TimeUnit.SECONDS).status());

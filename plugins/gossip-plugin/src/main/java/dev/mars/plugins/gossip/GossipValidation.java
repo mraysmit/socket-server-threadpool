@@ -92,8 +92,7 @@ final class GossipValidation {
     }
 
     /**
-     * An exact JSON integer in [min, max]: fractions, strings and other coercions are rejected. The range message is
-     * also what deployed version-1 peers send for an unsupported gossipVersion, so its wording must not change.
+     * An exact JSON integer in [min, max]: fractions, strings and other coercions are rejected.
      */
     static long exactLong(Object value, String field, long min, long max) {
         long number;

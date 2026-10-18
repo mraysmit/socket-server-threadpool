@@ -37,21 +37,36 @@ import java.util.concurrent.TimeUnit;
  * peers needing one are reached without crowding out ordinary traffic. Retry backoff and DNS aliases are bounded.
  */
 final class PeerSelector {
+    /** The longest a failing peer is left before it is tried again, however many times it has failed. */
     private static final long MAX_BACKOFF = Duration.ofSeconds(30).toNanos();
+    /** How long a DNS alias stays trusted after it was last confirmed; after that, the seed is keyed as written. */
     private static final long ALIAS_NANOS = Duration.ofSeconds(60).toNanos();
     /** Every third selection keeps its first slot for a recovery probe, even when healthy peers could fill it. */
     private static final int RESERVED_EVERY = 3;
     private final GossipConfig config;
+    /** Nanosecond time, as System.nanoTime gives it: only differences between readings mean anything. */
     private final LongSupplier clock;
+    /** Shuffles the healthy peers and jitters each delay, so processes do not fall into step with each other. */
     private final RandomGenerator random;
     private final long roundNanos;
+    /**
+     * Backoff for each peer whose last exchange failed, by canonical endpoint. A success removes its entry. Bounded
+     * to one entry per member or seed, and pruned of peers that are no longer candidates.
+     */
     private final Map<GossipConfig.Seed, Retry> retries = new LinkedHashMap<>();
+    /**
+     * For each configured seed, by its normal form, the different address DNS resolved it to once that address was
+     * confirmed as the same process. Retry state and selection then treat the two as one peer.
+     */
     private final Map<GossipConfig.Seed, Alias> aliases = new LinkedHashMap<>();
     /** Each recovery peer's place in the probe queue, by canonical endpoint: the lowest turn goes next. */
     private final Map<GossipConfig.Seed, Long> recoveryTurns = new HashMap<>();
+    /** The turn last handed out. Turns only grow, so a peer given a new one goes to the back of the queue. */
     private long lastTurn;
+    /** How many selections have been made, which decides when a slot is reserved for recovery. */
     private long selections;
 
+    /** The clock is a nanoTime source, so tests can drive time; the random generator likewise. */
     PeerSelector(GossipConfig config, LongSupplier clock, RandomGenerator random) {
         this.config = config;
         this.clock = clock;
@@ -59,6 +74,11 @@ final class PeerSelector {
         roundNanos = TimeUnit.MILLISECONDS.toNanos(config.roundMillis());
     }
 
+    /**
+     * This round's peers: at most {@code slots}, and never more than the fanout. A peer is left out while it is in
+     * {@code busy} (an exchange with it is still running) or backing off after a failure. Healthy peers are chosen at
+     * random and recovery peers by turn; see {@link #RESERVED_EVERY} for how the two share the slots.
+     */
     synchronized List<GossipConfig.Seed> select(MembershipTable.Snapshot snapshot, Set<GossipConfig.Seed> busy,
             int slots) {
         long now = clock.getAsLong();
@@ -180,12 +200,17 @@ final class PeerSelector {
         failure(peer);
     }
 
+    /** Records, or refreshes, a configured seed's alias when it was reached at an address other than its own. */
     private void rememberAlias(GossipConfig.Seed peer, GossipConfig.Seed resolved) {
         if (config.seeds().contains(peer) && !normalized(peer).equals(resolved)) {
             aliases.put(normalized(peer), new Alias(resolved, clock.getAsLong()));
         }
     }
 
+    /**
+     * A failed exchange: the peer's backoff grows, see {@link #backoff}. A peer new to the retry state is not
+     * tracked once that state is full, so it is simply tried again in a later round.
+     */
     synchronized void failure(GossipConfig.Seed peer) {
         peer = canonical(peer);
         Retry old = retries.get(peer);
@@ -209,12 +234,17 @@ final class PeerSelector {
         return low + random.nextLong(spread + 1);
     }
 
+    /** The wait before the first round: a random part of one round, so processes started together are spread out. */
     synchronized long initialDelay() { return 1 + random.nextLong(roundNanos); }
+
+    /** The wait between rounds: the round interval, jittered to between 80% and 120% of it. */
     synchronized long roundDelay() {
         long low = roundNanos - roundNanos / 5;
         long spread = Math.min(Long.MAX_VALUE - low, roundNanos / 5 * 2);
         return low + random.nextLong(spread + 1);
     }
+
+    /** How many peers are backing off now, for the runtime metrics. */
     synchronized int retryCount() { return retries.size(); }
 
     /** The key a peer's retry state and selection are kept by: its normal form, or the address its alias confirmed. */
@@ -227,6 +257,7 @@ final class PeerSelector {
         return alias != null && clock.getAsLong() - alias.verifiedAt() < ALIAS_NANOS ? alias.endpoint() : normalized;
     }
 
+    /** The peer with its host in normal form, parsing the host here. */
     private static GossipConfig.Seed normalized(GossipConfig.Seed peer) {
         return normalized(peer, Host.of(peer.host()));
     }
@@ -271,7 +302,9 @@ final class PeerSelector {
         @Override public String normal() { return name; }
     }
 
+    /** Failures in a row, when the last one happened, and how long after it the peer may be tried again. */
     private record Retry(int failures, long attempted, long delay) { }
+    /** The address a seed was confirmed at, and when that was last confirmed. */
     private record Alias(GossipConfig.Seed endpoint, long verifiedAt) { }
     /** A recovery peer available this round, under the canonical endpoint its turn is kept by. */
     private record Waiting(GossipConfig.Seed key, GossipConfig.Seed peer, long turn) { }
@@ -280,9 +313,8 @@ final class PeerSelector {
     private record Candidate(GossipConfig.Seed peer, boolean recovery) {
         /**
          * Which of two candidates at one endpoint to keep: the known one if it is healthy, so that a healthy member
-         * stays
-         * in the fanout; otherwise the later one, so that a recovering seed keeps its hostname and with it the DNS
-         * fallback.
+         * stays in the fanout; otherwise the later one, so that a recovering seed keeps its hostname and with it the
+         * DNS fallback.
          */
         static Candidate preferred(Candidate known, Candidate later) { return known.recovery() ? later : known; }
     }

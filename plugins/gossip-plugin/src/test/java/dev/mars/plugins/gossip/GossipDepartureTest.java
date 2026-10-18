@@ -165,7 +165,7 @@ class GossipDepartureTest {
                 assertTrue(((Number) departure.get("successes")).intValue() > 0);
                 var wire = new GossipWire(GossipSwarmTest.config(""));
                 var sender = MemberRecord.fromWire(GossipSwarmTest.status(other).get("self"));
-                owner.execute(wire.parameters(sender, List.of(before)));
+                owner.execute(wire.toWire(new GossipWire.ExchangeRequest(sender, List.of(before))));
                 assertTrue(hasLeft(owner, before.key()));
                 var repeated = (Map<?, ?>) client.execute("gossip", Map.of("operation", "leave")).result();
                 assertEquals(normalize(departure), normalize((Map<?, ?>) repeated.get("departure")));
@@ -194,7 +194,7 @@ class GossipDepartureTest {
             var sender = MemberRecord.fromWire(GossipSwarmTest.status(peer).get("self"));
             var wire = new GossipWire(config);
             // The peer learns ALIVE without introducing itself to the origin, so leave has no outbound targets.
-            peer.execute(wire.parameters(stale, List.of()));
+            peer.execute(wire.toWire(new GossipWire.ExchangeRequest(stale, List.of())));
             var client = new TextMessageClient("127.0.0.1", origin.getPort(), "Departing");
             client.execute("gossip", Map.of("operation", "leave"));
             GossipDnsResolverTest.await(() -> {
@@ -271,7 +271,7 @@ class GossipDepartureTest {
         var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, logs::add));
         var expected = new IOException("Fixture cleanup failure");
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
             @Override public void close() throws IOException { throw expected; }
         };
         var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
@@ -301,7 +301,7 @@ class GossipDepartureTest {
         }));
         var expected = new IOException("Cleanup must remain the primary failure");
         var client = new GossipRuntime.ExchangeClient() {
-            @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
+            @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) { throw new AssertionError("No targets"); }
             @Override public void close() throws IOException { throw expected; }
         };
         var runtime = new GossipRuntime(config, table, client, metrics, System::nanoTime,
@@ -357,7 +357,7 @@ class GossipDepartureTest {
         final List<Thread> threads = new CopyOnWriteArrayList<>();
         volatile boolean closed;
         DepartureClient(MembershipTable table, boolean stall) { this.table = table; this.stall = stall; }
-        @Override public GossipWire.Exchange exchange(GossipConfig.Seed peer) throws IOException {
+        @Override public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
             threads.add(Thread.currentThread());
             calls.add(peer.serverId());
             states.add(table.snapshot().self().state());
@@ -367,7 +367,7 @@ class GossipDepartureTest {
                 catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new InterruptedIOException(); }
             }
             if (peer.serverId().equals("Bad")) { throw new IOException("Unavailable peer"); }
-            return new GossipWire.Exchange(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), 1, Optional.empty());
+            return new GossipWire.ExchangeReply(PeerSelectorTest.record(peer.serverId(), 2, peer.port()), List.of(), MembershipTable.Admission.ADMITTED);
         }
         @Override public void close() { closed = true; release.countDown(); }
     }
