@@ -132,7 +132,7 @@ src/
 - **Admin Default Port**: 9001
 - **Request Executor**: One virtual thread per connection
 - **Listener Executor**: One named virtual thread per main/admin listener task
-- **Command Protocol**: One UTF-8 JSON request line and reply line per connection, version 1
+- **Command Protocol**: One UTF-8 JSON request line and reply line per connection, version 1; a request may ask for the connection to be kept open (see "Keeping a connection open")
 - **JSON Library**: Jackson Databind 2.21.5
 - **HTTP Response Format**: HTTP/1.1 status, headers, and UTF-8 body
 - **Test Framework**: JUnit Jupiter 6.0.2 with Maven Surefire 3.5.4
@@ -442,6 +442,19 @@ Example replies (the server also includes null `error` or `result` fields):
 {"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":1,"status":"OK","result":"Received: Hello server"}
 {"version":1,"messageId":"11111111-1111-4111-8111-111111111111","serverId":"Server-001","connectionId":2,"status":"ERROR","error":{"code":"UNKNOWN_INSTRUCTION","message":"Unknown instruction: missing"}}
 ```
+
+**Keeping a connection open.** By default the server closes the connection after one reply. A request may
+include the optional field `"connection"`, which is either `"keep-alive"` or `"close"` (the default); any other
+value is rejected as `INVALID_REQUEST`. With `"keep-alive"` the server replies and then waits for another request
+line on the same connection, and every reply carries the same `connectionId`. The connection ends when a request
+omits the field or says `"close"`, when the client closes it, after 5 minutes without a request, after 1,000
+requests, or at once when the server stops (idle connections do not delay shutdown, and are closed with a reset,
+because nothing is in flight on them and a closing handshake would leave each port in TIME_WAIT for two
+minutes; a client that resets an idle connection is likewise treated as a normal end and logs nothing). A request that is not valid
+JSON, or whose line is over the length limit, ends the connection after its error reply. This exists so that
+callers that talk to the same server often, such as the gossip plugin, do not open and close a TCP connection for
+every request; each closed connection stays in TIME_WAIT for about two minutes, which on a busy machine can use up
+the operating system's dynamic ports. The HTTP and legacy text paths still close after one response.
 
 Error codes are `INVALID_REQUEST`, `UNKNOWN_INSTRUCTION`, `INVALID_PARAMETERS`,
 and `PLUGIN_ERROR`. A valid parsed request UUID is retained on errors; an unreadable

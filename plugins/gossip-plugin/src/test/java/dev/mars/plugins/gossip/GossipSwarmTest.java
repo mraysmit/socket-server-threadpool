@@ -68,6 +68,13 @@ class GossipSwarmTest {
                 System.out.println("Three-node seed convergence observed in " + (System.nanoTime() - began) / 1_000_000 + " ms");
                 assertFalse((Boolean) status(first).get("isolated"));
                 assertTrue(((Number) ((Map<?, ?>) status(first).get("self")).get("heartbeat")).longValue() > 0);
+                // Real hosts keep connections open between exchanges: a few were opened and every later exchange reused one.
+                await(() -> ((Number) ((Map<?, ?>) status(first).get("exchanges")).get("outbound")).longValue() >= 15);
+                var connections = (Map<?, ?>) ((Map<?, ?>) status(first).get("runtime")).get("connections");
+                long opened = ((Number) connections.get("opened")).longValue();
+                long reused = ((Number) connections.get("reused")).longValue();
+                assertTrue(opened <= 6, "Opened " + opened + " connections for at least 15 exchanges with 2 peers: " + connections);
+                assertTrue(reused >= 10, "Reused only " + reused + " connections: " + connections);
                 assertEquals("Received: echo during gossip", new TextMessageClient("127.0.0.1", a.getPort(), "Server-A").send("echo during gossip").text());
                 assertTrue(request(a.getPort(), "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").contains("200"));
                 assertEquals("Server status: ALIVE", request(a.getAdminPort(), "status\n"));

@@ -24,14 +24,30 @@ import java.util.UUID;
 public final class CommandProtocol {
     private CommandProtocol() { }
 
+    /** The envelope field with which a client asks the server to keep the connection open after replying. */
+    public static final String CONNECTION_FIELD = "connection";
+    public static final String KEEP_ALIVE = "keep-alive";
+    public static final String CLOSE = "close";
+
+    /** A parsed request together with whether the client asked for the connection to stay open for more requests. */
+    public record ParsedRequest(CommandRequest request, boolean keepAlive) { }
+
     public static CommandRequest parseRequest(String text) throws InvalidRequestException {
+        return parse(text).request();
+    }
+
+    /**
+     * Parses a request line. The optional {@code connection} field is {@code "keep-alive"} or {@code "close"}; without
+     * it the server closes the connection after replying, as it always has.
+     */
+    public static ParsedRequest parse(String text) throws InvalidRequestException {
         UUID id = null;
         try {
             JsonNode root = Json.read(text);
             if (root == null || !root.isObject()) { throw new IllegalArgumentException("Request must be a JSON object"); }
             if (root.path("messageId").isTextual()) { id = parseUuid(root.get("messageId").textValue()); }
             if (id == null) { throw new IllegalArgumentException("A valid message UUID is required"); }
-            checkFields(root, Set.of("version", "messageId", "instruction", "parameters"));
+            checkFields(root, Set.of("version", "messageId", "instruction", "parameters", CONNECTION_FIELD));
             if (!root.path("version").isIntegralNumber() || !root.get("version").canConvertToInt()
                     || root.get("version").intValue() != 1) {
                 throw new IllegalArgumentException("Protocol version must be 1");
@@ -39,7 +55,17 @@ public final class CommandProtocol {
             if (!root.path("instruction").isTextual() || !root.path("parameters").isObject()) {
                 throw new IllegalArgumentException("Instruction must be a string and parameters must be an object");
             }
-            return new CommandRequest(1, id, root.get("instruction").textValue(), Json.parameters(root.get("parameters")));
+            boolean keepAlive = false;
+            if (root.has(CONNECTION_FIELD)) {
+                String connection = root.get(CONNECTION_FIELD).isTextual() ? root.get(CONNECTION_FIELD).textValue() : "";
+                if (!connection.equals(KEEP_ALIVE) && !connection.equals(CLOSE)) {
+                    throw new IllegalArgumentException("Connection must be \"keep-alive\" or \"close\"");
+                }
+                keepAlive = connection.equals(KEEP_ALIVE);
+            }
+            return new ParsedRequest(
+                    new CommandRequest(1, id, root.get("instruction").textValue(), Json.parameters(root.get("parameters"))),
+                    keepAlive);
         } catch (Exception e) {
             throw new InvalidRequestException(id, e instanceof IllegalArgumentException ? e.getMessage() : "Malformed JSON request");
         }

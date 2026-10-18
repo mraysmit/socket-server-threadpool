@@ -16,7 +16,7 @@
 package dev.mars.plugins.gossip;
 
 import dev.mars.protocol.CommandReply;
-import dev.mars.protocol.CommandRequest;
+import dev.mars.protocol.CommandProtocol;
 import dev.mars.protocol.Json;
 
 import java.io.IOException;
@@ -210,8 +210,22 @@ public final class GossipWire {
         return records.stream().map(MemberRecord::toWire).toList();
     }
 
+    /**
+     * The request envelope. Its {@code connection} field asks the host to keep the connection open after replying, so
+     * the transport can send the next exchange to the same peer over it instead of opening a new connection.
+     */
+    Map<String, Object> envelope(UUID messageId, Map<String, Object> parameters) {
+        var envelope = new LinkedHashMap<String, Object>();
+        envelope.put("version", 1);
+        envelope.put("messageId", messageId);
+        envelope.put("instruction", "gossip");
+        envelope.put("parameters", parameters);
+        envelope.put(CommandProtocol.CONNECTION_FIELD, CommandProtocol.KEEP_ALIVE);
+        return envelope;
+    }
+
     public byte[] requestBytes(Map<String, Object> parameters) {
-        return bytes(new CommandRequest(1, BUDGET_ID, "gossip", parameters));
+        return bytes(envelope(BUDGET_ID, parameters));
     }
 
     /** Bytes of the canonical request for this sender and members, computed without encoding the envelope. */

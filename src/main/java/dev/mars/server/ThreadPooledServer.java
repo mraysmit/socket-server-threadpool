@@ -43,6 +43,9 @@ public class ThreadPooledServer implements Runnable{
     protected volatile Thread runningThread = null;
     protected final ExecutorService requestExecutor;
     private volatile Duration drainTimeout = DEFAULT_DRAIN_TIMEOUT;
+    private volatile Duration keepAliveIdle = WorkerRunnable.DEFAULT_KEEP_ALIVE_IDLE;
+    /** Connections being served, so that stopping the server can close the ones waiting between requests. */
+    private final java.util.Set<WorkerRunnable> workers = java.util.concurrent.ConcurrentHashMap.newKeySet();
     // Virtual threads are cheap; sockets and memory are not. Excess clients wait in the kernel backlog.
     private volatile Semaphore connectionPermits = new Semaphore(DEFAULT_MAX_CONNECTIONS);
     final protected String SERVER_NAME = "ThreadPooledServer";
@@ -97,10 +100,13 @@ public class ThreadPooledServer implements Runnable{
                     Thread.sleep(ACCEPT_RETRY_DELAY.toMillis());
                     continue;
                 }
-                var worker = new WorkerRunnable(clientSocket, SERVER_NAME, serverId, plugins);
+                var worker = new WorkerRunnable(clientSocket, SERVER_NAME, serverId, plugins, this::isStopped, keepAliveIdle);
+                workers.add(worker);
+                // A connection accepted just as the server stopped must not be missed by the sweep in stop().
+                if (isStopped()) { worker.closeIfIdle(); }
                 this.requestExecutor.execute(() -> {
                     try { worker.run(); }
-                    finally { permits.release(); }
+                    finally { workers.remove(worker); permits.release(); }
                 });
             }
         } catch (IOException e) {
@@ -139,6 +145,11 @@ public class ThreadPooledServer implements Runnable{
         this.drainTimeout = Objects.requireNonNull(timeout, "timeout");
     }
 
+    /** How long a connection that the client asked to keep open may wait for its next request; applies to later connections. */
+    void keepAliveIdle(Duration idle) {
+        this.keepAliveIdle = Objects.requireNonNull(idle, "idle");
+    }
+
     /** Stop accepting work, wait up to the drain timeout, then interrupt whatever is still running. */
     void drain() {
         requestExecutor.shutdown();
@@ -171,6 +182,9 @@ public class ThreadPooledServer implements Runnable{
 
     public synchronized void stop(){
         this.isStopped.getAndSet(true);
+        // Connections kept open between requests are idle most of the time; close them now so shutdown does not wait.
+        // The flag is set first, so a worker that goes idle after this sweep sees it and closes itself.
+        workers.forEach(WorkerRunnable::closeIfIdle);
         try {
             if (this.serverSocket != null) {
                 this.serverSocket.close();

@@ -29,6 +29,10 @@ final class GossipMetrics {
     final AtomicLong rounds = new AtomicLong();
     final AtomicLong roundFailures = new AtomicLong();
     final AtomicLong skipped = new AtomicLong();
+    /** Outbound connections opened, outbound exchanges that reused one, and reused ones the peer had already closed. */
+    final AtomicLong connectionsOpened = new AtomicLong();
+    final AtomicLong connectionsReused = new AtomicLong();
+    final AtomicLong staleConnections = new AtomicLong();
     private final Map<GossipFailure, AtomicLong> failures = new java.util.EnumMap<>(GossipFailure.class);
     volatile int workers;
     volatile int dnsHelpers;
@@ -62,6 +66,8 @@ final class GossipMetrics {
         result.put("retryingPeers", retryingPeers);
         result.put("lastRoundAgeMillis", GossipWire.orNull(ageMillis(lastRound)));
         result.put("failures", kinds);
+        result.put("connections", Map.of("opened", connectionsOpened.get(), "reused", connectionsReused.get(),
+                "stale", staleConnections.get()));
         return result;
     }
 
