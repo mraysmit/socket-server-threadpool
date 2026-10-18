@@ -78,6 +78,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final Set<Socket> active = new HashSet<>();
     /** Kept-open connections waiting for the next exchange with a peer; guarded by this transport. */
     private final Map<InetSocketAddress, Deque<PeerConnection>> idle = new HashMap<>();
+    /** Peers whose host rejected the keep-alive field (an older build), so they get one exchange per connection. */
+    private final Set<InetSocketAddress> legacyPeers = new HashSet<>();
     private final long connectNanos;
     private final long idleNanos;
     private final long exchangeNanos;
@@ -187,16 +189,22 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         private CommandReply send(GossipWire.ExchangeRequest request, List<InetSocketAddress> candidates,
                 long deadline) throws IOException {
             messageId = UUID.randomUUID();
-            byte[] payload = GossipWire.bytes(wire.envelope(messageId, wire.toWire(request)));
+            var parameters = wire.toWire(request);
+            byte[] payload = GossipWire.bytes(wire.envelope(messageId, parameters));
+            // The same request without the keep-alive field, for a peer whose host does not know it.
+            byte[] plain = GossipWire.bytes(wire.envelope(messageId, parameters, false));
             // The batch was chosen to fit, so this only guards against an error in that arithmetic.
             if (payload.length > config.maxExchangeBytes()) {
                 throw new IOException("Outgoing exchange exceeds byte budget");
             }
-            var line = exchangeOverFirstReachable(candidates, payload, deadline);
-            CommandReply reply;
-            try { reply = CommandProtocol.parseReply(line.text()); }
-            catch (IOException unreadable) {
-                throw new GossipExchangeException(GossipFailure.PROTOCOL, unreadable.getMessage(), unreadable);
+            var line = exchangeOverFirstReachable(candidates, payload, plain, deadline);
+            CommandReply reply = readReply(line.text());
+            if (rejectsKeepAlive(reply)) {
+                // An older host rejects the field. Remember that, and send this request again without it; from now on the
+                // peer is asked for one exchange per connection.
+                rememberLegacy(line.address());
+                line = new Reply(exchangeOver(line.address(), payload, plain, deadline), line.address());
+                reply = readReply(line.text());
             }
             if (!messageId.equals(reply.messageId())) {
                 throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip message ID mismatch");
@@ -205,6 +213,13 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip server ID mismatch");
             }
             return reply;
+        }
+
+        private CommandReply readReply(String text) throws IOException {
+            try { return CommandProtocol.parseReply(text); }
+            catch (IOException unreadable) {
+                throw new GossipExchangeException(GossipFailure.PROTOCOL, unreadable.getMessage(), unreadable);
+            }
         }
 
         /** The exchange a reply carries, once the reply is a success from the sender it names. */
@@ -233,11 +248,11 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private record Reply(String text, InetSocketAddress address) { }
 
     /** Tries each address in order; if none connects, throws the first connection error with the rest suppressed. */
-    private Reply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload,
+    private Reply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload, byte[] plain,
             long deadline) throws IOException {
         SocketException unreachable = null;
         for (var address : candidates) {
-            try { return new Reply(exchangeOver(address, payload, deadline), address); }
+            try { return new Reply(exchangeOver(address, payload, plain, deadline), address); }
             catch (ConnectFailure failure) {
                 if (unreachable == null) { unreachable = failure.socketError(); }
                 else { unreachable.addSuppressed(failure.socketError()); }
@@ -252,15 +267,34 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      * restarted); that shows up as the connection failing before any reply byte, and the exchange is then sent again
      * over a new connection. Sending again is safe because merging an exchange is idempotent.
      */
-    private String exchangeOver(InetSocketAddress address, byte[] payload, long deadline) throws IOException {
+    private String exchangeOver(InetSocketAddress address, byte[] payload, byte[] plain, long deadline) throws IOException {
         checkDeadline(deadline);
+        if (isLegacy(address)) {
+            // This peer's host does not know the keep-alive field and closes after every reply.
+            return converse(new PeerConnection(sockets.get()), address, plain, deadline, false);
+        }
         var pooled = takeIdle(address);
         if (pooled != null) {
-            try { return converse(pooled, address, payload, deadline); }
+            try { return converse(pooled, address, payload, deadline, true); }
             catch (StaleConnection stale) { metrics.staleConnections.incrementAndGet(); }
             checkDeadline(deadline);
         }
-        return converse(new PeerConnection(sockets.get()), address, payload, deadline);
+        return converse(new PeerConnection(sockets.get()), address, payload, deadline, true);
+    }
+
+    /** An older host answers the keep-alive field with INVALID_REQUEST, "Unknown field: connection". */
+    private static boolean rejectsKeepAlive(CommandReply reply) {
+        return reply.error() != null && reply.error().code() == dev.mars.protocol.CommandError.Code.INVALID_REQUEST
+                && reply.error().message().contains("Unknown field: " + CommandProtocol.CONNECTION_FIELD);
+    }
+
+    private synchronized boolean isLegacy(InetSocketAddress address) { return legacyPeers.contains(address); }
+
+    /** Records a peer whose host rejected the keep-alive field, and closes any connection kept for it. */
+    private synchronized void rememberLegacy(InetSocketAddress address) {
+        legacyPeers.add(address);
+        var kept = idle.remove(address);
+        if (kept != null) { kept.forEach(peer -> closeQuietly(peer.socket)); }
     }
 
     /**
@@ -271,7 +305,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
      * watchdog to end before returning, so no thread outlives it. A connection that carried a clean reply goes back to
      * the pool; any other is closed, so a late or partial reply can never be read as the answer to a later request.
      */
-    private String converse(PeerConnection peer, InetSocketAddress address, byte[] payload, long deadline) throws IOException {
+    private String converse(PeerConnection peer, InetSocketAddress address, byte[] payload, long deadline,
+                            boolean keepAlive) throws IOException {
         var socket = peer.socket;
         boolean reused = socket.isConnected();
         boolean clean = false;
@@ -341,7 +376,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 synchronized (this) { active.remove(socket); }
             }
         } finally {
-            if (clean) { release(address, peer); } else { closeQuietly(socket); }
+            // A request that did not ask for keep-alive is closed by the host after its reply, so it is never pooled.
+            if (clean && keepAlive) { release(address, peer); } else { closeQuietly(socket); }
         }
     }
 

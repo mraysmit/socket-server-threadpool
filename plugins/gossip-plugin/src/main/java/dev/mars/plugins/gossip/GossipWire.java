@@ -215,12 +215,17 @@ public final class GossipWire {
      * the transport can send the next exchange to the same peer over it instead of opening a new connection.
      */
     Map<String, Object> envelope(UUID messageId, Map<String, Object> parameters) {
+        return envelope(messageId, parameters, true);
+    }
+
+    /** Without the field, the host closes the connection after its reply, as an older host always does. */
+    Map<String, Object> envelope(UUID messageId, Map<String, Object> parameters, boolean keepAlive) {
         var envelope = new LinkedHashMap<String, Object>();
         envelope.put("version", 1);
         envelope.put("messageId", messageId);
         envelope.put("instruction", "gossip");
         envelope.put("parameters", parameters);
-        envelope.put(CommandProtocol.CONNECTION_FIELD, CommandProtocol.KEEP_ALIVE);
+        if (keepAlive) { envelope.put(CommandProtocol.CONNECTION_FIELD, CommandProtocol.KEEP_ALIVE); }
         return envelope;
     }
 

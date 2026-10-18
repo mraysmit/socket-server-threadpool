@@ -99,6 +99,8 @@ class GossipConnectionReuseTest {
         final List<Boolean> keepAliveRequested = Collections.synchronizedList(new ArrayList<>());
         /** False behaves like a host that closes after every reply. */
         volatile boolean keepOpen = true;
+        /** True behaves like an older host: it rejects the keep-alive field as an unknown field. */
+        volatile boolean rejectsKeepAlive;
 
         private final String serverId;
 
@@ -127,6 +129,14 @@ class GossipConnectionReuseTest {
                 while ((line = in.readLine()) != null) {
                     var parsed = CommandProtocol.parse(line);
                     keepAliveRequested.add(parsed.keepAlive());
+                    if (rejectsKeepAlive && parsed.keepAlive()) {
+                        var rejection = CommandReply.failure(parsed.request().messageId(), "Peer", 1,
+                                dev.mars.protocol.CommandError.Code.INVALID_REQUEST, "Unknown field: connection");
+                        out.write(GossipWire.bytes(rejection));
+                        out.write('\n');
+                        out.flush();
+                        return;
+                    }
                     reply.write(out, listener.getLocalPort(), parsed.request(), requests.incrementAndGet());
                     if (!keepOpen) { return; }
                 }
@@ -328,6 +338,20 @@ class GossipConnectionReuseTest {
             assertEquals(0, peer.closedByClient.get() + peer.endedByReset.get(), "The connection is being kept open");
             transport.close();
             await(() -> peer.closedByClient.get() + peer.endedByReset.get() == 1);
+        }
+    }
+
+    @Test
+    void aPeerWhoseHostRejectsTheKeepAliveFieldIsServedOneExchangePerConnectionFromThenOn() throws Exception {
+        var metrics = new GossipMetrics();
+        try (var peer = new KeepAlivePeer(0, NEWLINE); var transport = new GossipTransport(CONFIG, table(), metrics)) {
+            peer.rejectsKeepAlive = true;
+            peer.keepOpen = false;
+            for (int i = 0; i < 3; i++) { assertEquals("Peer", transport.exchange(peer.endpoint()).sender().key().serverId(), "exchange " + i); }
+            assertEquals(List.of(true, false, false, false), peer.keepAliveRequested,
+                    "The first exchange tried keep-alive, was rejected, and was sent again without it; the rest never tried");
+            assertEquals(4, peer.accepted.get(), "Each request used its own connection, as an older host requires");
+            assertEquals(0, metrics.outboundFailures.get(), "Falling back is not a failure");
         }
     }
 
