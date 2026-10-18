@@ -59,6 +59,40 @@ class GossipConfigTest {
                 () -> config.seeds().add(new GossipConfig.Seed("other", "localhost", 9000)));
     }
 
+    /** Every key has a value no other key has, so two settings passed in each other's place cannot go unnoticed. */
+    @Test void everyKeyReachesItsOwnSetting() {
+        var properties = minimal();
+        properties.setProperty("advertise.host", "gossip.example");
+        properties.setProperty("seeds", "Seed@seed.example:9001");
+        properties.setProperty("round.millis", "1001");
+        properties.setProperty("heartbeat.millis", "1002");
+        properties.setProperty("suspect.after.millis", "1003");
+        properties.setProperty("dead.after.millis", "1004");
+        properties.setProperty("terminal.retention.millis", "1005");
+        properties.setProperty("fanout", "3");
+        properties.setProperty("max.inflight", "4");
+        properties.setProperty("max.members", "5");
+        properties.setProperty("max.batch.members", "6");
+        properties.setProperty("max.records", "7");
+        properties.setProperty("max.exchange.bytes", "2048");
+        var config = GossipConfig.fromProperties(properties, "Server-001");
+        assertEquals("demo-swarm", config.swarmId());
+        assertEquals("gossip.example", config.advertiseHost());
+        assertEquals(java.util.List.of(new GossipConfig.Seed("Seed", "seed.example", 9001)), config.seeds());
+        assertEquals(1001, config.roundMillis());
+        assertEquals(1002, config.heartbeatMillis());
+        assertEquals(1003, config.suspectAfterMillis());
+        assertEquals(1004, config.deadAfterMillis());
+        assertEquals(1005, config.terminalRetentionMillis());
+        assertEquals(3, config.fanout());
+        assertEquals(4, config.maxInflight());
+        assertEquals(5, config.maxMembers());
+        assertEquals(6, config.maxBatchMembers());
+        assertEquals(7, config.maxRecords());
+        assertEquals(2048, config.maxExchangeBytes());
+        assertFalse(config.discoveryEnabled());
+    }
+
     @Test void resolvesPerServerOverridesWithoutCachingOrMutatingDefaults() throws Exception {
         Path file = temporary.resolve("shared config.properties");
         Files.writeString(file, """

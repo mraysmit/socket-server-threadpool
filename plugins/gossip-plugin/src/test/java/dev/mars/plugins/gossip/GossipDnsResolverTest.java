@@ -76,7 +76,8 @@ class GossipDnsResolverTest {
         try (var resolver = new GossipDnsResolver(4, 2)) {
             var peer = resolver.resolveAll(new GossipConfig.Seed("Peer", "localhost", 9000)).getFirst();
             assertTrue(InetAddress.ofLiteral(peer.host()).isLoopbackAddress());
-            assertEquals(1, resolver.cacheSize());
+            // The lookup's thread stores the answer just after the caller has it.
+            await(() -> resolver.cacheSize() == 1);
             assertEquals(0, resolver.activeHelpers());
             assertEquals("127.0.0.1", resolver.resolveAll(new GossipConfig.Seed("Peer", "127.0.0.1", 9000)).getFirst().host());
             assertEquals(1, resolver.cacheSize());
@@ -103,10 +104,15 @@ class GossipDnsResolverTest {
             assertEquals("127.0.0.1", resolver.resolveAll(peer).getFirst().host());
             assertTrue(InetAddress.ofLiteral(resolver.resolveAll(peer).getFirst().host()).isLoopbackAddress());
             assertEquals(1, lookups.size());
+            // A lookup's thread stores its answer and leaves the active set just after its caller has the answer;
+            // until then a request joins the finished lookup. Each step waits for that, so it sees the cache settled.
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
             clock.set(TimeUnit.SECONDS.toNanos(61));
             resolver.resolveAll(peer).getFirst();
             assertEquals(2, lookups.size());
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
             resolver.resolveAll(new GossipConfig.Seed("Peer", "another.test", 9000)).getFirst();
+            await(() -> lookups.stream().noneMatch(Thread::isAlive));
             assertEquals(1, resolver.cacheSize());
             resolver.resolveAll(peer).getFirst();
             assertEquals(4, lookups.size());

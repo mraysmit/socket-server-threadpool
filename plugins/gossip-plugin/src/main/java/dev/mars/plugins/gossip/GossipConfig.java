@@ -115,13 +115,25 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
         if (!discovery.equals("true") && !discovery.equals("false")) {
             throw invalid("discovery.enabled", "must be true or false");
         }
-        return new GossipConfig(required(resolved, "swarm.id"), required(resolved, "advertise.host"), seeds,
-                number(resolved, "round.millis", 1000), number(resolved, "heartbeat.millis", 5000),
-                integer(resolved, "fanout", 2), integer(resolved, "max.inflight", 2),
-                integer(resolved, "max.members", 128), integer(resolved, "max.records", 512),
-                integer(resolved, "max.batch.members", 32), integer(resolved, "max.exchange.bytes", 32768),
-                number(resolved, "suspect.after.millis", 60000), number(resolved, "dead.after.millis", 180000),
-                number(resolved, "terminal.retention.millis", 1800000), Boolean.parseBoolean(discovery));
+        // Several neighbouring components share a type, so each value is named after its component: an argument in
+        // the wrong place shows as a name that does not match, and everyKeyReachesItsOwnSetting fails.
+        String swarmId = required(resolved, "swarm.id");
+        String advertiseHost = required(resolved, "advertise.host");
+        long roundMillis = number(resolved, "round.millis", 1000);
+        long heartbeatMillis = number(resolved, "heartbeat.millis", 5000);
+        int fanout = integer(resolved, "fanout", 2);
+        int maxInflight = integer(resolved, "max.inflight", 2);
+        int maxMembers = integer(resolved, "max.members", 128);
+        int maxRecords = integer(resolved, "max.records", 512);
+        int maxBatchMembers = integer(resolved, "max.batch.members", 32);
+        int maxExchangeBytes = integer(resolved, "max.exchange.bytes", 32768);
+        long suspectAfterMillis = number(resolved, "suspect.after.millis", 60000);
+        long deadAfterMillis = number(resolved, "dead.after.millis", 180000);
+        long terminalRetentionMillis = number(resolved, "terminal.retention.millis", 1800000);
+        boolean discoveryEnabled = Boolean.parseBoolean(discovery);
+        return new GossipConfig(swarmId, advertiseHost, seeds, roundMillis, heartbeatMillis, fanout, maxInflight,
+                maxMembers, maxRecords, maxBatchMembers, maxExchangeBytes, suspectAfterMillis, deadAfterMillis,
+                terminalRetentionMillis, discoveryEnabled);
     }
 
     private static boolean validOverride(String name) {
