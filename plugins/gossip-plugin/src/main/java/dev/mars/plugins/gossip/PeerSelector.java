@@ -66,10 +66,10 @@ final class PeerSelector {
         var candidates = candidates(snapshot);
         var busyKeys = busy.stream().map(this::canonical).collect(Collectors.toSet());
         retries.keySet().removeIf(peer -> !candidates.containsKey(peer) && !busyKeys.contains(peer));
-        recoveryTurns.keySet()
-                .removeIf(peer -> !(candidates.get(peer) instanceof Candidate candidate && candidate.recovery()));
+        recoveryTurns.keySet().removeIf(peer -> !(candidates.get(peer) instanceof Candidate candidate && candidate.recovery()));
         var ordinary = new ArrayList<GossipConfig.Seed>();
         var recovery = new ArrayList<Waiting>();
+
         for (var item : candidates.entrySet()) {
             var key = item.getKey();
             var candidate = item.getValue();
@@ -82,6 +82,7 @@ final class PeerSelector {
                 ordinary.add(candidate.peer());
             }
         }
+
         Collections.shuffle(ordinary, random);
         int count = Math.clamp(slots, 0, config.fanout());
         boolean reserved = ++selections % RESERVED_EVERY == 0;
@@ -104,6 +105,7 @@ final class PeerSelector {
         var self = snapshot.self();
         // Every candidate is checked against the local host, so it is parsed once; each candidate's host once too.
         var selfHost = Host.of(self.host());
+
         for (var member : snapshot.members()) {
             var known = member.record();
             if (known.key().equals(self.key()) || known.state() == MemberRecord.State.LEFT) { continue; }
@@ -115,6 +117,7 @@ final class PeerSelector {
                 candidates.merge(canonical(peer, host), new Candidate(peer, recovery), Candidate::preferred);
             }
         }
+        
         for (var seed : config.seeds()) {
             var host = Host.of(seed.host());
             if (!isSelf(self, selfHost, seed, host)) {
