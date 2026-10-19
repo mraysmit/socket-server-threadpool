@@ -20,6 +20,7 @@ import dev.mars.plugin.PluginContext;
 import dev.mars.protocol.Json;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.Timeout;
 
 import java.math.BigDecimal;
@@ -40,27 +41,31 @@ import static org.junit.jupiter.api.Assertions.*;
 class KvPluginTest {
     private final KvPlugin kv = new KvPlugin();
 
-    @BeforeEach void start() throws Exception { kv.start(new PluginContext("Server-001", 9000, 9001)); }
+    @BeforeEach void start(TestInfo test) throws Exception {
+        System.out.println("=== KvPluginTest." + test.getTestMethod().orElseThrow().getName());
+        kv.start(new PluginContext("Server-001", 9000, 9001));
+    }
 
     @Test void itsInstructionIsKv() { assertEquals("kv", new KvPlugin().instruction()); }
 
     @Test void commandsAreRefusedUntilThePluginHasStarted() {
         var unstarted = new KvPlugin();
         var refused = assertThrows(IllegalStateException.class, () -> unstarted.execute(get("a")));
+        System.out.println("KV | " + show(get("a")) + " before start -> refused: " + refused.getMessage());
         assertEquals("The key-value store has not started", refused.getMessage());
     }
 
     @Test void commandsAreRefusedOnceThePluginHasStopped() throws Exception {
-        kv.execute(put("a", "1"));
+        run(put("a", "1"));
         kv.stop();
-        var refused = assertThrows(IllegalStateException.class, () -> kv.execute(get("a")));
+        var refused = assertThrows(IllegalStateException.class, () -> run(get("a")));
         assertEquals("The key-value store has stopped", refused.getMessage());
     }
 
     @Test void putCreatesAPairAndThenReplacesItsValue() throws Exception {
-        assertEquals(Map.of("key", "colour", "created", true), kv.execute(put("colour", "blue")));
-        assertEquals(Map.of("key", "colour", "created", false), kv.execute(put("colour", "green")));
-        assertEquals(found("colour", "green"), kv.execute(get("colour")));
+        assertEquals(Map.of("key", "colour", "created", true), run(put("colour", "blue")));
+        assertEquals(Map.of("key", "colour", "created", false), run(put("colour", "green")));
+        assertEquals(found("colour", "green"), run(get("colour")));
     }
 
     @Test void everyJsonTypeComesBackExactlyAsItWasStored() throws Exception {
@@ -82,9 +87,9 @@ class KvPluginTest {
         values.put("object", nested);
         values.put("array", mixed);
         values.put("empty string", "");
-        for (var entry : values.entrySet()) { kv.execute(put(entry.getKey(), entry.getValue())); }
+        for (var entry : values.entrySet()) { run(put(entry.getKey(), entry.getValue())); }
         for (var entry : values.entrySet()) {
-            var reply = assertInstanceOf(Map.class, kv.execute(get(entry.getKey())));
+            var reply = assertInstanceOf(Map.class, run(get(entry.getKey())));
             assertEquals(true, reply.get("found"), entry.getKey());
             assertTrue(reply.containsKey("value"), entry.getKey());
             assertEquals(Json.write(entry.getValue()), Json.write(reply.get("value")), entry.getKey());
@@ -93,35 +98,35 @@ class KvPluginTest {
 
     @Test void aStoredValueIsACopyThatTheCallerCannotChangeLater() throws Exception {
         var value = new HashMap<String, Object>(Map.of("count", BigInteger.valueOf(1)));
-        kv.execute(put("counter", value));
+        run(put("counter", value));
         value.put("count", BigInteger.valueOf(2));
-        var stored = (Map<?, ?>) ((Map<?, ?>) kv.execute(get("counter"))).get("value");
+        var stored = (Map<?, ?>) ((Map<?, ?>) run(get("counter"))).get("value");
         assertEquals(BigInteger.valueOf(1), stored.get("count"));
     }
 
     @Test void getOfAMissingKeyReportsItWasNotFound() throws Exception {
-        assertEquals(Map.of("key", "absent", "found", false), kv.execute(get("absent")));
+        assertEquals(Map.of("key", "absent", "found", false), run(get("absent")));
     }
 
     @Test void deleteRemovesAPairAndReportsWhetherItExisted() throws Exception {
-        kv.execute(put("a", "1"));
-        assertEquals(Map.of("key", "a", "deleted", true), kv.execute(delete("a")));
-        assertEquals(Map.of("key", "a", "found", false), kv.execute(get("a")));
-        assertEquals(Map.of("key", "a", "deleted", false), kv.execute(delete("a")));
+        run(put("a", "1"));
+        assertEquals(Map.of("key", "a", "deleted", true), run(delete("a")));
+        assertEquals(Map.of("key", "a", "found", false), run(get("a")));
+        assertEquals(Map.of("key", "a", "deleted", false), run(delete("a")));
     }
 
     @Test void listReturnsEveryKeyInOrder() throws Exception {
-        assertEquals(Map.of("keys", List.of(), "count", 0), kv.execute(list()));
-        for (String key : List.of("b", "a", "c")) { kv.execute(put(key, key)); }
-        assertEquals(Map.of("keys", List.of("a", "b", "c"), "count", 3), kv.execute(list()));
+        assertEquals(Map.of("keys", List.of(), "count", 0), run(list()));
+        for (String key : List.of("b", "a", "c")) { run(put(key, key)); }
+        assertEquals(Map.of("keys", List.of("a", "b", "c"), "count", 3), run(list()));
     }
 
     @Test void replyFieldsComeInAFixedOrder() throws Exception {
-        assertEquals(List.of("key", "created"), List.copyOf(kv.execute(put("a", "1")).keySet()));
-        assertEquals(List.of("key", "found", "value"), List.copyOf(kv.execute(get("a")).keySet()));
-        assertEquals(List.of("key", "found"), List.copyOf(kv.execute(get("absent")).keySet()));
-        assertEquals(List.of("keys", "count"), List.copyOf(kv.execute(list()).keySet()));
-        assertEquals(List.of("key", "deleted"), List.copyOf(kv.execute(delete("a")).keySet()));
+        assertEquals(List.of("key", "created"), List.copyOf(run(put("a", "1")).keySet()));
+        assertEquals(List.of("key", "found", "value"), List.copyOf(run(get("a")).keySet()));
+        assertEquals(List.of("key", "found"), List.copyOf(run(get("absent")).keySet()));
+        assertEquals(List.of("keys", "count"), List.copyOf(run(list()).keySet()));
+        assertEquals(List.of("key", "deleted"), List.copyOf(run(delete("a")).keySet()));
     }
 
     @Test void malformedCommandsAreRejectedWithAReason() {
@@ -141,7 +146,7 @@ class KvPluginTest {
         nullKey.put("key", null);
         cases.add(nullKey);
         for (var parameters : cases) {
-            var rejected = assertThrows(InvalidParametersException.class, () -> kv.execute(parameters),
+            var rejected = assertThrows(InvalidParametersException.class, () -> run(parameters),
                     parameters.toString());
             assertFalse(rejected.getMessage().isBlank());
         }
@@ -149,27 +154,29 @@ class KvPluginTest {
 
     @Test void keysAndValuesAreLimitedInSize() throws Exception {
         String longest = "k".repeat(KvPlugin.MAX_KEY_LENGTH);
-        assertEquals(true, ((Map<?, ?>) kv.execute(put(longest, "v"))).get("created"));
-        assertThrows(InvalidParametersException.class, () -> kv.execute(put(longest + "k", "v")));
+        assertEquals(true, ((Map<?, ?>) run(put(longest, "v"))).get("created"));
+        assertThrows(InvalidParametersException.class, () -> run(put(longest + "k", "v")));
         // A string value of n characters encodes as n + 2 bytes, with its quotes.
         String largest = "v".repeat(KvPlugin.MAX_VALUE_BYTES - 2);
-        kv.execute(put("large", largest));
-        var tooLarge = assertThrows(InvalidParametersException.class, () -> kv.execute(put("large", largest + "v")));
+        run(put("large", largest));
+        var tooLarge = assertThrows(InvalidParametersException.class, () -> run(put("large", largest + "v")));
         assertTrue(tooLarge.getMessage().contains(String.valueOf(KvPlugin.MAX_VALUE_BYTES)), tooLarge.getMessage());
-        assertEquals(found("large", largest), kv.execute(get("large")), "A rejected put leaves the old value");
+        assertEquals(found("large", largest), run(get("large")), "A rejected put leaves the old value");
         // Size is measured in UTF-8 bytes, not characters: each of these takes three bytes.
         assertThrows(InvalidParametersException.class,
-                () -> kv.execute(put("wide", "€".repeat(KvPlugin.MAX_VALUE_BYTES / 3))));
+                () -> run(put("wide", "€".repeat(KvPlugin.MAX_VALUE_BYTES / 3))));
     }
 
     @Test void aFullStoreRefusesNewKeysButStillReplacesAndDeletes() throws Exception {
         for (int i = 0; i < KvPlugin.MAX_PAIRS; i++) { kv.execute(put("key-" + i, i)); }
-        var full = assertThrows(InvalidParametersException.class, () -> kv.execute(put("one-more", 1)));
+        System.out.println("KV | filled the store with " + KvPlugin.MAX_PAIRS + " pairs, key-0 = 0 to key-"
+                + (KvPlugin.MAX_PAIRS - 1) + " = " + (KvPlugin.MAX_PAIRS - 1));
+        var full = assertThrows(InvalidParametersException.class, () -> run(put("one-more", 1)));
         assertTrue(full.getMessage().contains(String.valueOf(KvPlugin.MAX_PAIRS)), full.getMessage());
-        assertEquals(Map.of("key", "key-0", "created", false), kv.execute(put("key-0", "replaced")));
-        kv.execute(delete("key-1"));
-        assertEquals(Map.of("key", "one-more", "created", true), kv.execute(put("one-more", 1)));
-        assertEquals(KvPlugin.MAX_PAIRS, ((Map<?, ?>) kv.execute(list())).get("count"));
+        assertEquals(Map.of("key", "key-0", "created", false), run(put("key-0", "replaced")));
+        run(delete("key-1"));
+        assertEquals(Map.of("key", "one-more", "created", true), run(put("one-more", 1)));
+        assertEquals(KvPlugin.MAX_PAIRS, ((Map<?, ?>) run(list())).get("count"));
     }
 
     @Test void concurrentPutsNeverExceedTheLimit() throws Exception {
@@ -188,9 +195,31 @@ class KvPluginTest {
             go.countDown();
             int stored = 0;
             for (var outcome : outcomes) { if (Boolean.TRUE.equals(outcome.get())) { stored++; } }
+            System.out.println("KV | " + attempts + " concurrent puts of new keys: " + stored + " stored, "
+                    + (attempts - stored) + " refused because the store was full");
             assertEquals(KvPlugin.MAX_PAIRS, stored);
         }
-        assertEquals(KvPlugin.MAX_PAIRS, ((Map<?, ?>) kv.execute(list())).get("count"));
+        assertEquals(KvPlugin.MAX_PAIRS, ((Map<?, ?>) run(list())).get("count"));
+    }
+
+    /** Runs one command and prints it with its reply, or with the reason it was refused. */
+    private Map<String, Object> run(Map<String, Object> parameters) throws InvalidParametersException {
+        try {
+            var reply = kv.execute(parameters);
+            System.out.println("KV | " + show(parameters) + " -> " + show(reply));
+            return reply;
+        } catch (InvalidParametersException | RuntimeException refused) {
+            System.out.println("KV | " + show(parameters) + " -> refused: " + refused.getMessage());
+            throw refused;
+        }
+    }
+
+    /** JSON for the log, with long values cut short. */
+    static String show(Object value) {
+        String json;
+        try { json = Json.write(value); }
+        catch (java.io.IOException e) { json = String.valueOf(value); }
+        return json.length() <= 200 ? json : json.substring(0, 150) + "... (" + json.length() + " characters)";
     }
 
     static Map<String, Object> put(String key, Object value) {

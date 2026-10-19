@@ -20,7 +20,9 @@ import dev.mars.client.TextMessageClient;
 import dev.mars.protocol.CommandReply;
 import dev.mars.protocol.Json;
 import dev.mars.testing.HostProcess;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInfo;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -44,6 +46,10 @@ class KvPluginIT {
     private static final Duration WAIT = Duration.ofSeconds(10);
     @TempDir Path temporary;
 
+    @BeforeEach void name(TestInfo test) {
+        System.out.println("=== KvPluginIT." + test.getTestMethod().orElseThrow().getName());
+    }
+
     @Test
     void packagedJarRegistersOnlyTheKvProviderAndUsesTheHostsApi() throws Exception {
         try (var jar = new JarFile(pluginJar().toFile())) {
@@ -66,6 +72,8 @@ class KvPluginIT {
             UUID id = UUID.randomUUID();
             var failure = assertThrows(CommandExecutionException.class,
                     () -> client.execute(id, "kv", Map.of("operation", "list")));
+            System.out.println("KV over TCP | Server-001, no kv plugin | {\"operation\":\"list\"} -> "
+                    + failure.reply().error().code() + ": " + failure.reply().error().message());
             assertFailure(failure, id, "Server-001", UNKNOWN_INSTRUCTION);
             assertCleanExit(server);
         }
@@ -129,6 +137,8 @@ class KvPluginIT {
                 UUID id = UUID.randomUUID();
                 var failure = assertThrows(CommandExecutionException.class,
                         () -> client.execute(id, "kv", Json.parameters(Json.read(parameters))), parameters);
+                System.out.println("KV over TCP | Server-001 | " + KvPluginTest.show(Json.read(parameters))
+                        + " -> " + failure.reply().error().code() + ": " + failure.reply().error().message());
                 assertFailure(failure, id, "Server-001", INVALID_PARAMETERS);
                 assertFalse(failure.reply().error().message().isBlank());
             }
@@ -157,6 +167,8 @@ class KvPluginIT {
     private static CommandReply command(TextMessageClient client, String serverId, String parameters) throws Exception {
         UUID id = UUID.randomUUID();
         var reply = client.execute(id, "kv", Json.parameters(Json.read(parameters)));
+        System.out.println("KV over TCP | " + serverId + " | " + KvPluginTest.show(Json.read(parameters))
+                + " -> " + KvPluginTest.show(reply.result()));
         assertEquals(id, reply.messageId());
         assertEquals(serverId, reply.serverId());
         assertEquals("OK", reply.status());
