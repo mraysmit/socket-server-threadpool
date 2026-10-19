@@ -106,6 +106,18 @@ class StartStopTest {
         }
     }
 
+    @Test
+    void consolePluginsCommandShowsTheServersLoadedPlugins() throws Exception {
+        var result = run("dev.mars.StartStop", new String[]{"CLI-002", "--port", "0", "--admin-port", "0"},
+                "plugins\nquit\n");
+        assertEquals(0, result.exitCode(), result.output());
+        assertTrue(result.output().contains("Server response: {\"serverId\":\"CLI-002\",\"plugins\":["), result.output());
+        assertTrue(result.output().contains("{\"class\":\"dev.mars.plugin.builtin.EchoPlugin\",\"instruction\":\"echo\","
+                + "\"source\":\"classpath\"}"), result.output());
+        assertTrue(result.output().contains("status, plugins, shutdown"), "The prompt names the command:\n" + result.output());
+        assertReleased(result);
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"quit\n", "shutdown\nquit\n"})
     void consoleUsesAllocatedPortsAndCleansUpOnExit(String exitCommands) throws Exception {

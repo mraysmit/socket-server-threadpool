@@ -39,12 +39,13 @@ public class StartStop {
             var console = new BufferedReader(new InputStreamReader(System.in))) {
             var client = new TextMessageClient("localhost", instance.getPort(), instance.getServerId());
             System.out.println("To stop this server, connect to admin port " + instance.getAdminPort());
-            System.out.println("> Enter commands (send <text or JSON command>, status, shutdown, or quit to exit):");
+            System.out.println("> Enter commands (send <text or JSON command>, status, plugins, shutdown, or quit to exit):");
             while (true) {
                 System.out.print("> ");
                 String command = console.readLine();
                 if (command == null || command.equalsIgnoreCase("quit")) { break; }
-                if (command.equalsIgnoreCase("status") || command.equalsIgnoreCase("shutdown")) {
+                if (command.equalsIgnoreCase("status") || command.equalsIgnoreCase("plugins")
+                        || command.equalsIgnoreCase("shutdown")) {
                     checkServerStatus(command, instance.getAdminPort());
                 } else if (command.regionMatches(true, 0, "send ", 0, 5)) {
                     try {
@@ -58,7 +59,7 @@ public class StartStop {
                 } else if (command.equalsIgnoreCase("send")) {
                     System.out.println("Usage: send <text or JSON command>");
                 } else {
-                    System.out.println("Unknown command. Available commands: send <text or JSON command>, status, shutdown, quit");
+                    System.out.println("Unknown command. Available commands: send <text or JSON command>, status, plugins, shutdown, quit");
                 }
             }
         }

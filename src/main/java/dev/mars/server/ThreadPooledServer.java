@@ -176,6 +176,9 @@ public class ThreadPooledServer implements Runnable{
         return this.isStopped.get();
     }
 
+    /** The plugins this server loaded, which the admin {@code plugins} command lists. */
+    public PluginRegistry getPlugins() { return plugins; }
+
     public String getServerId() {
         return serverId;
     }

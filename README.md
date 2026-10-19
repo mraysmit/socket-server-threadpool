@@ -299,11 +299,12 @@ The application provides an interactive console with the following commands:
 - `send <text>` - Send a text message to this instance's main port and display the verified reply
 - `send <JSON command>` - Execute an instruction with named parameters and display its result
 - `status` - Check if the server is running
+- `plugins` - List the server's loaded plugins, with each one's instruction and where it was loaded from
 - `shutdown` - Stop the main server and shutdown monitor
 - `quit` - Close the instance, quiesce plugins, drain accepted work with a timeout, and exit
 
 Command keywords are case-insensitive. The configured admin socket (default 9001) accepts
-`status` and `shutdown`; `send` and `quit` belong to the application console.
+`status`, `plugins` and `shutdown`; `send` and `quit` belong to the application console.
 
 Enter `quit` to stop and exit cleanly. You can also enter `shutdown` followed by
 `quit`. End-of-input closes the instance as well.
@@ -382,7 +383,7 @@ valid ID returns `error <messageId> <serverId> <connectionId> <reason>`.
 Open a new connection for each message. The `message` keyword is case-insensitive;
 message text is preserved. A missing or invalid message UUID receives an `Error: ...`
 line. Use the client and server built from the same version of this project.
-Administrative commands on the configured admin port remain `status` and `shutdown`.
+Administrative commands on the configured admin port are `status`, `plugins` and `shutdown`.
 
 ### Executing Plugin Commands
 
@@ -513,6 +514,51 @@ ID. Verified results print `Standalone plugin JAR test PASSED`. Reports are unde
 tests; use the separate example command above to test this standalone artifact.
 Reinstall the server after API changes and rebuild the example after changes to
 its source. The example's `clean` removes its previous JAR before rebuilding it.
+
+#### Key-Value Store Plugin
+
+[`plugins/kv-plugin`](plugins/kv-plugin) stores key-value pairs in the memory of the server that
+loads it. Its commands use one instruction, `kv`, with an `operation` parameter:
+
+| Operation | Parameters | Result |
+|---|---|---|
+| `put` | `key`, `value` | Creates the pair or replaces its value: `{"key":"colour","created":true}`, or `false` when it replaced one |
+| `get` | `key` | `{"key":"colour","found":true,"value":"blue"}`, or `{"key":"colour","found":false}` |
+| `delete` | `key` | `{"key":"colour","deleted":true}`, or `false` when there was no such key |
+| `list` | none | `{"keys":["colour","size"],"count":2}`, with the keys in order |
+
+A value may be any JSON value: a string, number, `true`, `false`, `null`, an object or an array. It
+comes back exactly as it was stored; numbers keep their full precision. Keys are strings of 1 to 256
+characters. A value may take up to 16 KB as JSON, and one server holds at most 1,000 pairs. Malformed
+commands, an oversized key or value, and a new key for a full store return an `INVALID_PARAMETERS`
+error, and the store is unchanged.
+
+Each server has its own store, which lives as long as the server runs: it is not saved, and servers do
+not share it. The commands work once the plugin has started with its server, and stop working when the
+server stops.
+
+Build it and start a server that loads it:
+
+```powershell
+mvn clean install
+mvn -f plugins/kv-plugin/pom.xml clean verify
+mvn compile exec:java "-Dexec.mainClass=dev.mars.StartStop" "-Dexec.args=Server-001 --plugins-dir plugins/kv-plugin/target"
+```
+
+The ready log includes `kv`. At the server console, enter:
+
+```text
+send {"instruction":"kv","parameters":{"operation":"put","key":"colour","value":"blue"}}
+send {"instruction":"kv","parameters":{"operation":"put","key":"limits","value":{"pairs":1000,"strict":true}}}
+send {"instruction":"kv","parameters":{"operation":"get","key":"limits"}}
+send {"instruction":"kv","parameters":{"operation":"list"}}
+send {"instruction":"kv","parameters":{"operation":"delete","key":"colour"}}
+```
+
+Its `mvn verify` runs unit tests for every operation and limit, then integration tests that load the
+packaged JAR into separate server processes and send commands over TCP: every JSON type round-trips,
+the store is shared by all connections to one server, each server has its own store, and invalid
+commands return correlated errors. Reports are under `plugins/kv-plugin/target/`.
 
 #### Testing Plugins
 
@@ -692,6 +738,7 @@ its own JAR:
 | `src/test/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Test classpath only; excluded from the server JAR | `MathAddPlugin` and `TextConcatPlugin` from `dev.mars.plugin.fixtures` |
 | `plugins/multiply-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Multiply plugin JAR | `dev.mars.plugins.multiply.MultiplyPlugin` (`math.multiply`) |
 | `plugins/gossip-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | Gossip plugin JAR | `dev.mars.plugins.gossip.GossipPlugin` (`gossip`) |
+| `plugins/kv-plugin/src/main/resources/META-INF/services/dev.mars.plugin.CommandPlugin` | KV plugin JAR | `dev.mars.plugins.kv.KvPlugin` (`kv`) |
 
 Inside each JAR, the registration has the same path:
 `META-INF/services/dev.mars.plugin.CommandPlugin`. These files remain separate
@@ -1127,7 +1174,7 @@ With redirection enabled, test output is in
 Tests cover HTTP response construction, UTF-8 content lengths, wire formatting,
 output failures, concurrent socket clients, UTF-8 text-message round trips,
 message ID matching, malformed/mismatched replies, distinct server instances,
-empty-message validation, and administrative status/shutdown commands.
+empty-message validation, and administrative status, plugins and shutdown commands.
 Socket tests start their own servers on temporary ports and clean up afterward;
 you do not need to start the application first. Reports are in `target/surefire-reports/`.
 Maven prints a test summary and `BUILD SUCCESS` when the suite passes. If a test
@@ -1170,6 +1217,24 @@ printf 'GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' | nc loc
 ```bash
 echo "status" | nc localhost 9001
 ```
+
+**List the loaded plugins:**
+```bash
+echo "plugins" | nc localhost 9001
+```
+
+The reply is one line of JSON. Every plugin the server loaded is listed in class order, including
+startup-only plugins, whose `instruction` is `null`. `source` is the file name of the plugin JAR it
+came from, or `classpath` for plugins built into the server or on its classpath:
+
+```json
+{"serverId":"Server-001","plugins":[
+  {"class":"dev.mars.plugin.builtin.AddressBroadcastPlugin","instruction":null,"source":"classpath"},
+  {"class":"dev.mars.plugin.builtin.EchoPlugin","instruction":"echo","source":"classpath"},
+  {"class":"dev.mars.plugins.kv.KvPlugin","instruction":"kv","source":"kv-plugin-1.0-SNAPSHOT.jar"}]}
+```
+
+Any server can be asked, at its own admin port, without loading anything else.
 
 **Shutdown server:**
 ```bash

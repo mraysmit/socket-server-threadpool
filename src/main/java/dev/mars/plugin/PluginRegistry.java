@@ -20,6 +20,7 @@ import dev.mars.protocol.CommandRequest;
 import dev.mars.protocol.Json;
 
 import java.io.IOException;
+import java.net.URISyntaxException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
@@ -28,6 +29,7 @@ import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.List;
 import java.util.ServiceConfigurationError;
 import java.util.ServiceLoader;
@@ -46,6 +48,7 @@ public final class PluginRegistry implements AutoCloseable {
     private final Map<String, CommandPlugin> plugins;
     private final URLClassLoader loader;
     private final List<CommandPlugin> loadedPlugins;
+    private final List<LoadedPlugin> described;
     private final ConcurrentLinkedDeque<CommandPlugin> enteredPlugins = new ConcurrentLinkedDeque<>();
     private boolean startupAttempted;
     private boolean stopAttempted;
@@ -54,9 +57,11 @@ public final class PluginRegistry implements AutoCloseable {
     private PluginRegistry(Iterable<CommandPlugin> providers, URLClassLoader loader) {
         var selected = new LinkedHashMap<String, CommandPlugin>();
         var discovered = new java.util.ArrayList<CommandPlugin>();
+        var instructions = new java.util.IdentityHashMap<CommandPlugin, String>();
         for (var provider : providers) {
             discovered.add(java.util.Objects.requireNonNull(provider, "provider"));
             String instruction = provider.instruction();
+            instructions.put(provider, instruction);
             if (instruction == null) { continue; }
             if (!instruction.matches("[A-Za-z][A-Za-z0-9._-]*")) {
                 throw new IllegalArgumentException("Invalid plugin instruction: " + instruction);
@@ -68,6 +73,26 @@ public final class PluginRegistry implements AutoCloseable {
         plugins = Map.copyOf(selected);
         loadedPlugins = discovered.stream().sorted(java.util.Comparator.comparing(plugin -> plugin.getClass().getName())).toList();
         this.loader = loader;
+        // Described once, here, so a query never calls into plugin code.
+        described = loadedPlugins.stream().map(plugin -> new LoadedPlugin(plugin.getClass().getName(),
+                Optional.ofNullable(instructions.get(plugin)), source(plugin, loader))).toList();
+    }
+
+    /**
+     * One loaded plugin: its class, the instruction it handles (none for a startup-only provider), and where it came
+     * from, the file name of its plugin JAR or {@code classpath}.
+     */
+    public record LoadedPlugin(String className, Optional<String> instruction, String source) { }
+
+    /** Every plugin this registry loaded, in class order, including startup-only providers. */
+    public List<LoadedPlugin> loaded() { return described; }
+
+    private static String source(CommandPlugin plugin, URLClassLoader loader) {
+        Class<?> type = plugin.getClass();
+        var code = type.getProtectionDomain().getCodeSource();
+        if (loader == null || type.getClassLoader() != loader || code == null) { return "classpath"; }
+        try { return Path.of(code.getLocation().toURI()).getFileName().toString(); }
+        catch (URISyntaxException | IllegalArgumentException e) { return code.getLocation().toString(); }
     }
 
     public static PluginRegistry of(Collection<CommandPlugin> providers) {

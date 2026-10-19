@@ -23,6 +23,7 @@ import java.io.UncheckedIOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class ShutdownMonitor implements Runnable {
@@ -93,8 +94,10 @@ public class ShutdownMonitor implements Runnable {
                             System.out.println("Server stopped by ShutdownMonitor");
                         } else if ("status".equalsIgnoreCase(command)) {
                             out.println("Server status: " + (server.isStopped() ? "STOPPED" : "ALIVE"));
+                        } else if ("plugins".equalsIgnoreCase(command)) {
+                            out.println(plugins());
                         } else {
-                            out.println("Unknown command. Available commands: status, shutdown");
+                            out.println("Unknown command. Available commands: status, plugins, shutdown");
                         }
                     } finally {
                         synchronized (this) { activeClient = null; }
@@ -110,6 +113,24 @@ public class ShutdownMonitor implements Runnable {
         } finally {
             stop();
         }
+    }
+
+    /**
+     * Every plugin the server loaded, as one line of JSON: its class, its instruction (null for a startup-only
+     * provider) and its source, a plugin JAR's file name or {@code classpath}.
+     */
+    private String plugins() throws IOException {
+        var plugins = server.getPlugins().loaded().stream().map(plugin -> {
+            var entry = new LinkedHashMap<String, Object>();
+            entry.put("class", plugin.className());
+            entry.put("instruction", plugin.instruction().orElse(null));
+            entry.put("source", plugin.source());
+            return entry;
+        }).toList();
+        var reply = new LinkedHashMap<String, Object>();
+        reply.put("serverId", server.getServerId());
+        reply.put("plugins", plugins);
+        return dev.mars.protocol.Json.write(reply);
     }
 
     public synchronized void stop() {

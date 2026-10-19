@@ -19,5 +19,6 @@
         <module>..</module>
         <module>gossip-plugin</module>
         <module>multiply-plugin</module>
+        <module>kv-plugin</module>
     </modules>
 </project>

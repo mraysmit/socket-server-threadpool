@@ -67,6 +67,28 @@ class ExternalPluginTest {
     }
 
     @Test
+    void adminPluginsCommandNamesTheJarAnExternalPluginCameFrom() throws Exception {
+        Path directory = Files.createDirectory(temporary.resolve("listed plugins"));
+        Path jar = providerJar(directory, "external.listed", "return \"listed\";");
+        try (var server = ServerInstance.start(new ServerOptions("Server-001", 0, 0, directory));
+             var admin = new java.net.Socket("localhost", server.getAdminPort())) {
+            var out = new java.io.PrintWriter(admin.getOutputStream(), true, java.nio.charset.StandardCharsets.UTF_8);
+            var in = new java.io.BufferedReader(new java.io.InputStreamReader(admin.getInputStream(),
+                    java.nio.charset.StandardCharsets.UTF_8));
+            out.println("plugins");
+            var reply = dev.mars.protocol.Json.read(in.readLine());
+            var listed = java.util.stream.StreamSupport.stream(reply.path("plugins").spliterator(), false)
+                    .filter(plugin -> plugin.path("class").asText().equals("example.ExamplePlugin")).toList();
+            assertEquals(1, listed.size(), reply.toString());
+            assertEquals("external.listed", listed.getFirst().path("instruction").asText());
+            assertEquals(jar.getFileName().toString(), listed.getFirst().path("source").asText());
+            // Plugins on the server's own classpath are still listed beside it.
+            assertTrue(reply.toString().contains("\"dev.mars.plugin.builtin.EchoPlugin\""), reply.toString());
+        }
+        Files.delete(jar);
+    }
+
+    @Test
     void pluginExceptionsAreStructuredAndDoNotStopOtherCommands() throws Exception {
         Path directory = Files.createDirectory(temporary.resolve("plugins"));
         providerJar(directory, "external.fail", "throw new IllegalStateException(\"private detail\");");

@@ -95,9 +95,35 @@ class ServerLifecycleTest {
         assertEquals("Server status: ALIVE", command(input));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"plugins", "PLUGINS", "Plugins"})
+    void pluginsCommandListsEveryLoadedPluginWithItsInstructionAndSource(String input) throws Exception {
+        var reply = Json.read(command(input));
+        assertEquals("Server-001", reply.path("serverId").asText());
+        var plugins = new ArrayList<String>();
+        for (var plugin : reply.path("plugins")) {
+            assertEquals(java.util.Set.of("class", "instruction", "source"), toSet(plugin.fieldNames()), plugin.toString());
+            plugins.add(plugin.path("class").asText() + " | " + (plugin.path("instruction").isNull() ? "startup only"
+                    : plugin.path("instruction").asText()) + " | " + plugin.path("source").asText());
+        }
+        // Every plugin this server loaded, in class order; none came from a plugin directory.
+        assertEquals(java.util.List.of(
+                "dev.mars.plugin.builtin.AddressBroadcastPlugin | startup only | classpath",
+                "dev.mars.plugin.builtin.EchoPlugin | echo | classpath",
+                "dev.mars.plugin.fixtures.MathAddPlugin | math.add | classpath",
+                "dev.mars.plugin.fixtures.TextConcatPlugin | text.concat | classpath"), plugins);
+        assertEquals("Server status: ALIVE", command("status"), "Querying plugins leaves the server running");
+    }
+
+    private static java.util.Set<String> toSet(java.util.Iterator<String> names) {
+        var set = new HashSet<String>();
+        names.forEachRemaining(set::add);
+        return set;
+    }
+
     @Test
     void unknownCommandDoesNotStopTheServer() throws Exception {
-        assertEquals("Unknown command. Available commands: status, shutdown", command("invalid"));
+        assertEquals("Unknown command. Available commands: status, plugins, shutdown", command("invalid"));
         assertEquals("Server status: ALIVE", command("status"));
     }
 
@@ -106,7 +132,7 @@ class ServerLifecycleTest {
         try (var client = connect(monitorPort)) {
             client.shutdownOutput();
             var reader = new BufferedReader(new InputStreamReader(client.getInputStream(), StandardCharsets.UTF_8));
-            assertEquals("Unknown command. Available commands: status, shutdown", reader.readLine());
+            assertEquals("Unknown command. Available commands: status, plugins, shutdown", reader.readLine());
         }
         assertEquals("Server status: ALIVE", command("status"));
     }
