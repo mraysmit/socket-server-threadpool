@@ -54,6 +54,11 @@ public final class KvPlugin implements CommandPlugin {
     private final TreeMap<String, String> pairs = new TreeMap<>();
     private volatile State state = State.NEW;
 
+    /** Skeleton until a test asks for it: the file is accepted and ignored. */
+    KvPlugin(java.nio.file.Path configFile) { }
+
+    public KvPlugin() { }
+
     @Override public String instruction() { return "kv"; }
 
     @Override public void start(PluginContext context) { state = State.RUNNING; }
