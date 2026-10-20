@@ -27,13 +27,25 @@ import java.util.Set;
  * The key-value plugin's settings: the properties file bundled with the plugin, overridden by an optional file, which can
  * in turn be overridden for one server with {@code server.<serverId>.} entries.
  */
-record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate) {
+record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate,
+                long syncRoundMillis, int syncFanout, int syncMaxBytes, long tombstoneRetentionMillis) {
+    /** The limits and replication switch given, with the shipped defaults for the sync settings. */
+    KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate) {
+        this(maxKeyLength, maxValueBytes, maxRecords, replicate, defaults().syncRoundMillis(), defaults().syncFanout(),
+                defaults().syncMaxBytes(), defaults().tombstoneRetentionMillis());
+    }
+
     private static final String DEFAULTS = "/kv-defaults.properties";
     private static final String REPLICATION = "replication";
     private static final String MAX_KEY_LENGTH = "namespace.kv.max.key.length";
     private static final String MAX_VALUE_BYTES = "namespace.kv.max.value.bytes";
     private static final String MAX_RECORDS = "namespace.kv.max.records";
-    private static final Set<String> KNOWN = Set.of(REPLICATION, MAX_KEY_LENGTH, MAX_VALUE_BYTES, MAX_RECORDS);
+    private static final String TOMBSTONE_RETENTION = "namespace.kv.tombstone.retention.millis";
+    private static final String SYNC_ROUND = "sync.round.millis";
+    private static final String SYNC_FANOUT = "sync.fanout";
+    private static final String SYNC_MAX_BYTES = "sync.max.bytes";
+    private static final Set<String> KNOWN = Set.of(REPLICATION, MAX_KEY_LENGTH, MAX_VALUE_BYTES, MAX_RECORDS,
+            TOMBSTONE_RETENTION, SYNC_ROUND, SYNC_FANOUT, SYNC_MAX_BYTES);
 
     static KvConfig defaults() {
         try { return load(null, ""); }
@@ -57,7 +69,8 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
             }
         }
         return new KvConfig(positive(settings, MAX_KEY_LENGTH), positive(settings, MAX_VALUE_BYTES),
-                positive(settings, MAX_RECORDS), onOff(settings, REPLICATION));
+                positive(settings, MAX_RECORDS), onOff(settings, REPLICATION), positiveLong(settings, SYNC_ROUND),
+                positive(settings, SYNC_FANOUT), positive(settings, SYNC_MAX_BYTES), positiveLong(settings, TOMBSTONE_RETENTION));
     }
 
     /** A setting must be a known one, or a known one for a particular server, so a misspelling is caught and not ignored. */
@@ -65,6 +78,15 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
         boolean known = KNOWN.contains(name)
                 || (name.startsWith("server.") && KNOWN.stream().anyMatch(key -> name.endsWith("." + key)));
         if (!known) { throw new IllegalArgumentException("Unknown setting: " + name); }
+    }
+
+    private static long positiveLong(Properties settings, String key) {
+        String value = settings.getProperty(key);
+        try {
+            long number = Long.parseLong(value.trim());
+            if (number > 0) { return number; }
+        } catch (NumberFormatException | NullPointerException notANumber) { /* reported below */ }
+        throw new IllegalArgumentException("Setting " + key + " must be a positive whole number, not '" + value + "'");
     }
 
     private static int positive(Properties settings, String key) {

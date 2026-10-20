@@ -41,6 +41,36 @@ class KvConfigTest {
         return Files.writeString(folder.resolve("kv.properties"), String.join(System.lineSeparator(), lines) + System.lineSeparator());
     }
 
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "sync.round.millis=0 | sync.round.millis",
+            "sync.fanout=lots | sync.fanout",
+            "sync.max.bytes=-5 | sync.max.bytes",
+            "namespace.kv.tombstone.retention.millis=0 | namespace.kv.tombstone.retention.millis"})
+    void aBadSyncSettingIsRefusedAsNotAPositiveNumber(String line, String key) throws Exception {
+        var path = file(line.trim());
+        var refused = assertThrows(IllegalArgumentException.class, () -> KvConfig.load(path, "Server-001"));
+        assertTrue(refused.getMessage().contains(key) && refused.getMessage().contains("positive whole number"), refused.getMessage());
+    }
+
+    @Test void theBundledDefaultsGiveTheSyncSettings() {
+        var defaults = KvConfig.defaults();
+        assertEquals(2_000, defaults.syncRoundMillis());
+        assertEquals(1, defaults.syncFanout());
+        assertEquals(32_768, defaults.syncMaxBytes());
+        assertEquals(1_800_000, defaults.tombstoneRetentionMillis());
+    }
+
+    @Test void aFileOverridesTheSyncSettings() throws Exception {
+        var config = KvConfig.load(file("sync.round.millis=500", "sync.fanout=3", "sync.max.bytes=4096",
+                "namespace.kv.tombstone.retention.millis=60000"), "Server-001");
+        assertEquals(500, config.syncRoundMillis());
+        assertEquals(3, config.syncFanout());
+        assertEquals(4_096, config.syncMaxBytes());
+        assertEquals(60_000, config.tombstoneRetentionMillis());
+        assertEquals(256, config.maxKeyLength());
+    }
+
     @Test void aFileOverridesTheDefaultsAndLeavesTheRestAlone() throws Exception {
         var config = KvConfig.load(file("namespace.kv.max.records=5", "replication=on"), "Server-001");
         assertEquals(5, config.maxRecords());
@@ -71,6 +101,10 @@ class KvConfigTest {
             "namespace.kv.max.recordz=5              | namespace.kv.max.recordz",
             "bogus=1                                 | bogus",
             "replication=maybe                       | replication",
+            "sync.round.millis=0                     | sync.round.millis",
+            "sync.fanout=lots                        | sync.fanout",
+            "sync.max.bytes=-5                       | sync.max.bytes",
+            "namespace.kv.tombstone.retention.millis=0 | namespace.kv.tombstone.retention.millis",
             "server.Server-001.namespace.kv.bogus=1  | namespace.kv.bogus"})
     void aBadSettingIsRejectedWithItsKeyNamed(String line, String key) throws Exception {
         var path = file(line.trim());

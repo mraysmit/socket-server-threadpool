@@ -2,7 +2,7 @@
 
 | Document metadata | Details |
 | --- | --- |
-| Status | Plan, approved for Phase 1. Phase 1 is in progress. |
+| Status | Plan, approved. **Phases 1 and 2 are complete** (2026-10-20). This is the review gate after Phase 2: Phase 3 has not been started. |
 | Last updated | 2026-10-20 |
 | Applies to | [`plugins/kv-plugin`](../plugins/kv-plugin), the gossip plugin, the host, and the test harness in `socket-server-swarm` |
 | Target design | [`PLUGIN_SERVICES_DESIGN.md`](PLUGIN_SERVICES_DESIGN.md), [`REPLICATION_ENGINE_DESIGN.md`](REPLICATION_ENGINE_DESIGN.md) and [`REPLICATION_PROFILES_DESIGN.md`](REPLICATION_PROFILES_DESIGN.md) describe where this ends up. This document says in what order to build it. |
@@ -201,7 +201,133 @@ inside out, so that the first tests need no sockets.
     replication does not receive pushes.
 26. The harness's Command tab gets the `kv status` and `kv apply` reference entries, and the README describes the option.
 
-## 6. What a reviewer should see at the end of Phase 1
+## 5b. Phase 2 as test-first steps
+
+**Design in brief.** Each server can summarise its store as a root hash over (key, version, deleted) in key order, excluding deletion
+records older than the retention. Two servers with equal roots hold the same records. When they differ, the initiator walks its
+keys in pages (as many as fit in `sync.max.bytes`), and the other server answers with the records it holds that are newer or
+missing and the keys it wants, so both end with the newer of every record. A reply that would be too large is cut off with a
+continuation key. Peer messages carry the swarm ID, and a server refuses another swarm's. One thing in Phase 1 has to change
+(see the note after the list): the `status` reply gains fields.
+
+New configuration (all with shipped defaults in `kv-defaults.properties`): `sync.round.millis` (2000), `sync.fanout` (1),
+`sync.max.bytes` (32768), `namespace.kv.tombstone.retention.millis` (1800000, matching gossip's terminal retention).
+
+**G. Root hash and expiry** (`VersionedStore`, with a fake clock)
+
+27. Two stores holding the same records have the same root, whatever order they were written in, and any write, deletion, or
+    different version changes it.
+28. A deletion record older than the retention, by its own timestamp, is dropped, and is left out of the root before it is dropped.
+    A live pair is never dropped.
+
+**H. Pages and the other side's answer** (`VersionedStore`, `SyncResponder`)
+
+29. A page of the digest is the next keys in order after a given key, as many as fit a byte budget, always at least one.
+30. Given a page, the responder returns the records it holds that are newer than, or missing from, the page, and the keys it wants
+    (where the page is newer, or it lacks the key). Records of its own that fall in the page's range but not in the page are
+    returned too, and the last page's range runs to the end.
+31. A reply too large for the budget is cut off with the key to continue after, and the keys it did not reach are not reported
+    as wanted.
+
+**I. The initiator** (`Syncer`, two stores joined by an in-process link)
+
+32. Equal roots: one root exchange and nothing else.
+33. Differing stores end identical, with every record the newer of the two, deletions included.
+34. A store with many records, and a small page budget, takes several pages and still ends identical.
+35. An empty store pulls everything from a full one, through the continuation path.
+36. A peer that fails part-way leaves what was applied so far, reports the failure, and a later sync completes.
+
+**J. Over the wire** (`KvPlugin`, `TcpPeerLink`)
+
+37. `sync-root` and `sync-digest` through the instruction, with validation, refused when replication is off, and refused when
+    the swarm ID is wrong or missing. `apply` takes an optional swarm ID, checked when present.
+38. Pushes carry the swarm ID. The real link carries a sync over real sockets between two in-process servers.
+39. `status` shows the root, and per peer its last sync time and result, and the sync counters.
+
+**K. The loop** (`SyncLoop`)
+
+40. A server that starts with replication on pulls everything from a peer as soon as one is found, before its first round.
+41. Each round syncs with the configured number of alive peers, chosen at random, and a failing peer does not stop the round.
+42. A write whose push failed is repaired by the next round (two real in-process servers).
+43. Starting, stopping and restarting a server: a restarted server (empty, new process) is restored; a stopped server catches up
+    when it returns.
+
+**L. Real servers and the page** (harness)
+
+44. The harness snapshot carries each server's kv root, and the page shows "kv in sync N of M" for a swarm.
+45. Swarm tests: a server added to a running swarm receives everything; a stopped and restarted server is restored; two writers
+    of one key converge to the same value; a failed push is repaired.
+
+**A change to Phase 1 tests, announced here before it is made.** `status` was designed to grow, and Phase 2 adds `root` and `sync`
+after `counters`. The Phase 1 test `statusFieldsComeInAFixedOrderAndItTakesNoParameters` asserts the exact field list, so it is
+updated to the new order. Nothing else in Phase 1 is touched: the push counters keep their own map.
+
+## 5c. Phase 2 result
+
+Built test-first, following section 5b in order, with the same discipline as Phase 1 (each step began with a failing test, and
+a test that passed first time was a guard that was then checked by breaking the code it guards).
+
+| Project | Tests | Failures |
+| --- | --- | --- |
+| `plugins/kv-plugin`, unit | 207 (108 at the end of Phase 1) | 0 |
+| `plugins/kv-plugin`, integration (real server processes) | 5, unchanged | 0 |
+| `socket-server-swarm` (the harness) | 112 (102 after Phase 1) | 0 |
+
+Delivered as planned in 5b: the root hash and deletion-record expiry; digest pages and the responder's reply with a continuation
+key; the initiator; `sync-root` and `sync-digest` and the swarm ID check; `status` with `root` and `sync`; the start-up pull and the
+periodic round; the harness snapshot, the page's "kv: N of M in sync" line, the inspector facts, and events; swarm tests with real
+servers (a server added to a running swarm, a stopped and restarted server, two writers of one key).
+
+Two earlier tests changed, both announced or forced by the design, and nothing else from Phase 1 was touched:
+
+- The Phase 1 `status` field-order test now lists `root` and `sync` after `counters` (announced in 5b).
+- The harness's `ConnectionPoolTest` pins the exact number of requests a snapshot of a plugin-free swarm sends: nine before,
+  twelve now, because the snapshot also asks each server once whether the key-value plugin is there, as it already did for gossip.
+
+What the work taught that is worth knowing:
+
+- Rows in a `sync-digest` request have to be in key order, and the plugin now refuses them if not. A test that sent them out of order
+  produced wrong answers silently, which is how that gap was found.
+- A first version of the swarm tests' "everyone is alive" wait, and later a set of tests comparing `Integer` with the `BigInteger`
+  that the JSON decoder returns, were mistakes in the tests and not in the code; each was fixed in the test.
+- A push that cannot name its swarm (gossip's status not answering) goes without a swarm ID instead of failing, so the Phase 1
+  default-wiring test with a stand-in gossip keeps passing. A comparison always names the swarm, and cannot go ahead without.
+- Seven `KvConvergenceTest` scenarios with real servers and a 100 ms round settle in under two seconds, so the periodic loop is
+  cheap to test.
+
+Known limits that remain, all from section 3 and all Phase 3: a write is pushed to every alive peer, every push and comparison opens
+its own connection, the counter `c` is always 0, and a replicated record over a limit is refused rather than absorbed.
+
+## 6. Phase 1 result
+
+Built test-first, following section 5 in order. Every step started with a test that failed for the reason it was meant to, and a
+test that passed the first time was either a deliberate guard (checked by temporarily breaking the code it guards) or was
+rewritten.
+
+| Project | Tests | Failures |
+| --- | --- | --- |
+| `plugins/kv-plugin`, unit | 108 (the original 14 unchanged, 94 new) | 0 |
+| `plugins/kv-plugin`, integration (real server processes) | 5, unchanged | 0 |
+| `socket-server-swarm` (the harness) | 102 (89 before, 13 new) | 0 |
+
+Delivered as planned: configuration with the three limits in a bundled properties file, versions and the merge rule, `apply`,
+`status`, the pusher, peers read from gossip, the harness `--kv-replicate` option, a five-server swarm test, and the Command tab
+entries. Shortcuts taken, all from section 3 and none added: the counter `c` is always 0 and `w` is made strictly increasing;
+peers are found by a loopback `gossip members` call on every push; a push goes to every alive peer on a connection of its own; a
+replicated record over a limit is refused; no swarm ID in messages; no retry.
+
+Things the work taught that are worth knowing:
+
+- Gossip's `members` list includes a row for the server itself. The peer reader skips it, and the swarm test waits for every member
+  to be rated alive, itself included, before writing. A first version of that wait was one peer short and made the swarm tests
+  time out, which showed up only because they ran against real servers.
+- `NumberFormatException` is an `IllegalArgumentException`, so a test that only checks the exception type can pass for the wrong
+  reason. The configuration tests check that the message names the setting.
+- Existing tests refer to `KvPlugin.MAX_KEY_LENGTH`, `MAX_VALUE_BYTES` and `MAX_PAIRS`. They remain, but now take their values from
+  the bundled defaults file at class load, so the code holds no limiting number and the original tests did not have to change.
+- A guard against a runaway members cursor uses repeat detection, which needs no page limit in the code.
+
+## 7. What a reviewer should see at the end of Phase 1
 
 - A short list of changes, each step above traceable to a test.
 - The unchanged existing kv tests, passing.

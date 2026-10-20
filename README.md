@@ -526,16 +526,68 @@ loads it. Its commands use one instruction, `kv`, with an `operation` parameter:
 | `get` | `key` | `{"key":"colour","found":true,"value":"blue"}`, or `{"key":"colour","found":false}` |
 | `delete` | `key` | `{"key":"colour","deleted":true}`, or `false` when there was no such key |
 | `list` | none | `{"keys":["colour","size"],"count":2}`, with the keys in order |
+| `status` | none | Whether replication is on, the live and deleted counts, and counters: `{"replication":"off","pairs":2,"deleted":0,"counters":{"pushed":0,"pushFailures":0,"applied":0,"ignored":0,"rejected":0}}` |
+| `apply` | `records`, optional `swarmId` | For servers handing each other records when replication is on (see below). Answers `{"applied":1,"ignored":0,"rejected":0}`. Refused when replication is off, or when `swarmId` names another swarm. |
+| `sync-root` | `swarmId`, `root` | For servers comparing their pairs: answers `{"equal":true,"root":"..."}` with its own root. |
+| `sync-digest` | `swarmId`, `after`, `upTo`, `rows` | For servers comparing their pairs: given a page of the other server's keys and versions, answers the records it has that are newer or missing, the keys it wants, and where to carry on if the reply was cut at the message limit. |
 
 A value may be any JSON value: a string, number, `true`, `false`, `null`, an object or an array. It
 comes back exactly as it was stored; numbers keep their full precision. Keys are strings of 1 to 256
-characters. A value may take up to 16 KB as JSON, and one server holds at most 1,000 pairs. Malformed
-commands, an oversized key or value, and a new key for a full store return an `INVALID_PARAMETERS`
-error, and the store is unchanged.
+characters. A value may take up to 16 KB as JSON, and one server holds at most 1,000 pairs. Those three
+limits are the shipped defaults in `kv-defaults.properties` inside the plugin jar, and the code holds no
+number that limits the store; they can be changed (see below). Malformed commands, an oversized key or
+value, and a new key for a full store return an `INVALID_PARAMETERS` error, and the store is unchanged.
 
 Each server has its own store, which lives as long as the server runs: it is not saved, and servers do
-not share it. The commands work once the plugin has started with its server, and stop working when the
-server stops.
+not share it unless replication is turned on (see below). The commands work once the plugin has started
+with its server, and stop working when the server stops.
+
+Settings are read when the plugin starts from the file named by `-Dkv.config=<path>`, over the shipped
+defaults; a `server.<serverId>.` prefix on a key applies it to one server only. A misspelled key, a
+non-numeric or non-positive limit, and a value other than `on` or `off` stop the plugin starting, with a
+message that names the setting.
+
+| Setting | Shipped default | Meaning |
+|---|---|---|
+| `replication` | `off` | `on` copies this server's writes to the other servers of its swarm |
+| `namespace.kv.max.key.length` | 256 | Longest key, in characters |
+| `namespace.kv.max.value.bytes` | 16384 | Largest value, as UTF-8 bytes of its JSON |
+| `namespace.kv.max.records` | 1000 | Pairs a server accepts from its own clients |
+| `namespace.kv.tombstone.retention.millis` | 1800000 | How long a deletion record is kept, by its own timestamp |
+| `sync.round.millis` | 2000 | Time between comparisons with another server |
+| `sync.fanout` | 1 | How many other servers each comparison round talks to |
+| `sync.max.bytes` | 32768 | Largest message sent while comparing; a larger store takes several |
+
+##### Replication (second phase)
+
+With `replication=on` and the gossip plugin loaded on the same server, each pair carries a version (the
+time of the write, a counter and the writing server), and the newest version wins. After a local `put` or
+`delete`, the server asks its own gossip plugin which members it rates alive and sends each of them the
+record (a deletion leaves a record, so it spreads too), on separate threads, without making the writer
+wait. A server that cannot be reached is skipped and counted in `status`; the write still succeeds. A
+record a peer sends that breaks this server's own limits is refused and counted, not stored.
+
+Pushes are not enough on their own, so each server also compares its pairs with others. It summarises its
+store as a root hash (a SHA-256 over every key, version and whether it is a deletion, in key order, leaving out
+deletion records past their retention). When it starts, it pulls from a peer as soon as it finds one that
+gossip rates alive, and then from a second. After that, every `sync.round.millis` it picks `sync.fanout`
+random alive peers and sends each its root. If the roots are equal that is all. If not, it walks its keys a
+page at a time (a page fits `sync.max.bytes`), the other server answers with the records it has that are newer
+or missing and the keys it wants, and each side hands the other what it lacks, so both end with the newer of
+every record. A reply that would be too large is cut off with the key to carry on from. So a push that was
+lost, a server that was stopped, a server added later, and two servers that wrote the same key at once all
+settle, normally within a round or two. Every message names this server's swarm (read from its gossip
+plugin's status), and a server in another swarm refuses it. A deletion record older than
+`namespace.kv.tombstone.retention.millis` is dropped, so a server away longer than that can bring a deleted
+key back; the default matches gossip's.
+
+`status` now also reports `root` and `sync`: rounds run, rounds that found a difference, failures, and for
+each peer compared with the time and result of the last comparison (`EQUAL`, `SYNCED` or `FAILED`).
+
+Not yet: a write is pushed to every alive peer and every push and comparison opens a new connection, which will
+not scale to a large swarm; the version's counter is always 0; a replicated record over a limit is refused. Those
+are the next phase; see [`docs/REPLICATION_PLAN.md`](docs/REPLICATION_PLAN.md), which also describes where this
+is heading. To try it in the test harness, see its README (`--kv-replicate`).
 
 Build it and start a server that loads it:
 

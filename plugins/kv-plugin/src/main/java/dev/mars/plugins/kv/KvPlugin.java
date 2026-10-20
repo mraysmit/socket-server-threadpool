@@ -23,47 +23,136 @@ import dev.mars.protocol.Json;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.math.BigInteger;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Random;
+import java.util.Set;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executor;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeMap;
 
 /**
  * An in-memory store of key-value pairs, one per server, behind the {@code kv} instruction. Its operations are
  * {@code put}, {@code get}, {@code delete} and {@code list}; a value may be any JSON value. The store accepts
  * commands only while the plugin is running, and is lost when the server stops.
+ *
+ * <p>With replication on, each local write is also pushed to the other servers its own gossip plugin rates alive, and
+ * {@code apply} accepts the records they push. Every pair carries a version, and the newest write wins. {@code status}
+ * reports what the store holds and what replication has done.
  */
 public final class KvPlugin implements CommandPlugin {
-    /** The longest key, in characters. */
-    static final int MAX_KEY_LENGTH = 256;
-    /** The largest value, as UTF-8 bytes of its JSON. */
-    static final int MAX_VALUE_BYTES = 16 * 1024;
-    /** The most pairs one server holds, so clients cannot exhaust its memory. */
-    static final int MAX_PAIRS = 1000;
+    /** The shipped limits, read from the bundled defaults. A server's own configuration can change them. */
+    static final int MAX_KEY_LENGTH = KvConfig.defaults().maxKeyLength();
+    static final int MAX_VALUE_BYTES = KvConfig.defaults().maxValueBytes();
+    static final int MAX_PAIRS = KvConfig.defaults().maxRecords();
     private static final String OPERATION = "operation";
     private static final String KEY = "key";
     private static final String VALUE = "value";
+    private static final String SWARM_ID = "swarmId";
 
     private enum State { NEW, RUNNING, STOPPED }
 
     /**
      * Sorted, so {@code list} returns keys in order. Each value is held as its JSON text, which gives its exact size
-     * and is a copy that no caller can change afterwards.
+     * and is a copy that no caller can change afterwards. Each pair also carries the version that decides which of two
+     * writes is newer.
      */
-    private final TreeMap<String, String> pairs = new TreeMap<>();
+    private volatile VersionedStore store;
+    private volatile SyncResponder responder;
+    private volatile SwarmIdSource swarmIds;
+    private final SyncLink syncLink;
+    private volatile Thread syncThread;
+    private final PeerSource peers;
+    private final PeerLink link;
+    private final Executor executor;
+    private volatile ExecutorService ownExecutor;
+    private volatile Replicator replicator;
+    private final KvCounters counters = new KvCounters();
+    private final SyncStats syncStats = new SyncStats(System::currentTimeMillis);
     private volatile State state = State.NEW;
 
-    /** Skeleton until a test asks for it: the file is accepted and ignored. */
-    KvPlugin(java.nio.file.Path configFile) { }
+    private final Path configFile;
+    private volatile KvConfig config = KvConfig.defaults();
 
-    public KvPlugin() { }
+    /** Reads its settings from the file named by the kv.config system property, if there is one. */
+    public KvPlugin() { this(null); }
+
+    KvPlugin(Path configFile) { this(configFile, null, null, null); }
+
+    /** With a peer list and a link given, replication uses them. Tests give fakes; otherwise they are made when the plugin starts. */
+    KvPlugin(Path configFile, PeerSource peers, PeerLink link, Executor executor) {
+        this(configFile, peers, link, executor, null);
+    }
+
+    KvPlugin(Path configFile, PeerSource peers, PeerLink link, Executor executor, SwarmIdSource swarmIds) {
+        this(configFile, peers, link, executor, swarmIds, null);
+    }
+
+    /** The comparison link is the one given, or the push link if that can compare too, or a real one made at start. */
+    KvPlugin(Path configFile, PeerSource peers, PeerLink link, Executor executor, SwarmIdSource swarmIds, SyncLink syncLink) {
+        this.syncLink = syncLink;
+        this.swarmIds = swarmIds;
+        this.configFile = configFile;
+        this.peers = peers;
+        this.link = link;
+        this.executor = executor;
+    }
 
     @Override public String instruction() { return "kv"; }
 
-    @Override public void start(PluginContext context) { state = State.RUNNING; }
+    @Override public void start(PluginContext context) throws IOException {
+        config = KvConfig.load(configFile != null ? configFile : fileFromProperty(), context.serverId());
+        store = new VersionedStore(context.serverId(), System::currentTimeMillis, config);
+        responder = new SyncResponder(store, config.syncMaxBytes());
+        if (swarmIds == null) { swarmIds = new GossipSwarmId(new LoopbackGossip(context.port())); }
+        if (config.replicate()) {
+            // Anything not given (tests give fakes) is the real thing: peers from this server's own gossip, over sockets.
+            var pushes = executor;
+            if (pushes == null) {
+                ownExecutor = Executors.newVirtualThreadPerTaskExecutor();
+                pushes = ownExecutor;
+            }
+            var found = peers != null ? peers : new GossipPeers(new LoopbackGossip(context.port()), context.serverId());
+            replicator = new Replicator(found, link != null ? link : new TcpPeerLink(swarmIds), pushes, counters);
+            SyncLink compare = syncLink != null ? syncLink : link instanceof SyncLink capable ? capable : new TcpPeerLink(swarmIds);
+            var rounds = new SyncRounds(found, new Syncer(store, compare, config.syncMaxBytes()), store, syncStats, config.syncFanout(), new Random());
+            syncThread = Thread.ofVirtual().name("kv-sync-" + context.serverId()).start(() -> syncLoop(rounds, config.syncRoundMillis()));
+        }
+        state = State.RUNNING;
+    }
 
-    @Override public void stop() { state = State.STOPPED; }
+    /** Pulls from a peer as soon as one can be found, then compares with a few random peers every round, until the plugin stops. */
+    private void syncLoop(SyncRounds rounds, long everyMillis) {
+        boolean pulled = false;
+        while (state == State.RUNNING) {
+            try {
+                if (!pulled) { pulled = rounds.bootstrap() > 0; } else { rounds.round(); }
+            } catch (RuntimeException e) {
+                // A comparison that goes wrong is counted where it can be, and the next round tries again.
+                syncStats.failed();
+            }
+            try { Thread.sleep(everyMillis); }
+            catch (InterruptedException stopped) { return; }
+        }
+    }
+
+    private static Path fileFromProperty() {
+        String path = System.getProperty("kv.config");
+        return path == null ? null : Path.of(path);
+    }
+
+    @Override public void stop() {
+        state = State.STOPPED;
+        var loop = syncThread;
+        if (loop != null) { loop.interrupt(); }
+        var own = ownExecutor;
+        if (own != null) { own.shutdown(); }
+    }
 
     @Override public Map<String, Object> execute(Map<String, Object> parameters) throws InvalidParametersException {
         switch (state) {
@@ -88,35 +177,122 @@ public final class KvPlugin implements CommandPlugin {
                 PluginParameters.requireKeys(parameters, OPERATION);
                 yield list();
             }
-            default -> throw new InvalidParametersException("Supported operations: put, get, delete, list");
+            case "apply" -> {
+                if (parameters.containsKey(SWARM_ID)) { PluginParameters.requireKeys(parameters, OPERATION, "records", SWARM_ID); }
+                else { PluginParameters.requireKeys(parameters, OPERATION, "records"); }
+                yield apply(parameters.get(SWARM_ID), parameters.get("records"));
+            }
+            case "sync-root" -> {
+                PluginParameters.requireKeys(parameters, OPERATION, SWARM_ID, "root");
+                yield syncRoot(parameters.get(SWARM_ID), parameters.get("root"));
+            }
+            case "sync-digest" -> {
+                PluginParameters.requireKeys(parameters, OPERATION, SWARM_ID, "after", "upTo", "rows");
+                yield syncDigest(parameters.get(SWARM_ID), parameters.get("after"), parameters.get("upTo"), parameters.get("rows"));
+            }
+            case "status" -> {
+                PluginParameters.requireKeys(parameters, OPERATION);
+                yield status();
+            }
+            default -> throw new InvalidParametersException("Supported operations: put, get, delete, list, apply, status");
         };
     }
 
     /** Creates the pair, or replaces its value; a new key is refused once the store is full. */
     private synchronized Map<String, Object> put(String key, String value) throws InvalidParametersException {
-        boolean exists = pairs.containsKey(key);
-        if (!exists && pairs.size() >= MAX_PAIRS) {
-            throw new InvalidParametersException("The store is full: it holds at most " + MAX_PAIRS + " pairs");
+        boolean exists = store.get(key).isPresent();
+        if (!exists && store.liveCount() >= config.maxRecords()) {
+            throw new InvalidParametersException("The store is full: it holds at most " + config.maxRecords() + " pairs");
         }
-        pairs.put(key, value);
-        return reply(KEY, key, "created", !exists);
+        var write = store.put(key, value);
+        push(write.record());
+        return reply(KEY, key, "created", !write.hadLive());
     }
 
     private Map<String, Object> get(String key) {
-        String value;
-        synchronized (this) { value = pairs.get(key); }
-        if (value == null) { return reply(KEY, key, "found", false); }
+        var record = store.get(key);
+        if (record.isEmpty()) { return reply(KEY, key, "found", false); }
         // A JSON null value is stored as the text "null", so a stored null is still found.
-        return reply(KEY, key, "found", true, VALUE, decode(value));
+        return reply(KEY, key, "found", true, VALUE, decode(record.get().valueJson()));
     }
 
     private synchronized Map<String, Object> delete(String key) {
-        return reply(KEY, key, "deleted", pairs.remove(key) != null);
+        var write = store.delete(key);
+        push(write.record());
+        return reply(KEY, key, "deleted", write.hadLive());
+    }
+
+    /** Hands a local write to the replicator, if replication is on. Never throws, and never waits for a peer. */
+    private void push(KvRecord record) {
+        var current = replicator;
+        if (current != null) { current.push(record); }
     }
 
     private synchronized Map<String, Object> list() {
-        var keys = List.copyOf(pairs.keySet());
+        var keys = store.keys();
         return reply("keys", keys, "count", keys.size());
+    }
+
+    /** Merges records another server sends. The whole batch is checked first, so a bad record stores nothing. */
+    private Map<String, Object> apply(Object swarm, Object records) throws InvalidParametersException {
+        requireReplication();
+        if (swarm != null) { requireSameSwarm(swarm); }
+        var result = store.apply(KvWire.parseRecords(records));
+        counters.applied.addAndGet(result.applied());
+        counters.ignored.addAndGet(result.ignored());
+        counters.rejected.addAndGet(result.rejected());
+        return reply("applied", result.applied(), "ignored", result.ignored(), "rejected", result.rejected());
+    }
+
+    private void requireReplication() throws InvalidParametersException {
+        if (!config.replicate()) { throw new InvalidParametersException("Replication is off on this server"); }
+    }
+
+    /** A message that names a swarm is for this server only if it is in that swarm, so servers of two swarms never mix their pairs. */
+    private void requireSameSwarm(Object given) throws InvalidParametersException {
+        if (!(given instanceof String named) || named.isEmpty()) { throw new InvalidParametersException("Parameter 'swarmId' must be the name of a swarm"); }
+        String own;
+        try { own = swarmIds.swarmId(); }
+        catch (IOException | RuntimeException e) {
+            throw new InvalidParametersException("Cannot confirm which swarm this server is in: " + e.getMessage());
+        }
+        if (!own.equals(named)) { throw new InvalidParametersException("This server is in another swarm than '" + named + "'"); }
+    }
+
+    private Map<String, Object> syncRoot(Object swarm, Object root) throws InvalidParametersException {
+        requireReplication();
+        requireSameSwarm(swarm);
+        if (!(root instanceof String theirs)) { throw new InvalidParametersException("Parameter 'root' must be text"); }
+        var answer = responder.root(theirs);
+        return reply("equal", answer.equal(), "root", answer.root());
+    }
+
+    private Map<String, Object> syncDigest(Object swarm, Object after, Object upTo, Object rows) throws InvalidParametersException {
+        requireReplication();
+        requireSameSwarm(swarm);
+        if (after != null && !(after instanceof String)) { throw new InvalidParametersException("Parameter 'after' must be a key or null"); }
+        if (upTo != null && !(upTo instanceof String)) { throw new InvalidParametersException("Parameter 'upTo' must be a key or null"); }
+        if (!(rows instanceof List<?> items)) { throw new InvalidParametersException("Parameter 'rows' must be an array"); }
+        var parsed = new ArrayList<VersionedStore.DigestRow>();
+        int position = 0;
+        for (var item : items) {
+            var row = KvWire.parseRow(item, ++position);
+            if (!parsed.isEmpty() && row.key().compareTo(parsed.getLast().key()) <= 0) {
+                throw new InvalidParametersException("Rows must be in key order with no key twice, but row " + position + " (" + row.key() + ") is not");
+            }
+            parsed.add(row);
+        }
+        var answer = responder.digest(new SyncResponder.DigestRequest((String) after, (String) upTo, parsed));
+        var wire = new ArrayList<Map<String, Object>>();
+        try { for (var record : answer.records()) { wire.add(KvWire.toWire(record)); } }
+        catch (IOException e) { throw new IllegalStateException("A stored value is not JSON", e); }
+        return reply("records", wire, "want", answer.want(), "continueAfter", answer.continueAfter());
+    }
+
+    /** Whether replication is on, what the store holds, and what replication has done so far. */
+    private Map<String, Object> status() {
+        return reply("replication", config.replicate() ? "on" : "off", "pairs", store.liveCount(),
+                "deleted", store.deletedCount(), "counters", counters.toMap(), "root", store.root(), "sync", syncStats.toMap());
     }
 
     /** A reply whose fields stay in the order given, which is the order a reader sees them in. */
@@ -126,20 +302,20 @@ public final class KvPlugin implements CommandPlugin {
         return reply;
     }
 
-    private static String key(Map<String, Object> parameters) throws InvalidParametersException {
+    private String key(Map<String, Object> parameters) throws InvalidParametersException {
         String key = PluginParameters.string(parameters, KEY);
-        if (key.isEmpty() || key.length() > MAX_KEY_LENGTH) {
-            throw new InvalidParametersException("Parameter 'key' must have 1 to " + MAX_KEY_LENGTH + " characters");
+        if (key.isEmpty() || key.length() > config.maxKeyLength()) {
+            throw new InvalidParametersException("Parameter 'key' must have 1 to " + config.maxKeyLength() + " characters");
         }
         return key;
     }
 
-    private static String encode(Object value) throws InvalidParametersException {
+    private String encode(Object value) throws InvalidParametersException {
         String json;
         try { json = Json.write(value); }
         catch (IOException e) { throw new InvalidParametersException("Parameter 'value' must be a JSON value"); }
-        if (json.getBytes(StandardCharsets.UTF_8).length > MAX_VALUE_BYTES) {
-            throw new InvalidParametersException("Parameter 'value' exceeds " + MAX_VALUE_BYTES + " bytes of JSON");
+        if (json.getBytes(StandardCharsets.UTF_8).length > config.maxValueBytes()) {
+            throw new InvalidParametersException("Parameter 'value' exceeds " + config.maxValueBytes() + " bytes of JSON");
         }
         return json;
     }
