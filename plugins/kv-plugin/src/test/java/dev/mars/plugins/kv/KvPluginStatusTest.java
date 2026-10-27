@@ -44,7 +44,8 @@ class KvPluginStatusTest {
     }
 
     private static Map<String, Object> counters(long pushed, long pushFailures, long applied, long ignored, long rejected) {
-        return Map.of("pushed", pushed, "pushFailures", pushFailures, "applied", applied, "ignored", ignored, "rejected", rejected);
+        return Map.of("pushed", pushed, "pushFailures", pushFailures, "applied", applied, "ignored", ignored, "rejected", rejected,
+                "tooFarAhead", 0L, "announced", 0L, "fetched", 0L);
     }
 
     @Test void aFreshServerReportsReplicationOffAndNothingStored() throws Exception {

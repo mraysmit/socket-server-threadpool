@@ -99,6 +99,28 @@ class KvPluginReplicationTest {
         assertEquals(List.of(THREE), sent.stream().map(Map.Entry::getKey).toList());
     }
 
+    @Test void aSenderWhoseRecordIsTooFarAheadIsCountedAndDroppedFromTheMesh() throws Exception {
+        var kv = started("replication=on");
+        long ahead = System.currentTimeMillis() + KvConfig.defaults().maxClockSkewMillis() + 60_000;
+        kv.execute(Map.of("operation", "apply", "from", "Server-002", "records", List.of(record("a", "1", ahead, "Server-002"))));
+        var counters = (Map<?, ?>) kv.execute(Map.of("operation", "status")).get("counters");
+        assertEquals(1L, counters.get("rejected"));
+        assertEquals(1L, counters.get("tooFarAhead"));
+        assertEquals(Map.of("key", "a", "found", false), kv.execute(Map.of("operation", "get", "key", "a")));
+        sent.clear();
+        kv.execute(put("b", "2"));
+        assertEquals(List.of(THREE), sent.stream().map(Map.Entry::getKey).toList(), "Server-002 is out of the mesh for now");
+    }
+
+    @Test void anAnnouncementIsAnsweredWithTheKeysThisServerWouldTake() throws Exception {
+        var kv = started("replication=on");
+        kv.execute(apply(record("held", "1", 5_000, "Server-002")));
+        var rows = List.of(
+                Map.of("key", "held", "version", Map.of("w", 5_000, "c", 0, "n", "Server-002"), "deleted", false),
+                Map.of("key", "new", "version", Map.of("w", 5_000, "c", 0, "n", "Server-002"), "deleted", false));
+        assertEquals(Map.of("want", List.of("new")), kv.execute(Map.of("operation", "announce", "from", "Server-002", "rows", rows)));
+    }
+
     @Test void aSenderThatIsNotAServerIdIsRefused() throws Exception {
         var kv = started("replication=on");
         for (Object bad : List.of(5, "", " ")) {

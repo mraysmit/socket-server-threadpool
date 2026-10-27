@@ -128,7 +128,7 @@ public final class KvPlugin implements CommandPlugin {
             }
             var found = peers != null ? peers : new GossipPeers(new LoopbackGossip(context.port(), connections), context.serverId());
             var tcp = new TcpPeerLink(swarmIds, connections, context.serverId());
-            replicator = new Replicator(found, link != null ? link : tcp, pushes, counters, config.pushFanout(), new Random());
+            replicator = new Replicator(found, link != null ? link : tcp, pushes, counters, Replicator.Settings.of(config), new Random());
             SyncLink compare = syncLink != null ? syncLink : link instanceof SyncLink capable ? capable : tcp;
             var rounds = new SyncRounds(found, new Syncer(store, compare, config.syncMaxBytes()), store, syncStats, config.syncFanout(), new Random());
             syncThread = Thread.ofVirtual().name("kv-sync-" + context.serverId()).start(() -> syncLoop(rounds, config.syncRoundMillis()));
@@ -202,6 +202,13 @@ public final class KvPlugin implements CommandPlugin {
                 PluginParameters.requireKeys(parameters, expected.toArray(String[]::new));
                 yield apply(parameters.get(SWARM_ID), parameters.get(FROM), parameters.get("records"));
             }
+            case "announce" -> {
+                var expected = new ArrayList<>(List.of(OPERATION, "rows"));
+                if (parameters.containsKey(SWARM_ID)) { expected.add(SWARM_ID); }
+                if (parameters.containsKey(FROM)) { expected.add(FROM); }
+                PluginParameters.requireKeys(parameters, expected.toArray(String[]::new));
+                yield announce(parameters.get(SWARM_ID), parameters.get(FROM), parameters.get("rows"));
+            }
             case "sync-root" -> {
                 PluginParameters.requireKeys(parameters, OPERATION, SWARM_ID, "root");
                 yield syncRoot(parameters.get(SWARM_ID), parameters.get("root"));
@@ -261,22 +268,55 @@ public final class KvPlugin implements CommandPlugin {
     private Map<String, Object> apply(Object swarm, Object from, Object records) throws InvalidParametersException {
         requireReplication();
         if (swarm != null) { requireSameSwarm(swarm); }
-        if (from != null && (!(from instanceof String sender) || sender.isBlank())) {
-            throw new InvalidParametersException("Parameter 'from' must be the sending server's ID");
-        }
+        String sender = sender(from);
         var parsed = KvWire.parseRecords(records);
         var taken = new ArrayList<KvRecord>();
         var result = store.apply(parsed, taken);
+        counters.tooFarAhead.addAndGet(result.tooFarAhead());
         var current = replicator;
         if (current != null) {
-            String sender = (String) from;
-            if (sender != null && !sender.equals(serverId)) { current.grafted(sender); }
+            if (result.tooFarAhead() > 0) {
+                System.err.println("Key-value records refused, stamped more than " + config.maxClockSkewMillis()
+                        + " ms ahead of this server's clock: " + result.tooFarAhead() + " | from=" + sender + " | serverId=" + serverId);
+                if (sender != null) { current.penalise(sender); }
+            } else if (sender != null && !sender.equals(serverId)) {
+                current.grafted(sender);
+            }
             current.forward(taken, sender);
         }
         counters.applied.addAndGet(result.applied());
         counters.ignored.addAndGet(result.ignored());
         counters.rejected.addAndGet(result.rejected());
         return reply("applied", result.applied(), "ignored", result.ignored(), "rejected", result.rejected());
+    }
+
+    /** The sending server a push names, or null when it names none. */
+    private static String sender(Object from) throws InvalidParametersException {
+        if (from == null) { return null; }
+        if (!(from instanceof String sender) || sender.isBlank()) {
+            throw new InvalidParametersException("Parameter 'from' must be the sending server's ID");
+        }
+        return sender;
+    }
+
+    /**
+     * Answers a peer that announces records by key and version with the keys of those this server would take, so that
+     * only those are then sent whole. A sender that names itself is taken into the push mesh, as for a push.
+     */
+    private Map<String, Object> announce(Object swarm, Object from, Object rows) throws InvalidParametersException {
+        requireReplication();
+        if (swarm != null) { requireSameSwarm(swarm); }
+        String sender = sender(from);
+        if (!(rows instanceof List<?> items)) { throw new InvalidParametersException("Parameter 'rows' must be an array"); }
+        var want = new ArrayList<String>();
+        int position = 0;
+        for (var item : items) {
+            var row = KvWire.parseRow(item, ++position);
+            if (store.wants(row)) { want.add(row.key()); }
+        }
+        var current = replicator;
+        if (current != null && sender != null && !sender.equals(serverId)) { current.grafted(sender); }
+        return reply("want", want);
     }
 
     private void requireReplication() throws InvalidParametersException {

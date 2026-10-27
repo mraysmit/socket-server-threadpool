@@ -26,6 +26,11 @@ final class KvCounters {
     final AtomicLong applied = new AtomicLong();
     final AtomicLong ignored = new AtomicLong();
     final AtomicLong rejected = new AtomicLong();
+    /** Of the rejected records, those stamped too far ahead of this server's clock. */
+    final AtomicLong tooFarAhead = new AtomicLong();
+    /** Records announced to a peer by key and version instead of sent whole, and of those, the ones it asked for. */
+    final AtomicLong announced = new AtomicLong();
+    final AtomicLong fetched = new AtomicLong();
 
     /** The counters as a status reply shows them, in a fixed order. */
     Map<String, Object> toMap() {
@@ -35,6 +40,9 @@ final class KvCounters {
         counters.put("applied", applied.get());
         counters.put("ignored", ignored.get());
         counters.put("rejected", rejected.get());
+        counters.put("tooFarAhead", tooFarAhead.get());
+        counters.put("announced", announced.get());
+        counters.put("fetched", fetched.get());
         return counters;
     }
 }

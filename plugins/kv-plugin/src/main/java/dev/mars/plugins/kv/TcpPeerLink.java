@@ -67,6 +67,33 @@ final class TcpPeerLink implements PeerLink, SyncLink {
         if (serverId != null) { apply(peer, List.of(), serverId); }
     }
 
+    /** Each record by key, version and whether it is a deletion, without its value; the peer answers with the keys it wants. */
+    @Override public List<String> announce(Peer peer, List<KvRecord> records) throws IOException {
+        var parameters = new LinkedHashMap<String, Object>();
+        parameters.put("operation", "announce");
+        var swarm = swarmIfKnown();
+        if (swarm != null) { parameters.put("swarmId", swarm); }
+        if (serverId != null) { parameters.put("from", serverId); }
+        var rows = new ArrayList<Map<String, Object>>();
+        for (var record : records) {
+            var row = new LinkedHashMap<String, Object>();
+            row.put("key", record.key());
+            var version = new LinkedHashMap<String, Object>();
+            version.put("w", record.version().w());
+            version.put("c", record.version().c());
+            version.put("n", record.version().n());
+            row.put("version", version);
+            row.put("deleted", record.deleted());
+            rows.add(row);
+        }
+        parameters.put("rows", rows);
+        var reply = call(peer, parameters);
+        if (!(reply.get("want") instanceof List<?> want) || !want.stream().allMatch(key -> key instanceof String)) {
+            throw new IOException("The peer's announce reply is not understood");
+        }
+        return want.stream().map(String.class::cast).toList();
+    }
+
     /** The records a comparison found the peer wants. It names no sender, as before pushes did. */
     @Override public void apply(Peer peer, List<KvRecord> records) throws IOException { apply(peer, records, null); }
 

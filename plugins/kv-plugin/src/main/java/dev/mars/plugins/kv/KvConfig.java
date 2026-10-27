@@ -28,18 +28,21 @@ import java.util.Set;
  * in turn be overridden for one server with {@code server.<serverId>.} entries.
  */
 record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate,
-                long syncRoundMillis, int syncFanout, int syncMaxBytes, long tombstoneRetentionMillis, int pushFanout) {
+                long syncRoundMillis, int syncFanout, int syncMaxBytes, long tombstoneRetentionMillis, int pushFanout,
+                long maxClockSkewMillis, long pushBatchMillis, int pushAnnounceBytes) {
     /** The limits and replication switch given, with the shipped defaults for the sync settings. */
     KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate) {
         this(maxKeyLength, maxValueBytes, maxRecords, replicate, defaults().syncRoundMillis(), defaults().syncFanout(),
-                defaults().syncMaxBytes(), defaults().tombstoneRetentionMillis(), defaults().pushFanout());
+                defaults().syncMaxBytes(), defaults().tombstoneRetentionMillis(), defaults().pushFanout(),
+                defaults().maxClockSkewMillis(), defaults().pushBatchMillis(), defaults().pushAnnounceBytes());
     }
 
-    /** Everything but the push fanout given, with the shipped push fanout. */
+    /** Everything but the push and clock settings given, with the shipped ones for those. */
     KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate, long syncRoundMillis, int syncFanout,
              int syncMaxBytes, long tombstoneRetentionMillis) {
         this(maxKeyLength, maxValueBytes, maxRecords, replicate, syncRoundMillis, syncFanout, syncMaxBytes,
-                tombstoneRetentionMillis, defaults().pushFanout());
+                tombstoneRetentionMillis, defaults().pushFanout(), defaults().maxClockSkewMillis(), defaults().pushBatchMillis(),
+                defaults().pushAnnounceBytes());
     }
 
     private static final String DEFAULTS = "/kv-defaults.properties";
@@ -52,8 +55,11 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
     private static final String SYNC_FANOUT = "sync.fanout";
     private static final String SYNC_MAX_BYTES = "sync.max.bytes";
     private static final String PUSH_FANOUT = "push.fanout";
+    private static final String MAX_CLOCK_SKEW = "max.clock.skew.millis";
+    private static final String PUSH_BATCH = "push.batch.millis";
+    private static final String PUSH_ANNOUNCE = "push.announce.bytes";
     private static final Set<String> KNOWN = Set.of(REPLICATION, MAX_KEY_LENGTH, MAX_VALUE_BYTES, MAX_RECORDS,
-            TOMBSTONE_RETENTION, SYNC_ROUND, SYNC_FANOUT, SYNC_MAX_BYTES, PUSH_FANOUT);
+            TOMBSTONE_RETENTION, SYNC_ROUND, SYNC_FANOUT, SYNC_MAX_BYTES, PUSH_FANOUT, MAX_CLOCK_SKEW, PUSH_BATCH, PUSH_ANNOUNCE);
 
     static KvConfig defaults() {
         try { return load(null, ""); }
@@ -79,7 +85,8 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
         return new KvConfig(positive(settings, MAX_KEY_LENGTH), positive(settings, MAX_VALUE_BYTES),
                 positive(settings, MAX_RECORDS), onOff(settings, REPLICATION), positiveLong(settings, SYNC_ROUND),
                 positive(settings, SYNC_FANOUT), positive(settings, SYNC_MAX_BYTES), positiveLong(settings, TOMBSTONE_RETENTION),
-                positive(settings, PUSH_FANOUT));
+                positive(settings, PUSH_FANOUT), positiveLong(settings, MAX_CLOCK_SKEW), nonNegativeLong(settings, PUSH_BATCH),
+                positive(settings, PUSH_ANNOUNCE));
     }
 
     /** A setting must be a known one, or a known one for a particular server, so a misspelling is caught and not ignored. */
@@ -96,6 +103,15 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
             if (number > 0) { return number; }
         } catch (NumberFormatException | NullPointerException notANumber) { /* reported below */ }
         throw new IllegalArgumentException("Setting " + key + " must be a positive whole number, not '" + value + "'");
+    }
+
+    private static long nonNegativeLong(Properties settings, String key) {
+        String value = settings.getProperty(key);
+        try {
+            long number = Long.parseLong(value.trim());
+            if (number >= 0) { return number; }
+        } catch (NumberFormatException | NullPointerException notANumber) { /* reported below */ }
+        throw new IllegalArgumentException("Setting " + key + " must be zero or a positive whole number, not '" + value + "'");
     }
 
     private static int positive(Properties settings, String key) {

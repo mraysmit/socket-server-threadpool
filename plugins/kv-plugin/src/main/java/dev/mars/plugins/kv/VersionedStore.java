@@ -29,9 +29,13 @@ final class VersionedStore {
     /** What a local write produced, and whether the key held a live value before it. */
     record Write(KvRecord record, boolean hadLive) { }
 
-    /** What applying a batch from a peer did: records kept, and records ignored because they were not newer. */
-    record Applied(int applied, int ignored, int rejected) {
+    /**
+     * What applying a batch from a peer did: records kept, records ignored because they were not newer, and records
+     * refused, of which {@code tooFarAhead} were stamped too far ahead of this server's clock.
+     */
+    record Applied(int applied, int ignored, int rejected, int tooFarAhead) {
         Applied(int applied, int ignored) { this(applied, ignored, 0); }
+        Applied(int applied, int ignored, int rejected) { this(applied, ignored, rejected, 0); }
     }
 
     private final String serverId;
@@ -85,8 +89,15 @@ final class VersionedStore {
 
     /** As {@link #apply(java.util.Collection)}, also adding each record that was newer than what was held to {@code taken}. */
     synchronized Applied apply(java.util.Collection<KvRecord> received, java.util.List<KvRecord> taken) {
-        int applied = 0, ignored = 0, rejected = 0;
+        int applied = 0, ignored = 0, rejected = 0, tooFarAhead = 0;
+        long now = clock.getAsLong();
         for (var record : received) {
+            // Checked before the clock moves: one server with a wrong clock must not push everyone's clock with it.
+            if (tooFarAhead(record.version(), now)) {
+                rejected++;
+                tooFarAhead++;
+                continue;
+            }
             if (!withinLimits(record)) {
                 rejected++;
                 continue;
@@ -101,7 +112,22 @@ final class VersionedStore {
                 ignored++;
             }
         }
-        return new Applied(applied, ignored, rejected);
+        return new Applied(applied, ignored, rejected, tooFarAhead);
+    }
+
+    /** A version stamped more than the allowed skew ahead of this server's clock, which nothing could overwrite for that long. */
+    private boolean tooFarAhead(Version version, long now) {
+        return version.w() - now > limits.maxClockSkewMillis();
+    }
+
+    /**
+     * Whether a record a peer announces by key and version would be taken: it is newer than what is held, within the key
+     * limit, and not too far ahead. Its value is not known yet, so the value limit is checked when it arrives.
+     */
+    synchronized boolean wants(DigestRow row) {
+        if (row.key().length() > limits.maxKeyLength() || tooFarAhead(row.version(), clock.getAsLong())) { return false; }
+        var current = records.get(row.key());
+        return current == null || row.version().compareTo(current.version()) > 0;
     }
 
     /** A record from a peer is held only if it respects this server's own limits. */

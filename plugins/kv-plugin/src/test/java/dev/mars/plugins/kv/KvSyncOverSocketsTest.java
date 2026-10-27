@@ -159,6 +159,17 @@ class KvSyncOverSocketsTest {
         }
     }
 
+    @Test void aRealServerAsksOnlyForTheAnnouncedRecordsItLacks() throws Exception {
+        var remote = server("Server-R", "alpha");
+        try (var connections = TcpPeerLink.newClient()) {
+            var link = new TcpPeerLink(() -> "alpha", connections, "Local");
+            var held = new KvRecord("held", "\"1\"", new Version(System.currentTimeMillis(), 0, "Local"), false);
+            link.send(peer(remote), List.of(held));
+            var fresh = new KvRecord("fresh", "\"2\"", new Version(System.currentTimeMillis(), 0, "Local"), false);
+            assertEquals(List.of("fresh"), link.announce(peer(remote), List.of(held, fresh)));
+        }
+    }
+
     @Test void pushesNameTheSwarmSoAServerInAnotherSwarmRefusesThem() throws Exception {
         var sameSwarm = server("Server-R", "alpha");
         var otherSwarm = server("Server-O", "beta");

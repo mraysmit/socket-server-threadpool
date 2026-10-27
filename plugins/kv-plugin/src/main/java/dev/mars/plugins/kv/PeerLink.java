@@ -27,4 +27,12 @@ interface PeerLink {
      * ways. A link that cannot say which server is sending does nothing.
      */
     default void graft(Peer peer) throws IOException { }
+
+    /**
+     * Tells a peer which records this server has, by key and version only, and returns the keys of those it does not
+     * hold yet, which are then sent whole. A link that cannot announce answers that the peer wants them all.
+     */
+    default List<String> announce(Peer peer, List<KvRecord> records) throws IOException {
+        return records.stream().map(KvRecord::key).toList();
+    }
 }
