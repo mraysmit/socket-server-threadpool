@@ -121,6 +121,9 @@ public final class ServerInstance implements AutoCloseable {
 
     public boolean frozen() { return gate.frozen(); }
 
+    /** The instructions this server answers, one per command plugin it loaded. */
+    public java.util.Set<String> instructions() { return plugins.instructions(); }
+
     /** Quiesce plugins and close listeners without joining the calling listener task. */
     public synchronized void requestStop() {
         if (stopRequested) {
