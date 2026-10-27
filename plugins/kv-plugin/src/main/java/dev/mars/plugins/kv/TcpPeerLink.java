@@ -43,7 +43,7 @@ final class TcpPeerLink implements PeerLink, SyncLink {
 
     TcpPeerLink() { this(null); }
 
-    TcpPeerLink(SwarmIdSource swarmIds) { this(swarmIds, newClient()); }
+    TcpPeerLink(SwarmIdSource swarmIds) { this(swarmIds, newClient(null)); }
 
     TcpPeerLink(SwarmIdSource swarmIds, KeepAliveClient connections) { this(swarmIds, connections, null); }
 
@@ -53,10 +53,13 @@ final class TcpPeerLink implements PeerLink, SyncLink {
         this.serverId = serverId;
     }
 
-    /** The client the plugin shares between its peer link and its calls to its own gossip, and closes when it stops. */
-    static KeepAliveClient newClient() {
+    /**
+     * The client the plugin shares between its peer link and its calls to its own gossip, and closes when it stops.
+     * {@code serverId} is the server it sends for, so injected network faults apply to it; null for none.
+     */
+    static KeepAliveClient newClient(String serverId) {
         return new KeepAliveClient(KeepAliveClient.Settings.of("Key-value", MAX_REPLY_BYTES, Duration.ofSeconds(5),
-                Duration.ofSeconds(10), Duration.ofSeconds(15)));
+                Duration.ofSeconds(10), Duration.ofSeconds(15)), KeepAliveClient.Listener.NONE, java.net.Socket::new, serverId);
     }
 
     /** A push names this server, so the receiver leaves it out when passing the records on. */

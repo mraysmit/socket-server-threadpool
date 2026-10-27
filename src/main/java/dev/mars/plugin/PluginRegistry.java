@@ -51,6 +51,8 @@ public final class PluginRegistry implements AutoCloseable {
     private final List<LoadedPlugin> described;
     private final ConcurrentLinkedDeque<CommandPlugin> enteredPlugins = new ConcurrentLinkedDeque<>();
     private boolean startupAttempted;
+    /** The server's run gate, from its context at start; requests wait on it while the server is frozen. */
+    private volatile RunGate gate = new RunGate();
     private boolean stopAttempted;
     private boolean closed;
 
@@ -154,6 +156,7 @@ public final class PluginRegistry implements AutoCloseable {
         }
         java.util.Objects.requireNonNull(context, "context");
         startupAttempted = true;
+        gate = context.gate();
         IOException failure = null;
         boolean interrupted = false;
         // Lifecycle calls stay serialized; workers record entry without acquiring this monitor.
@@ -235,6 +238,12 @@ public final class PluginRegistry implements AutoCloseable {
     }
 
     public CommandReply dispatch(CommandRequest request, String serverId, long connectionId) {
+        // A frozen server reads a request but answers nothing until it is thawed, as a paused process would.
+        try { gate.awaitRunning(); }
+        catch (InterruptedException stopping) {
+            Thread.currentThread().interrupt();
+            return CommandReply.failure(request.messageId(), serverId, connectionId, PLUGIN_ERROR, "Server is stopping");
+        }
         var plugin = plugins.get(request.instruction());
         if (plugin == null) {
             return CommandReply.failure(request.messageId(), serverId, connectionId,

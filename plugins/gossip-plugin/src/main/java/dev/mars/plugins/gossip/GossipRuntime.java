@@ -66,6 +66,7 @@ final class GossipRuntime implements AutoCloseable {
     private IOException stopFailure;
     private final ReentrantLock closeLock = new ReentrantLock();
     private volatile State state = State.INITIALIZING;
+    private volatile dev.mars.plugin.RunGate gate = new dev.mars.plugin.RunGate();
 
     GossipRuntime(GossipConfig config, MembershipTable table, GossipTransport transport,
             GossipMetrics metrics) throws IOException {
@@ -106,6 +107,9 @@ final class GossipRuntime implements AutoCloseable {
         scheduler.start();
     }
 
+    /** The server's run gate: while it is frozen, the scheduler waits instead of running rounds. */
+    synchronized void gate(dev.mars.plugin.RunGate gate) { this.gate = java.util.Objects.requireNonNull(gate); }
+
     /** Rounds will be run by hand, through {@link #round()}, instead of by the owned scheduler. */
     synchronized void manual() { state = State.MANUAL; }
 
@@ -115,6 +119,8 @@ final class GossipRuntime implements AutoCloseable {
     private void run() {
         try {
             for (boolean first = true; awaitRound(first); first = false) {
+                // A frozen server runs no rounds, so its heartbeat stops and its peers see it fall silent.
+                gate.awaitRunning();
                 try { round(); }
                 catch (RuntimeException e) {
                     metrics.roundFailures.incrementAndGet();

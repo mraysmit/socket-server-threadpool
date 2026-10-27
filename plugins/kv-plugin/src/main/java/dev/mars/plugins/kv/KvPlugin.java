@@ -78,6 +78,8 @@ public final class KvPlugin implements CommandPlugin {
     private final SyncStats syncStats = new SyncStats(System::currentTimeMillis);
     private volatile State state = State.NEW;
     private volatile String serverId;
+    /** While the server is frozen, the sync loop waits instead of comparing. */
+    private volatile dev.mars.plugin.RunGate gate = new dev.mars.plugin.RunGate();
 
     private final Path configFile;
     private volatile KvConfig config = KvConfig.defaults();
@@ -110,11 +112,12 @@ public final class KvPlugin implements CommandPlugin {
 
     @Override public void start(PluginContext context) throws IOException {
         serverId = context.serverId();
+        gate = context.gate();
         config = KvConfig.load(configFile != null ? configFile : fileFromProperty(), context.serverId());
         store = new VersionedStore(context.serverId(), System::currentTimeMillis, config);
         responder = new SyncResponder(store, config.syncMaxBytes());
         // One set of kept-open connections, to the peers and to this server's own gossip, closed when the plugin stops.
-        var connections = TcpPeerLink.newClient();
+        var connections = TcpPeerLink.newClient(context.serverId());
         ownConnections = connections;
         if (swarmIds == null) { swarmIds = new GossipSwarmId(new LoopbackGossip(context.port(), connections)); }
         // Running before the sync thread starts, which runs only while the plugin is.
@@ -139,6 +142,8 @@ public final class KvPlugin implements CommandPlugin {
     private void syncLoop(SyncRounds rounds, long everyMillis) {
         boolean pulled = false;
         while (state == State.RUNNING) {
+            try { gate.awaitRunning(); }
+            catch (InterruptedException stopped) { return; }
             try {
                 // Each round also keeps the push mesh in step with the peers alive, as gossipsub's heartbeat does.
                 var current = replicator;

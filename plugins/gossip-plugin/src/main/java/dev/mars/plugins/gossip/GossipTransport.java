@@ -86,7 +86,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             @Override public void opened() { metrics.connectionsOpened.incrementAndGet(); }
             @Override public void reused() { metrics.connectionsReused.incrementAndGet(); }
             @Override public void stale() { metrics.staleConnections.incrementAndGet(); }
-        }, java.util.Objects.requireNonNull(sockets));
+        }, java.util.Objects.requireNonNull(sockets), table.self().key().serverId());
     }
 
     public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {

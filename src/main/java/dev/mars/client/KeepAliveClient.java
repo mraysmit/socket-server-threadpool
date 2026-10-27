@@ -133,6 +133,8 @@ public final class KeepAliveClient implements AutoCloseable {
     private final Settings settings;
     private final Listener listener;
     private final Supplier<Socket> sockets;
+    /** The server this client sends for, which injected network faults are decided by; null for none. */
+    private final String source;
     private final long connectNanos;
     private final long idleNanos;
     private final long idleLimitNanos;
@@ -149,9 +151,18 @@ public final class KeepAliveClient implements AutoCloseable {
 
     /** Tests replace {@code sockets} to stall a write, which a real loopback socket cannot be relied on to do. */
     public KeepAliveClient(Settings settings, Listener listener, Supplier<Socket> sockets) {
+        this(settings, listener, sockets, null);
+    }
+
+    /**
+     * A client that sends for the server {@code source}, so that any {@link NetworkFaults} installed for testing apply
+     * to its requests. Without a source, none do.
+     */
+    public KeepAliveClient(Settings settings, Listener listener, Supplier<Socket> sockets, String source) {
         this.settings = Objects.requireNonNull(settings);
         this.listener = Objects.requireNonNull(listener);
         this.sockets = Objects.requireNonNull(sockets);
+        this.source = source;
         connectNanos = settings.connectTimeout().toNanos();
         idleNanos = settings.readIdleTimeout().toNanos();
         idleLimitNanos = settings.idleLimit().toNanos();
@@ -210,6 +221,7 @@ public final class KeepAliveClient implements AutoCloseable {
     }
 
     private Exchange exchange(InetSocketAddress address, byte[] keepAlive, byte[] plain, long deadline) throws IOException {
+        injectFaults(address, deadline);
         var reply = parse(exchangeOver(address, keepAlive, plain, deadline));
         if (rejectsKeepAlive(reply)) {
             // An older host rejects the field. Remember that, and send this request again without it; from now on the
@@ -218,6 +230,31 @@ public final class KeepAliveClient implements AutoCloseable {
             reply = parse(exchangeOver(address, keepAlive, plain, deadline));
         }
         return new Exchange(reply, address);
+    }
+
+    /**
+     * Applies an injected network fault to a request about to be sent: waits out its delay, and for a lost request waits
+     * as long as an unanswered connect would and then times out, as a sender behind a partition does.
+     */
+    private void injectFaults(InetSocketAddress address, long deadline) throws IOException {
+        if (source == null) { return; }
+        var fault = NetworkFaults.fault(source, address);
+        if (fault.delayMillis() > 0) { sleepUntil(Math.min(deadline, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fault.delayMillis()))); }
+        if (fault.lost()) {
+            sleepUntil(Math.min(deadline, System.nanoTime() + connectNanos));
+            throw new SocketTimeoutException(settings.name() + " request to " + address + " was lost (injected network fault)");
+        }
+        checkDeadline(deadline);
+    }
+
+    private static void sleepUntil(long until) throws InterruptedIOException {
+        try {
+            long left = until - System.nanoTime();
+            if (left > 0) { TimeUnit.NANOSECONDS.sleep(left); }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new InterruptedIOException("Interrupted while an injected network fault was delaying a request");
+        }
     }
 
     private static CommandReply parse(String line) throws IOException {

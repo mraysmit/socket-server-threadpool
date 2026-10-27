@@ -151,7 +151,7 @@ class KvSyncOverSocketsTest {
 
     @Test void aPushAndAGraftNameTheSenderAndARealServerAcceptsBoth() throws Exception {
         var remote = server("Server-R", "alpha");
-        try (var connections = TcpPeerLink.newClient()) {
+        try (var connections = TcpPeerLink.newClient(null)) {
             var link = new TcpPeerLink(() -> "alpha", connections, "Local");
             link.graft(peer(remote));
             link.send(peer(remote), List.of(new KvRecord("a", "\"1\"", new Version(System.currentTimeMillis(), 0, "Local"), false)));
@@ -161,7 +161,7 @@ class KvSyncOverSocketsTest {
 
     @Test void aRealServerAsksOnlyForTheAnnouncedRecordsItLacks() throws Exception {
         var remote = server("Server-R", "alpha");
-        try (var connections = TcpPeerLink.newClient()) {
+        try (var connections = TcpPeerLink.newClient(null)) {
             var link = new TcpPeerLink(() -> "alpha", connections, "Local");
             var held = new KvRecord("held", "\"1\"", new Version(System.currentTimeMillis(), 0, "Local"), false);
             link.send(peer(remote), List.of(held));

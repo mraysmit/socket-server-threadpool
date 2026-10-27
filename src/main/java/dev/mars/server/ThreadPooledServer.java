@@ -48,6 +48,8 @@ public class ThreadPooledServer implements Runnable{
     private final java.util.Set<WorkerRunnable> workers = java.util.concurrent.ConcurrentHashMap.newKeySet();
     // Virtual threads are cheap; sockets and memory are not. Excess clients wait in the kernel backlog.
     private volatile Semaphore connectionPermits = new Semaphore(DEFAULT_MAX_CONNECTIONS);
+    /** While frozen the listener accepts nothing; connections wait in the kernel's backlog, as for a paused process. */
+    private volatile dev.mars.plugin.RunGate gate = new dev.mars.plugin.RunGate();
     final protected String SERVER_NAME = "ThreadPooledServer";
 
     public ThreadPooledServer(int port) {
@@ -67,6 +69,8 @@ public class ThreadPooledServer implements Runnable{
         requestExecutor = Executors.newVirtualThreadPerTaskExecutor();
     }
 
+    void gate(dev.mars.plugin.RunGate gate) { this.gate = java.util.Objects.requireNonNull(gate); }
+
     public void run(){
         try {
             synchronized(this){
@@ -78,6 +82,7 @@ public class ThreadPooledServer implements Runnable{
             }
             System.out.println(SERVER_NAME + " started on port: " + getPort() + " | serverId=" + serverId);
             while(! isStopped()){
+                gate.awaitRunning();
                 Semaphore permits = connectionPermits;
                 if (!acquireConnectionPermit(permits)) {
                     break;

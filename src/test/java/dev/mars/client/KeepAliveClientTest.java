@@ -264,6 +264,32 @@ class KeepAliveClientTest {
         }
     }
 
+    @Test void aRequestTheNetworkLosesTimesOutAndOneItDelaysArrivesLate() throws Exception {
+        var quick = KeepAliveClient.Settings.of("Test", 65_536, Duration.ofMillis(300), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        try (var running = new Running();
+             var faulty = new KeepAliveClient(quick, KeepAliveClient.Listener.NONE, Socket::new, "Server-A");
+             var plain = new KeepAliveClient(quick)) {
+            NetworkFaults.install((source, destination) -> new NetworkFaults.Fault(0, true));
+            long start = System.nanoTime();
+            var lost = assertThrows(java.net.SocketTimeoutException.class, () -> echo(faulty, running.address(), "x"));
+            assertTrue(lost.getMessage().contains("injected network fault"), lost.getMessage());
+            assertTrue(System.nanoTime() - start >= Duration.ofMillis(250).toNanos(), "Waited as an unanswered connect would");
+            assertEquals("y", echo(plain, running.address(), "y"), "A client that sends for no server is never faulted");
+
+            var seen = new CopyOnWriteArrayList<String>();
+            NetworkFaults.install((source, destination) -> {
+                seen.add(source + "->" + destination.getPort());
+                return new NetworkFaults.Fault(200, false);
+            });
+            start = System.nanoTime();
+            assertEquals("z", echo(faulty, running.address(), "z"));
+            assertTrue(System.nanoTime() - start >= Duration.ofMillis(190).toNanos(), "Delayed");
+            assertEquals(List.of("Server-A->" + running.server.getPort()), seen);
+        } finally {
+            NetworkFaults.clear();
+        }
+    }
+
     @Test void settingsRefuseLimitsThatCannotWork() {
         assertThrows(IllegalArgumentException.class, () -> KeepAliveClient.Settings.of(" ", 1, Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1)));
         assertThrows(IllegalArgumentException.class, () -> KeepAliveClient.Settings.of("T", 0, Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1)));

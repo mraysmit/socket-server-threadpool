@@ -22,6 +22,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import dev.mars.plugin.PluginRegistry;
 import dev.mars.plugin.PluginContext;
+import dev.mars.plugin.RunGate;
 import java.io.UncheckedIOException;
 
 /** Owns both listeners and starts them only after both ports have been bound. */
@@ -36,11 +37,14 @@ public final class ServerInstance implements AutoCloseable {
     private boolean stopRequested;
     private boolean closed;
     private RuntimeException stopFailure;
+    private final RunGate gate = new RunGate();
 
     private ServerInstance(ServerOptions options, PluginRegistry plugins) {
         this.plugins = plugins;
         server = new ThreadPooledServer(options.port(), options.serverId(), plugins);
         monitor = new ShutdownMonitor(options.adminPort(), server, this::requestStop);
+        server.gate(gate);
+        monitor.gate(gate);
         listeners = Executors.newThreadPerTaskExecutor(
                 Thread.ofVirtual().name("listener-" + options.serverId() + "-", 0).factory());
     }
@@ -67,7 +71,7 @@ public final class ServerInstance implements AutoCloseable {
                 instance.bindMain(options.port());
                 instance.bindAdmin(options.adminPort());
             }
-            plugins.start(new PluginContext(instance.getServerId(), instance.getPort(), instance.getAdminPort()));
+            plugins.start(new PluginContext(instance.getServerId(), instance.getPort(), instance.getAdminPort(), instance.gate));
             instance.serverTask = instance.listeners.submit(instance.server);
             instance.monitorTask = instance.listeners.submit(instance.monitor);
             System.out.println("Server ready | serverId=" + instance.getServerId()
@@ -106,6 +110,17 @@ public final class ServerInstance implements AutoCloseable {
     Future<?> serverTask() { return serverTask; }
     Future<?> monitorTask() { return monitorTask; }
 
+    /**
+     * Freezes the server, as a debugger or a long pause would: it keeps its connections and state but accepts, answers
+     * and does nothing, and its plugins pause their own work. Its peers see it go silent, not go away.
+     */
+    public void freeze() { gate.freeze(); }
+
+    /** Lets a frozen server carry on where it stopped. */
+    public void thaw() { gate.thaw(); }
+
+    public boolean frozen() { return gate.frozen(); }
+
     /** Quiesce plugins and close listeners without joining the calling listener task. */
     public synchronized void requestStop() {
         if (stopRequested) {
@@ -113,6 +128,8 @@ public final class ServerInstance implements AutoCloseable {
             return;
         }
         stopRequested = true;
+        // A stopping server is not frozen: everything waiting on the gate must be free to finish.
+        gate.thaw();
         RuntimeException failure = null;
         // Close the main listener first so no new request reaches a quiescing plugin; accepted ones still drain.
         try { failure = attempt(failure, server::stop); }

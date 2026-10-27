@@ -33,6 +33,10 @@ public class ShutdownMonitor implements Runnable {
     protected volatile Thread runningThread;
     protected final AtomicBoolean running = new AtomicBoolean(true);
     private Socket activeClient;
+    /** A frozen server's admin port is silent too. */
+    private volatile dev.mars.plugin.RunGate gate = new dev.mars.plugin.RunGate();
+
+    void gate(dev.mars.plugin.RunGate gate) { this.gate = java.util.Objects.requireNonNull(gate); }
     private final Runnable stopRequest;
 
     public ShutdownMonitor(int port, ThreadPooledServer server) {
@@ -70,6 +74,7 @@ public class ShutdownMonitor implements Runnable {
             System.out.println("Shutdown monitor listening on port " + getPort() + " | serverId=" + server.getServerId());
             while (running.get()) {
                 try {
+                    gate.awaitRunning();
                     Socket client = serverSocket.accept();
                     synchronized (this) {
                         if (!running.get()) {
@@ -108,6 +113,8 @@ public class ShutdownMonitor implements Runnable {
                     }
                 }
             }
+        } catch (InterruptedException stopping) {
+            Thread.currentThread().interrupt();
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot start shutdown monitor", e);
         } finally {

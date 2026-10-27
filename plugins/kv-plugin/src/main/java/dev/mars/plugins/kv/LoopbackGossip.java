@@ -29,7 +29,7 @@ final class LoopbackGossip implements Gossip {
     private final InetSocketAddress address;
     private final KeepAliveClient connections;
 
-    LoopbackGossip(int port) { this(port, TcpPeerLink.newClient()); }
+    LoopbackGossip(int port) { this(port, TcpPeerLink.newClient(null)); }
 
     LoopbackGossip(int port, KeepAliveClient connections) {
         address = new InetSocketAddress("localhost", port);

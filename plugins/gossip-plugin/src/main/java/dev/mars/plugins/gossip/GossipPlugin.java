@@ -64,6 +64,7 @@ public final class GossipPlugin implements CommandPlugin {
         GossipRuntime runtime = null;
         try {
             runtime = new GossipRuntime(config, table, transport, metrics);
+            runtime.gate(context.gate());
             var commands = new GossipCommands(config, table, metrics, transport, runtime);
             if (schedule) { runtime.start(); }
             else { runtime.manual(); }
