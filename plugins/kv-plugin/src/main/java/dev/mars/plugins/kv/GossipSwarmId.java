@@ -18,17 +18,24 @@ package dev.mars.plugins.kv;
 import java.io.IOException;
 import java.util.Map;
 
-/** Reads this server's swarm ID from its own gossip plugin's status. */
+/**
+ * Reads this server's swarm ID from its own gossip plugin's status, once: gossip's swarm is set when it starts and does
+ * not change while it runs. Until a read succeeds, each call asks again.
+ */
 final class GossipSwarmId implements SwarmIdSource {
     private final Gossip gossip;
+    private volatile String known;
 
     GossipSwarmId(Gossip gossip) { this.gossip = gossip; }
 
     @Override public String swarmId() throws IOException {
+        var cached = known;
+        if (cached != null) { return cached; }
         var status = gossip.call(Map.of("operation", "status"));
         if (!(status.get("swarmId") instanceof String swarm) || swarm.isEmpty()) {
             throw new IOException("Gossip's status does not name a swarm");
         }
+        known = swarm;
         return swarm;
     }
 }

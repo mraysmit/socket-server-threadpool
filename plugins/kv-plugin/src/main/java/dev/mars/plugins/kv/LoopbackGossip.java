@@ -15,19 +15,29 @@
  */
 package dev.mars.plugins.kv;
 
-import dev.mars.client.TextMessageClient;
+import dev.mars.client.KeepAliveClient;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.util.Map;
 
-/** Calls the gossip instruction on this server's own main port, as any client could. */
+/**
+ * Calls the gossip instruction on this server's own main port, as any client could, over a connection kept open between
+ * calls. Every call only reads, so it is safe to send twice.
+ */
 final class LoopbackGossip implements Gossip {
-    private final int port;
+    private final InetSocketAddress address;
+    private final KeepAliveClient connections;
 
-    LoopbackGossip(int port) { this.port = port; }
+    LoopbackGossip(int port) { this(port, TcpPeerLink.newClient()); }
+
+    LoopbackGossip(int port, KeepAliveClient connections) {
+        address = new InetSocketAddress("localhost", port);
+        this.connections = java.util.Objects.requireNonNull(connections);
+    }
 
     @Override public Map<String, Object> call(Map<String, Object> parameters) throws IOException {
-        var reply = new TextMessageClient("localhost", port).execute("gossip", parameters);
+        var reply = connections.execute(address, "gossip", parameters);
         if (!(reply.result() instanceof Map<?, ?> result)) { throw new IOException("Gossip's reply is not an object"); }
         @SuppressWarnings("unchecked") var typed = (Map<String, Object>) result;
         return typed;

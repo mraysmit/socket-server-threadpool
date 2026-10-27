@@ -16,58 +16,28 @@
 package dev.mars.plugins.gossip;
 
 import dev.mars.client.CommandExecutionException;
-import dev.mars.protocol.CommandProtocol;
+import dev.mars.client.KeepAliveClient;
 import dev.mars.protocol.CommandReply;
 
 import java.io.IOException;
-import java.io.InterruptedIOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
-import java.net.SocketException;
-import java.net.SocketTimeoutException;
-import java.nio.ByteBuffer;
-import java.nio.charset.CodingErrorAction;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
  * Bounded UTF-8 JSON exchanges over connections to peers, kept open between exchanges so that gossip does not open and
- * close a TCP connection every round. Its only threads are watchdogs that each exchange joins.
+ * close a TCP connection every round. The connections, their reuse and each exchange's deadline belong to the host's
+ * {@link KeepAliveClient}; this transport chooses what to send, checks who answered, and merges the reply.
  */
 public final class GossipTransport implements GossipRuntime.ExchangeClient {
     static final class BusyException extends IOException {
         BusyException() { super("Gossip outbound capacity is full"); }
     }
-    /** A socket error while connecting: the only failure that moves on to the host's next address. */
-    private static final class ConnectFailure extends IOException {
-        ConnectFailure(SocketException cause) { super(cause); }
-        SocketException socketError() { return (SocketException) getCause(); }
-    }
-    /** How often the watchdog checks whether a caller on a platform thread has been interrupted. */
-    private static final long INTERRUPT_CHECK_MILLIS = 50;
     private static final String OUTBOUND = "outbound"; // The direction identity log lines name.
-    /** Kept-open connections held per peer; one is enough for gossip's one exchange at a time, two absorb overlap. */
-    private static final int MAX_IDLE_PER_PEER = 2;
-    /**
-     * Shorter than the host's 5 minute idle limit, so a pooled connection is normally still open when it is reused, and
-     * longer than the gap between two exchanges with the same peer: a server picks about two of its peers per round, so in
-     * a swarm of a hundred it meets a given peer only about once a minute.
-     */
-    private static final long IDLE_LIMIT_NANOS = TimeUnit.MINUTES.toNanos(4);
-    /** The host closes a kept-open connection after 1,000 requests; stop reusing one a little before that. */
-    private static final int MAX_USES = 900;
     private final GossipConfig config;
     private final MembershipTable table;
     private final GossipWire wire;
@@ -75,15 +45,8 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
     private final GossipLog log;
     private final GossipBatchSelector requests = new GossipBatchSelector();
     private final Semaphore permits;
-    private final Set<Socket> active = new HashSet<>();
-    /** Kept-open connections waiting for the next exchange with a peer; guarded by this transport. */
-    private final Map<InetSocketAddress, Deque<PeerConnection>> idle = new HashMap<>();
-    /** Peers whose host rejected the keep-alive field (an older build), so they get one exchange per connection. */
-    private final Set<InetSocketAddress> legacyPeers = new HashSet<>();
-    private final long connectNanos;
-    private final long idleNanos;
+    private final KeepAliveClient connections;
     private final long exchangeNanos;
-    private final Supplier<Socket> sockets;
     private boolean closed;
 
     /** For callers that own a standalone table, as the design document describes. */
@@ -110,14 +73,20 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                     Duration readIdleTimeout, Duration exchangeTimeout, Supplier<Socket> sockets) {
         this.config = java.util.Objects.requireNonNull(config);
         this.table = java.util.Objects.requireNonNull(table);
-        this.sockets = java.util.Objects.requireNonNull(sockets);
         this.metrics = metrics;
         log = metrics.log(config, table.self());
         wire = new GossipWire(config);
         permits = new Semaphore(config.maxInflight());
-        connectNanos = positiveNanos(connectTimeout);
-        idleNanos = positiveNanos(readIdleTimeout);
         exchangeNanos = positiveNanos(exchangeTimeout);
+        positiveNanos(connectTimeout);
+        positiveNanos(readIdleTimeout);
+        var settings = KeepAliveClient.Settings.of("Gossip", config.maxExchangeBytes(), connectTimeout, readIdleTimeout,
+                exchangeTimeout);
+        connections = new KeepAliveClient(settings, new KeepAliveClient.Listener() {
+            @Override public void opened() { metrics.connectionsOpened.incrementAndGet(); }
+            @Override public void reused() { metrics.connectionsReused.incrementAndGet(); }
+            @Override public void stale() { metrics.staleConnections.incrementAndGet(); }
+        }, java.util.Objects.requireNonNull(sockets));
     }
 
     public GossipWire.ExchangeReply exchange(GossipConfig.Seed peer) throws IOException {
@@ -197,15 +166,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             if (payload.length > config.maxExchangeBytes()) {
                 throw new IOException("Outgoing exchange exceeds byte budget");
             }
-            var line = exchangeOverFirstReachable(candidates, payload, plain, deadline);
-            CommandReply reply = readReply(line.text());
-            if (rejectsKeepAlive(reply)) {
-                // An older host rejects the field. Remember that, and send this request again without it; from now on the
-                // peer is asked for one exchange per connection.
-                rememberLegacy(line.address());
-                line = new Reply(exchangeOver(line.address(), payload, plain, deadline), line.address());
-                reply = readReply(line.text());
-            }
+            CommandReply reply = exchangeOverFirstReachable(candidates, payload, plain, deadline);
             if (!messageId.equals(reply.messageId())) {
                 throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip message ID mismatch");
             }
@@ -213,13 +174,6 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
                 throw new GossipExchangeException(GossipFailure.IDENTITY, "Gossip server ID mismatch");
             }
             return reply;
-        }
-
-        private CommandReply readReply(String text) throws IOException {
-            try { return CommandProtocol.parseReply(text); }
-            catch (IOException unreadable) {
-                throw new GossipExchangeException(GossipFailure.PROTOCOL, unreadable.getMessage(), unreadable);
-            }
         }
 
         /** The exchange a reply carries, once the reply is a success from the sender it names. */
@@ -245,269 +199,20 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         }
     }
 
-    private record Reply(String text, InetSocketAddress address) { }
-
-    /** Tries each address in order; if none connects, throws the first connection error with the rest suppressed. */
-    private Reply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload, byte[] plain,
+    /**
+     * Sends the request over a kept-open connection when there is one. A pooled connection the peer has closed is
+     * replaced and the request sent again, which is safe because merging an exchange is idempotent. Failures keep the
+     * kinds gossip counts them by.
+     */
+    private CommandReply exchangeOverFirstReachable(List<InetSocketAddress> candidates, byte[] payload, byte[] plain,
             long deadline) throws IOException {
-        SocketException unreachable = null;
-        for (var address : candidates) {
-            try { return new Reply(exchangeOver(address, payload, plain, deadline), address); }
-            catch (ConnectFailure failure) {
-                if (unreachable == null) { unreachable = failure.socketError(); }
-                else { unreachable.addSuppressed(failure.socketError()); }
-            }
+        try { return connections.exchange(candidates, payload, plain, deadline).reply(); }
+        catch (KeepAliveClient.ReplyTooLargeException tooLarge) {
+            throw new GossipExchangeException(GossipFailure.PROTOCOL,
+                    "Gossip reply exceeds max.exchange.bytes before parsing", tooLarge);
+        } catch (KeepAliveClient.MalformedReplyException unreadable) {
+            throw new GossipExchangeException(GossipFailure.PROTOCOL, unreadable.getMessage(), unreadable);
         }
-        throw unreachable;
-    }
-
-    /**
-     * One exchange over a connection to the peer: a kept-open one from the pool when there is one, otherwise a new one.
-     * A pooled connection may have been closed by the peer since it was last used (it idled out, or the peer
-     * restarted); that shows up as the connection failing before any reply byte, and the exchange is then sent again
-     * over a new connection. Sending again is safe because merging an exchange is idempotent.
-     */
-    private String exchangeOver(InetSocketAddress address, byte[] payload, byte[] plain, long deadline) throws IOException {
-        checkDeadline(deadline);
-        if (isLegacy(address)) {
-            // This peer's host does not know the keep-alive field and closes after every reply.
-            return converse(new PeerConnection(sockets.get()), address, plain, deadline, false);
-        }
-        var pooled = takeIdle(address);
-        if (pooled != null) {
-            try { return converse(pooled, address, payload, deadline, true); }
-            catch (StaleConnection stale) { metrics.staleConnections.incrementAndGet(); }
-            checkDeadline(deadline);
-        }
-        return converse(new PeerConnection(sockets.get()), address, payload, deadline, true);
-    }
-
-    /** An older host answers the keep-alive field with INVALID_REQUEST, "Unknown field: connection". */
-    private static boolean rejectsKeepAlive(CommandReply reply) {
-        return reply.error() != null && reply.error().code() == dev.mars.protocol.CommandError.Code.INVALID_REQUEST
-                && reply.error().message().contains("Unknown field: " + CommandProtocol.CONNECTION_FIELD);
-    }
-
-    private synchronized boolean isLegacy(InetSocketAddress address) { return legacyPeers.contains(address); }
-
-    /** Records a peer whose host rejected the keep-alive field, and closes any connection kept for it. */
-    private synchronized void rememberLegacy(InetSocketAddress address) {
-        legacyPeers.add(address);
-        var kept = idle.remove(address);
-        if (kept != null) { kept.forEach(peer -> closeQuietly(peer.socket)); }
-    }
-
-    /**
-     * One blocking request and reply. Connects and reads have socket timeouts; a blocking write has none, so a
-     * watchdog closes the socket once the overall deadline passes. An interrupt also ends the exchange: on a virtual
-     * thread it closes the socket itself, and for a platform thread, which an interrupt does not wake from blocking
-     * socket I/O, the watchdog closes the socket within {@value #INTERRUPT_CHECK_MILLIS} ms. The exchange waits for its
-     * watchdog to end before returning, so no thread outlives it. A connection that carried a clean reply goes back to
-     * the pool; any other is closed, so a late or partial reply can never be read as the answer to a later request.
-     */
-    private String converse(PeerConnection peer, InetSocketAddress address, byte[] payload, long deadline,
-                            boolean keepAlive) throws IOException {
-        var socket = peer.socket;
-        boolean reused = socket.isConnected();
-        boolean clean = false;
-        try {
-            synchronized (this) {
-                if (closed) { throw new IOException("Gossip transport is closed"); }
-                active.add(socket);
-            }
-            var caller = Thread.currentThread();
-            long check = caller.isVirtual() ? Long.MAX_VALUE : TimeUnit.MILLISECONDS.toNanos(INTERRUPT_CHECK_MILLIS);
-            var watchdog = Thread.ofVirtual().start(() -> {
-                try {
-                    long left = deadline - System.nanoTime();
-                    while (left > 0 && !caller.isInterrupted()) {
-                        TimeUnit.NANOSECONDS.sleep(Math.min(left, check));
-                        left = deadline - System.nanoTime();
-                    }
-                    socket.close();
-                } catch (InterruptedException | IOException finished) { /* The exchange ended first. */ }
-            });
-            try {
-                if (reused) {
-                    // Nothing should be waiting on an idle connection. Data that is means the peer sent something we did
-                    // not ask for, and it would be read as the reply to this request.
-                    var idleInput = socket.getInputStream();
-                    if (peer.pendingLineFeed && idleInput.available() > 0) {
-                        // The line feed that completes the previous reply's carriage return has arrived: expected.
-                        if (idleInput.read() == '\n') { peer.pendingLineFeed = false; }
-                        else { throw new StaleConnection(new IOException("Unsolicited data on an idle connection")); }
-                    }
-                    if (idleInput.available() > 0) {
-                        throw new StaleConnection(new IOException("Unsolicited data on an idle connection"));
-                    }
-                    metrics.connectionsReused.incrementAndGet();
-                } else {
-                    try { socket.connect(address, millis(Math.min(connectNanos, deadline - System.nanoTime()))); }
-                    catch (SocketException refusedOrUnreachable) {
-                        checkDeadline(deadline);
-                        throw new ConnectFailure(refusedOrUnreachable);
-                    }
-                    metrics.connectionsOpened.incrementAndGet();
-                }
-                var output = socket.getOutputStream();
-                output.write(payload);
-                output.write('\n');
-                output.flush();
-                String line = readLine(peer, deadline);
-                peer.uses++;
-                clean = true;
-                return line;
-            } catch (SocketException closedUnderneath) {
-                // Closed by the watchdog, by an interrupt, or by close(): report which, rather than a bare socket
-                // error.
-                checkDeadline(deadline);
-                synchronized (this) {
-                    if (closed) { throw new IOException("Gossip transport is closed", closedUnderneath); }
-                }
-                // Otherwise the peer reset or closed the connection; on a reused one that only means it went stale.
-                if (reused) { throw new StaleConnection(closedUnderneath); }
-                throw closedUnderneath;
-            } catch (PeerClosedException closedBeforeReply) {
-                if (reused) { throw new StaleConnection(closedBeforeReply); }
-                throw closedBeforeReply;
-            } finally {
-                watchdog.interrupt();
-                joinUninterruptibly(watchdog);
-                synchronized (this) { active.remove(socket); }
-            }
-        } finally {
-            // A request that did not ask for keep-alive is closed by the host after its reply, so it is never pooled.
-            if (clean && keepAlive) { release(address, peer); } else { closeQuietly(socket); }
-        }
-    }
-
-    /** A connection to a peer, with what is needed to reuse it for another exchange. */
-    private static final class PeerConnection {
-        final Socket socket;
-        long idleSince;
-        int uses;
-        /** Set when the connection cannot safely carry another exchange, whatever its age or use count. */
-        boolean unusable;
-        /** The last reply ended with a carriage return whose line feed has not been read yet. */
-        boolean pendingLineFeed;
-
-        PeerConnection(Socket socket) { this.socket = socket; }
-    }
-
-    /** The peer closed a pooled connection before sending any reply, so the exchange never reached it. */
-    private static final class StaleConnection extends IOException {
-        StaleConnection(IOException cause) { super(cause); }
-    }
-
-    private static final class PeerClosedException extends IOException {
-        PeerClosedException() { super("Peer closed without a reply"); }
-    }
-
-    private synchronized PeerConnection takeIdle(InetSocketAddress address) {
-        pruneIdle();
-        var queue = idle.get(address);
-        if (queue == null) { return null; }
-        var peer = queue.pollLast();
-        if (queue.isEmpty()) { idle.remove(address); }
-        return peer;
-    }
-
-    /** Keeps a connection that carried a clean reply for the next exchange with the same peer. */
-    private synchronized void release(InetSocketAddress address, PeerConnection peer) {
-        if (closed || peer.unusable || peer.uses >= MAX_USES || peer.socket.isClosed()) { closeQuietly(peer.socket); return; }
-        peer.idleSince = System.nanoTime();
-        var queue = idle.computeIfAbsent(address, key -> new ArrayDeque<>());
-        queue.addLast(peer);
-        while (queue.size() > MAX_IDLE_PER_PEER) { closeQuietly(queue.pollFirst().socket); }
-        pruneIdle();
-    }
-
-    /** Closes pooled connections that have waited longer than the host keeps them; callers hold the lock. */
-    private void pruneIdle() {
-        long now = System.nanoTime();
-        for (var queues = idle.values().iterator(); queues.hasNext();) {
-            var queue = queues.next();
-            while (!queue.isEmpty() && now - queue.peekFirst().idleSince > IDLE_LIMIT_NANOS) {
-                closeQuietly(queue.pollFirst().socket);
-            }
-            if (queue.isEmpty()) { queues.remove(); }
-        }
-    }
-
-    private static void closeQuietly(Socket socket) {
-        try { socket.close(); } catch (IOException alreadyClosed) { /* Nothing more to release. */ }
-    }
-
-    /** Reads one reply line into a bounded buffer, scanning only newly read bytes for the terminator. */
-    private String readLine(PeerConnection peer, long deadline) throws IOException {
-        var socket = peer.socket;
-        // One spare byte tells a full-length line followed by its terminator apart from an oversized line.
-        byte[] bytes = new byte[config.maxExchangeBytes() + 1];
-        var input = socket.getInputStream();
-        int length = 0;
-        int scanned = 0;
-        while (true) {
-            checkDeadline(deadline);
-            // Each read waits at most the idle limit, and never past the overall deadline.
-            socket.setSoTimeout(millis(Math.min(idleNanos, deadline - System.nanoTime())));
-            int count = input.read(bytes, length, bytes.length - length);
-            if (count < 0) {
-                if (length == 0) { throw new PeerClosedException(); }
-                peer.unusable = true; // The peer closed after the reply, so the connection cannot be reused.
-                return decodeUtf8(bytes, length);
-            }
-            if (peer.pendingLineFeed && length == 0) {
-                // The previous reply ended with a carriage return; its line feed is not part of this reply.
-                peer.pendingLineFeed = false;
-                if (bytes[0] == '\n') {
-                    System.arraycopy(bytes, 1, bytes, 0, count - 1);
-                    if (--count == 0) { continue; }
-                }
-            }
-            length += count;
-            for (; scanned < length; scanned++) {
-                byte b = bytes[scanned];
-                if (b != '\n' && b != '\r') { continue; }
-                String line = decodeUtf8(bytes, scanned);
-                int end = scanned + 1;
-                if (b == '\r') {
-                    if (end < length && bytes[end] == '\n') { end++; }
-                    else if (end == length) { peer.pendingLineFeed = true; }
-                }
-                // Anything after the reply means the stream is not in step with the requests; do not reuse it.
-                if (end < length) { peer.unusable = true; }
-                return line;
-            }
-            if (length == bytes.length) {
-                throw new GossipExchangeException(GossipFailure.PROTOCOL,
-                        "Gossip reply exceeds max.exchange.bytes before parsing");
-            }
-        }
-    }
-
-    /** Socket timeouts are whole milliseconds, and zero would mean no timeout at all. */
-    private static int millis(long nanos) {
-        return (int) Math.max(1, Math.min(Integer.MAX_VALUE, TimeUnit.NANOSECONDS.toMillis(nanos)));
-    }
-
-    private static String decodeUtf8(byte[] bytes, int length) throws IOException {
-        return StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-                .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes, 0, length)).toString();
-    }
-
-    /** Waits for a thread to end even if the caller is interrupted, keeping the caller's interrupt status. */
-    private static void joinUninterruptibly(Thread thread) {
-        boolean interrupted = Thread.interrupted();
-        while (thread.isAlive()) {
-            try { thread.join(); }
-            catch (InterruptedException e) { interrupted = true; }
-        }
-        if (interrupted) { Thread.currentThread().interrupt(); }
-    }
-
-    private static void checkDeadline(long deadline) throws IOException {
-        if (Thread.currentThread().isInterrupted()) { throw new InterruptedIOException("Gossip exchange interrupted"); }
-        if (deadline - System.nanoTime() <= 0) { throw new SocketTimeoutException("Gossip I/O deadline exceeded"); }
     }
 
     private static long positiveNanos(Duration timeout) {
@@ -520,28 +225,10 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     /** Close owned I/O resources synchronously; callers own their threads, and DNS may still be running. */
     @Override public void close() throws IOException {
-        List<Socket> sockets;
-        List<Socket> idleSockets = new ArrayList<>();
         synchronized (this) {
             if (closed) { return; }
             closed = true;
-            var all = new ArrayList<>(active);
-            idle.values().forEach(queue -> queue.forEach(peer -> idleSockets.add(peer.socket)));
-            all.addAll(idleSockets);
-            idle.clear();
-            sockets = List.copyOf(all);
         }
-        // An idle connection has nothing in flight, so it is closed with a reset: a closing handshake would leave the port
-        // in TIME_WAIT for two minutes, and a server with a hundred peers would then leave a hundred of them every time
-        // it stops. The host treats a reset between requests as a normal end.
-        for (Socket socket : idleSockets) {
-            try { socket.setSoLinger(true, 0); } catch (IOException cannotReset) { /* an ordinary close then */ }
-        }
-        IOException failure = null;
-        for (Socket socket : sockets) {
-            try { socket.close(); }
-            catch (IOException e) { if (failure == null) { failure = e; } else { failure.addSuppressed(e); } }
-        }
-        if (failure != null) { throw failure; }
+        connections.close();
     }
 }

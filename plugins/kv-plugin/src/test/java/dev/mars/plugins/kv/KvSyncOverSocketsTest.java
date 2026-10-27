@@ -128,6 +128,37 @@ class KvSyncOverSocketsTest {
                 "A comparison has to name the swarm, so it cannot go ahead");
     }
 
+    @Test void pushesAndComparisonsWithOnePeerShareOneConnection() throws Exception {
+        var remote = server("Server-R", "alpha");
+        var opened = new java.util.concurrent.atomic.AtomicInteger();
+        var reused = new java.util.concurrent.atomic.AtomicInteger();
+        var settings = dev.mars.client.KeepAliveClient.Settings.of("Key-value", 1 << 20, java.time.Duration.ofSeconds(5),
+                java.time.Duration.ofSeconds(10), java.time.Duration.ofSeconds(15));
+        try (var connections = new dev.mars.client.KeepAliveClient(settings, new dev.mars.client.KeepAliveClient.Listener() {
+            @Override public void opened() { opened.incrementAndGet(); }
+            @Override public void reused() { reused.incrementAndGet(); }
+        })) {
+            var link = new TcpPeerLink(() -> "alpha", connections);
+            for (int i = 0; i < 50; i++) {
+                link.send(peer(remote), List.of(new KvRecord("k" + i, "\"" + i + "\"", new Version(System.currentTimeMillis() + i, 0, "Local"), false)));
+            }
+            link.syncRoot(peer(remote), "0000000000000000");
+            assertEquals(1, opened.get(), "Fifty pushes and a comparison over one connection");
+            assertEquals(50, reused.get());
+            assertEquals("49", run(remote, Map.of("operation", "get", "key", "k49")).get("value"));
+        }
+    }
+
+    @Test void aPushAndAGraftNameTheSenderAndARealServerAcceptsBoth() throws Exception {
+        var remote = server("Server-R", "alpha");
+        try (var connections = TcpPeerLink.newClient()) {
+            var link = new TcpPeerLink(() -> "alpha", connections, "Local");
+            link.graft(peer(remote));
+            link.send(peer(remote), List.of(new KvRecord("a", "\"1\"", new Version(System.currentTimeMillis(), 0, "Local"), false)));
+            assertEquals("1", run(remote, Map.of("operation", "get", "key", "a")).get("value"));
+        }
+    }
+
     @Test void pushesNameTheSwarmSoAServerInAnotherSwarmRefusesThem() throws Exception {
         var sameSwarm = server("Server-R", "alpha");
         var otherSwarm = server("Server-O", "beta");

@@ -15,10 +15,12 @@
  */
 package dev.mars.plugins.kv;
 
-import dev.mars.client.TextMessageClient;
+import dev.mars.client.KeepAliveClient;
 import dev.mars.plugin.InvalidParametersException;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,25 +28,54 @@ import java.util.Map;
 
 /**
  * Talks to a peer over the socket protocol: hands it records, and takes part in comparing stores. Each call is one command
- * on a connection of its own, which is opened and closed for it. That is fine for the few writes and the occasional
- * comparison of a small swarm and is replaced by a shared, reused connection before the swarm is large (see
- * docs/REPLICATION_PLAN.md). Given a swarm source, every message names this server's swarm, and a peer in another swarm
- * refuses it. Without one, only plain pushes can be sent, and they name no swarm.
+ * over a connection kept open to that peer and reused by the next call, so steady writes do not open a connection each.
+ * Every call is safe to send twice, as a pooled connection the peer closed makes the client do: applying a record again
+ * changes nothing, and comparing is read-only. Given a swarm source, every message names this server's swarm, and a peer
+ * in another swarm refuses it. Without one, only plain pushes can be sent, and they name no swarm.
  */
 final class TcpPeerLink implements PeerLink, SyncLink {
+    /** Far above any reply a peer sends: a sync page is bounded by sync.max.bytes, plus at most one oversized record. */
+    private static final int MAX_REPLY_BYTES = 1 << 20;
     private final SwarmIdSource swarmIds;
+    private final KeepAliveClient connections;
+    /** This server's ID, which pushes name so the receiver passes them on to others and takes this server into its mesh. */
+    private final String serverId;
 
     TcpPeerLink() { this(null); }
 
-    TcpPeerLink(SwarmIdSource swarmIds) { this.swarmIds = swarmIds; }
+    TcpPeerLink(SwarmIdSource swarmIds) { this(swarmIds, newClient()); }
 
-    @Override public void send(Peer peer, List<KvRecord> records) throws IOException { apply(peer, records); }
+    TcpPeerLink(SwarmIdSource swarmIds, KeepAliveClient connections) { this(swarmIds, connections, null); }
 
-    @Override public void apply(Peer peer, List<KvRecord> records) throws IOException {
+    TcpPeerLink(SwarmIdSource swarmIds, KeepAliveClient connections, String serverId) {
+        this.swarmIds = swarmIds;
+        this.connections = java.util.Objects.requireNonNull(connections);
+        this.serverId = serverId;
+    }
+
+    /** The client the plugin shares between its peer link and its calls to its own gossip, and closes when it stops. */
+    static KeepAliveClient newClient() {
+        return new KeepAliveClient(KeepAliveClient.Settings.of("Key-value", MAX_REPLY_BYTES, Duration.ofSeconds(5),
+                Duration.ofSeconds(10), Duration.ofSeconds(15)));
+    }
+
+    /** A push names this server, so the receiver leaves it out when passing the records on. */
+    @Override public void send(Peer peer, List<KvRecord> records) throws IOException { apply(peer, records, serverId); }
+
+    /** An apply with no records, naming this server: the peer takes it into its push mesh. */
+    @Override public void graft(Peer peer) throws IOException {
+        if (serverId != null) { apply(peer, List.of(), serverId); }
+    }
+
+    /** The records a comparison found the peer wants. It names no sender, as before pushes did. */
+    @Override public void apply(Peer peer, List<KvRecord> records) throws IOException { apply(peer, records, null); }
+
+    private void apply(Peer peer, List<KvRecord> records, String from) throws IOException {
         var parameters = new LinkedHashMap<String, Object>();
         parameters.put("operation", "apply");
         var swarm = swarmIfKnown();
         if (swarm != null) { parameters.put("swarmId", swarm); }
+        if (from != null) { parameters.put("from", from); }
         var wire = new ArrayList<Map<String, Object>>();
         for (var record : records) { wire.add(KvWire.toWire(record)); }
         parameters.put("records", wire);
@@ -107,8 +138,8 @@ final class TcpPeerLink implements PeerLink, SyncLink {
 
     /** One kv command to one peer. An error reply, such as a refusal from another swarm, is thrown as an IOException. */
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> call(Peer peer, Map<String, Object> parameters) throws IOException {
-        var reply = new TextMessageClient(peer.host(), peer.port()).execute("kv", parameters);
+    private Map<String, Object> call(Peer peer, Map<String, Object> parameters) throws IOException {
+        var reply = connections.execute(new InetSocketAddress(peer.host(), peer.port()), "kv", parameters);
         if (!(reply.result() instanceof Map<?, ?> result)) { throw new IOException("The peer's reply is not an object"); }
         return (Map<String, Object>) result;
     }

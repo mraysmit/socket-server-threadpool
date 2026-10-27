@@ -28,11 +28,18 @@ import java.util.Set;
  * in turn be overridden for one server with {@code server.<serverId>.} entries.
  */
 record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate,
-                long syncRoundMillis, int syncFanout, int syncMaxBytes, long tombstoneRetentionMillis) {
+                long syncRoundMillis, int syncFanout, int syncMaxBytes, long tombstoneRetentionMillis, int pushFanout) {
     /** The limits and replication switch given, with the shipped defaults for the sync settings. */
     KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate) {
         this(maxKeyLength, maxValueBytes, maxRecords, replicate, defaults().syncRoundMillis(), defaults().syncFanout(),
-                defaults().syncMaxBytes(), defaults().tombstoneRetentionMillis());
+                defaults().syncMaxBytes(), defaults().tombstoneRetentionMillis(), defaults().pushFanout());
+    }
+
+    /** Everything but the push fanout given, with the shipped push fanout. */
+    KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean replicate, long syncRoundMillis, int syncFanout,
+             int syncMaxBytes, long tombstoneRetentionMillis) {
+        this(maxKeyLength, maxValueBytes, maxRecords, replicate, syncRoundMillis, syncFanout, syncMaxBytes,
+                tombstoneRetentionMillis, defaults().pushFanout());
     }
 
     private static final String DEFAULTS = "/kv-defaults.properties";
@@ -44,8 +51,9 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
     private static final String SYNC_ROUND = "sync.round.millis";
     private static final String SYNC_FANOUT = "sync.fanout";
     private static final String SYNC_MAX_BYTES = "sync.max.bytes";
+    private static final String PUSH_FANOUT = "push.fanout";
     private static final Set<String> KNOWN = Set.of(REPLICATION, MAX_KEY_LENGTH, MAX_VALUE_BYTES, MAX_RECORDS,
-            TOMBSTONE_RETENTION, SYNC_ROUND, SYNC_FANOUT, SYNC_MAX_BYTES);
+            TOMBSTONE_RETENTION, SYNC_ROUND, SYNC_FANOUT, SYNC_MAX_BYTES, PUSH_FANOUT);
 
     static KvConfig defaults() {
         try { return load(null, ""); }
@@ -70,7 +78,8 @@ record KvConfig(int maxKeyLength, int maxValueBytes, int maxRecords, boolean rep
         }
         return new KvConfig(positive(settings, MAX_KEY_LENGTH), positive(settings, MAX_VALUE_BYTES),
                 positive(settings, MAX_RECORDS), onOff(settings, REPLICATION), positiveLong(settings, SYNC_ROUND),
-                positive(settings, SYNC_FANOUT), positive(settings, SYNC_MAX_BYTES), positiveLong(settings, TOMBSTONE_RETENTION));
+                positive(settings, SYNC_FANOUT), positive(settings, SYNC_MAX_BYTES), positiveLong(settings, TOMBSTONE_RETENTION),
+                positive(settings, PUSH_FANOUT));
     }
 
     /** A setting must be a known one, or a known one for a particular server, so a misspelling is caught and not ignored. */

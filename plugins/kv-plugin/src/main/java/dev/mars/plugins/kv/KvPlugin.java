@@ -54,6 +54,7 @@ public final class KvPlugin implements CommandPlugin {
     private static final String KEY = "key";
     private static final String VALUE = "value";
     private static final String SWARM_ID = "swarmId";
+    private static final String FROM = "from";
 
     private enum State { NEW, RUNNING, STOPPED }
 
@@ -71,10 +72,12 @@ public final class KvPlugin implements CommandPlugin {
     private final PeerLink link;
     private final Executor executor;
     private volatile ExecutorService ownExecutor;
+    private volatile dev.mars.client.KeepAliveClient ownConnections;
     private volatile Replicator replicator;
     private final KvCounters counters = new KvCounters();
     private final SyncStats syncStats = new SyncStats(System::currentTimeMillis);
     private volatile State state = State.NEW;
+    private volatile String serverId;
 
     private final Path configFile;
     private volatile KvConfig config = KvConfig.defaults();
@@ -106,10 +109,16 @@ public final class KvPlugin implements CommandPlugin {
     @Override public String instruction() { return "kv"; }
 
     @Override public void start(PluginContext context) throws IOException {
+        serverId = context.serverId();
         config = KvConfig.load(configFile != null ? configFile : fileFromProperty(), context.serverId());
         store = new VersionedStore(context.serverId(), System::currentTimeMillis, config);
         responder = new SyncResponder(store, config.syncMaxBytes());
-        if (swarmIds == null) { swarmIds = new GossipSwarmId(new LoopbackGossip(context.port())); }
+        // One set of kept-open connections, to the peers and to this server's own gossip, closed when the plugin stops.
+        var connections = TcpPeerLink.newClient();
+        ownConnections = connections;
+        if (swarmIds == null) { swarmIds = new GossipSwarmId(new LoopbackGossip(context.port(), connections)); }
+        // Running before the sync thread starts, which runs only while the plugin is.
+        state = State.RUNNING;
         if (config.replicate()) {
             // Anything not given (tests give fakes) is the real thing: peers from this server's own gossip, over sockets.
             var pushes = executor;
@@ -117,13 +126,13 @@ public final class KvPlugin implements CommandPlugin {
                 ownExecutor = Executors.newVirtualThreadPerTaskExecutor();
                 pushes = ownExecutor;
             }
-            var found = peers != null ? peers : new GossipPeers(new LoopbackGossip(context.port()), context.serverId());
-            replicator = new Replicator(found, link != null ? link : new TcpPeerLink(swarmIds), pushes, counters);
-            SyncLink compare = syncLink != null ? syncLink : link instanceof SyncLink capable ? capable : new TcpPeerLink(swarmIds);
+            var found = peers != null ? peers : new GossipPeers(new LoopbackGossip(context.port(), connections), context.serverId());
+            var tcp = new TcpPeerLink(swarmIds, connections, context.serverId());
+            replicator = new Replicator(found, link != null ? link : tcp, pushes, counters, config.pushFanout(), new Random());
+            SyncLink compare = syncLink != null ? syncLink : link instanceof SyncLink capable ? capable : tcp;
             var rounds = new SyncRounds(found, new Syncer(store, compare, config.syncMaxBytes()), store, syncStats, config.syncFanout(), new Random());
             syncThread = Thread.ofVirtual().name("kv-sync-" + context.serverId()).start(() -> syncLoop(rounds, config.syncRoundMillis()));
         }
-        state = State.RUNNING;
     }
 
     /** Pulls from a peer as soon as one can be found, then compares with a few random peers every round, until the plugin stops. */
@@ -131,6 +140,9 @@ public final class KvPlugin implements CommandPlugin {
         boolean pulled = false;
         while (state == State.RUNNING) {
             try {
+                // Each round also keeps the push mesh in step with the peers alive, as gossipsub's heartbeat does.
+                var current = replicator;
+                if (current != null) { current.maintain(); }
                 if (!pulled) { pulled = rounds.bootstrap() > 0; } else { rounds.round(); }
             } catch (RuntimeException e) {
                 // A comparison that goes wrong is counted where it can be, and the next round tries again.
@@ -152,6 +164,11 @@ public final class KvPlugin implements CommandPlugin {
         if (loop != null) { loop.interrupt(); }
         var own = ownExecutor;
         if (own != null) { own.shutdown(); }
+        var connections = ownConnections;
+        if (connections != null) {
+            try { connections.close(); }
+            catch (IOException e) { System.err.println("Key-value connections did not all close: " + e.getMessage()); }
+        }
     }
 
     @Override public Map<String, Object> execute(Map<String, Object> parameters) throws InvalidParametersException {
@@ -178,9 +195,12 @@ public final class KvPlugin implements CommandPlugin {
                 yield list();
             }
             case "apply" -> {
-                if (parameters.containsKey(SWARM_ID)) { PluginParameters.requireKeys(parameters, OPERATION, "records", SWARM_ID); }
-                else { PluginParameters.requireKeys(parameters, OPERATION, "records"); }
-                yield apply(parameters.get(SWARM_ID), parameters.get("records"));
+                // The swarm and the sending server are optional: a server from before either was named sends neither.
+                var expected = new ArrayList<>(List.of(OPERATION, "records"));
+                if (parameters.containsKey(SWARM_ID)) { expected.add(SWARM_ID); }
+                if (parameters.containsKey(FROM)) { expected.add(FROM); }
+                PluginParameters.requireKeys(parameters, expected.toArray(String[]::new));
+                yield apply(parameters.get(SWARM_ID), parameters.get(FROM), parameters.get("records"));
             }
             case "sync-root" -> {
                 PluginParameters.requireKeys(parameters, OPERATION, SWARM_ID, "root");
@@ -233,11 +253,26 @@ public final class KvPlugin implements CommandPlugin {
         return reply("keys", keys, "count", keys.size());
     }
 
-    /** Merges records another server sends. The whole batch is checked first, so a bad record stores nothing. */
-    private Map<String, Object> apply(Object swarm, Object records) throws InvalidParametersException {
+    /**
+     * Merges records another server sends. The whole batch is checked first, so a bad record stores nothing. Records that
+     * were new here are passed on to this server's push mesh; one already held stops, so a write stops spreading once all
+     * have it. A sender that names itself is left out of that, and taken into the mesh, so pushes flow both ways.
+     */
+    private Map<String, Object> apply(Object swarm, Object from, Object records) throws InvalidParametersException {
         requireReplication();
         if (swarm != null) { requireSameSwarm(swarm); }
-        var result = store.apply(KvWire.parseRecords(records));
+        if (from != null && (!(from instanceof String sender) || sender.isBlank())) {
+            throw new InvalidParametersException("Parameter 'from' must be the sending server's ID");
+        }
+        var parsed = KvWire.parseRecords(records);
+        var taken = new ArrayList<KvRecord>();
+        var result = store.apply(parsed, taken);
+        var current = replicator;
+        if (current != null) {
+            String sender = (String) from;
+            if (sender != null && !sender.equals(serverId)) { current.grafted(sender); }
+            current.forward(taken, sender);
+        }
         counters.applied.addAndGet(result.applied());
         counters.ignored.addAndGet(result.ignored());
         counters.rejected.addAndGet(result.rejected());

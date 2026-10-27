@@ -90,6 +90,79 @@ class ReplicatorTest {
         assertEquals(1L, counters.pushFailures.get());
     }
 
+    private static List<Peer> peers(int count) {
+        var many = new ArrayList<Peer>();
+        for (int i = 2; i < 2 + count; i++) { many.add(new Peer("Server-" + i, "127.0.0.1", 9000 + i)); }
+        return many;
+    }
+
+    private java.util.Set<Peer> targets() {
+        return sent.stream().map(Map.Entry::getKey).collect(java.util.stream.Collectors.toSet());
+    }
+
+    @Test void writesGoToTheSameFewPeersEveryTime() {
+        alive.clear();
+        alive.addAll(peers(19));
+        var mesh = new Replicator(peers, link, Runnable::run, counters, 3, new java.util.Random(1));
+        for (int i = 0; i < 10; i++) { mesh.push(WRITE); }
+        assertEquals(30, sent.size());
+        assertEquals(3, targets().size(), "Ten writes, one mesh of three");
+    }
+
+    @Test void aMeshPeerThatIsNoLongerAliveIsReplaced() {
+        alive.clear();
+        alive.addAll(peers(5));
+        var mesh = new Replicator(peers, link, Runnable::run, counters, 2, new java.util.Random(1));
+        mesh.push(WRITE);
+        var first = targets();
+        var gone = first.iterator().next();
+        alive.remove(gone);
+        sent.clear();
+        mesh.push(WRITE);
+        assertEquals(2, targets().size());
+        assertFalse(targets().contains(gone));
+        assertEquals(1, targets().stream().filter(first::contains).count(), "The peer still alive stays in the mesh");
+    }
+
+    @Test void aForwardedRecordGoesNeitherToItsSenderNorToItsWriter() {
+        var four = new Peer("Server-004", "127.0.0.1", 9300);
+        var writer = new Peer("Server-001", "127.0.0.1", 9000);
+        alive.addAll(List.of(four, writer));
+        inline.forward(List.of(WRITE), TWO.serverId());
+        assertEquals(java.util.Set.of(THREE, four), targets());
+    }
+
+    @Test void aPeerThatPushesHereJoinsTheMeshUpToTwiceTheFanout() {
+        alive.clear();
+        alive.addAll(peers(6));
+        var mesh = new Replicator(peers, link, Runnable::run, counters, 1, new java.util.Random(1));
+        mesh.push(WRITE);
+        assertEquals(1, targets().size());
+        for (var peer : alive) { mesh.grafted(peer.serverId()); }
+        sent.clear();
+        mesh.push(WRITE);
+        assertEquals(2, targets().size(), "A fanout of one holds at most two");
+    }
+
+    @Test void maintainingTheMeshTellsOnlyThePeersNewlyChosen() throws Exception {
+        alive.clear();
+        alive.addAll(peers(5));
+        var grafts = Collections.synchronizedList(new ArrayList<Peer>());
+        PeerLink grafting = new PeerLink() {
+            @Override public void send(Peer peer, List<KvRecord> records) { sent.add(Map.entry(peer, records)); }
+            @Override public void graft(Peer peer) { grafts.add(peer); }
+        };
+        var mesh = new Replicator(peers, grafting, Runnable::run, counters, 2, new java.util.Random(1));
+        mesh.maintain();
+        assertEquals(2, grafts.size());
+        mesh.maintain();
+        assertEquals(2, grafts.size(), "An unchanged mesh tells nobody again");
+        alive.remove(grafts.getFirst());
+        mesh.maintain();
+        assertEquals(3, grafts.size(), "The replacement is told");
+        assertEquals(0, sent.size(), "Maintaining sends no records");
+    }
+
     @Test void aPushDoesNotMakeTheCallerWaitForSlowPeers() throws Exception {
         var release = new CountDownLatch(1);
         var started = new CountDownLatch(2);

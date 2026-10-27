@@ -86,10 +86,45 @@ class KvPluginReplicationTest {
         assertEquals(0, sent.size());
     }
 
-    @Test void aRecordReceivedFromAPeerIsNotPushedOnYet() throws Exception {
+    @Test void aRecordNewToThisServerIsPassedOnButNotBackToTheServerThatWroteIt() throws Exception {
         var kv = started("replication=on");
         kv.execute(apply(record("a", "1", 5_000, "Server-002")));
-        assertEquals(0, sent.size(), "Forwarding is a later phase");
+        assertEquals(List.of(THREE), sent.stream().map(Map.Entry::getKey).toList());
+        assertEquals(List.of(new KvRecord("a", "\"1\"", new Version(5_000, 0, "Server-002"), false)), sent.getFirst().getValue());
+    }
+
+    @Test void aSenderThatNamesItselfIsLeftOutWhenTheRecordIsPassedOn() throws Exception {
+        var kv = started("replication=on");
+        kv.execute(Map.of("operation", "apply", "from", "Server-002", "records", List.of(record("a", "1", 5_000, "Server-009"))));
+        assertEquals(List.of(THREE), sent.stream().map(Map.Entry::getKey).toList());
+    }
+
+    @Test void aSenderThatIsNotAServerIdIsRefused() throws Exception {
+        var kv = started("replication=on");
+        for (Object bad : List.of(5, "", " ")) {
+            assertThrows(InvalidParametersException.class,
+                    () -> kv.execute(Map.of("operation", "apply", "from", bad, "records", List.of())), String.valueOf(bad));
+        }
+    }
+
+    @Test void aRecordAlreadyHeldIsNotPassedOnSoSpreadingStops() throws Exception {
+        var kv = started("replication=on");
+        kv.execute(apply(record("a", "1", 5_000, "Server-002")));
+        sent.clear();
+        kv.execute(apply(record("a", "1", 5_000, "Server-002")));
+        kv.execute(apply(record("a", "0", 4_000, "Server-003")));
+        assertEquals(0, sent.size(), "Neither a repeat nor an older version goes any further");
+    }
+
+    @Test void aWriteGoesToNoMoreThanTheFanoutOfPeers() throws Exception {
+        var many = new ArrayList<Peer>();
+        for (int i = 2; i <= 20; i++) { many.add(new Peer("Server-" + i, "127.0.0.1", 9000 + i)); }
+        var file = Files.writeString(folder.resolve("fanout.properties"), "replication=on" + System.lineSeparator() + "push.fanout=3" + System.lineSeparator());
+        var kv = new KvPlugin(file, () -> many, link, Runnable::run);
+        kv.start(new PluginContext("Server-001", 9000, 9001));
+        kv.execute(put("a", "1"));
+        assertEquals(3, sent.size());
+        assertEquals(3, sent.stream().map(Map.Entry::getKey).distinct().count(), "Three different peers");
     }
 
     @Test void statusCountsThePushes() throws Exception {

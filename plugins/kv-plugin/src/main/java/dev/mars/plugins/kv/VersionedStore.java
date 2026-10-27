@@ -81,7 +81,10 @@ final class VersionedStore {
      * Merges records received from a peer: for each key the newer version wins, and an equal or older one is ignored. Every
      * record's time is also taken into account, so a later local write is newer than anything seen here.
      */
-    synchronized Applied apply(java.util.Collection<KvRecord> received) {
+    synchronized Applied apply(java.util.Collection<KvRecord> received) { return apply(received, new java.util.ArrayList<>()); }
+
+    /** As {@link #apply(java.util.Collection)}, also adding each record that was newer than what was held to {@code taken}. */
+    synchronized Applied apply(java.util.Collection<KvRecord> received, java.util.List<KvRecord> taken) {
         int applied = 0, ignored = 0, rejected = 0;
         for (var record : received) {
             if (!withinLimits(record)) {
@@ -92,6 +95,7 @@ final class VersionedStore {
             var current = records.get(record.key());
             if (current == null || record.version().compareTo(current.version()) > 0) {
                 records.put(record.key(), record);
+                taken.add(record);
                 applied++;
             } else {
                 ignored++;

@@ -21,4 +21,10 @@ import java.util.List;
 /** Hands records to one peer. */
 interface PeerLink {
     void send(Peer peer, List<KvRecord> records) throws IOException;
+
+    /**
+     * Tells a peer it is now in this server's push mesh, so that it takes this server into its own and pushes flow both
+     * ways. A link that cannot say which server is sending does nothing.
+     */
+    default void graft(Peer peer) throws IOException { }
 }
