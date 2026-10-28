@@ -341,7 +341,9 @@ class MembershipTableTest {
 
     @Test void restartsRemainDistinctAndReachableDuplicateLogicalIdsAreReportedWithoutAWinner() {
         var table = table();
-        var restart = member("Peer", 3, 0);
+        // A second process with the same ID, listening elsewhere: both are reachable, so neither may be preferred.
+        var restart = new MemberRecord(new MemberKey("Peer", new UUID(0, 3)), "localhost", 9001, 0,
+                MemberRecord.State.ALIVE, Map.of());
         table.mergeDirect(peer, List.of());
         table.mergeDirect(restart, List.of());
         assertEquals(java.util.Set.of("Peer"), table.snapshot().identityConflicts());
@@ -357,6 +359,44 @@ class MembershipTableTest {
         assertEquals(java.util.Set.of("Self"), table.snapshot().identityConflicts());
         assertEquals(java.util.Set.of("Self"), table.identityConflicts());
         assertEquals(self, table.snapshot().self());
+    }
+
+    @Test void aRestartAnsweringAtTheSameEndpointSupersedesTheOldBootWithoutAConflict() {
+        var table = table();
+        var restart = member("Peer", 3, 0);
+        table.mergeDirect(peer, List.of());
+        // Only a direct answer proves who listens at an endpoint; a forwarded copy of the new boot proves nothing.
+        table.merge(List.of(restart));
+        assertEquals(MembershipTable.Assessment.ALIVE, view(table, peer.key()).assessment());
+
+        table.mergeDirect(restart, List.of());
+        assertTrue(table.identityConflicts().isEmpty());
+        assertFalse(view(table, peer.key()).identityConflict());
+        assertEquals(MembershipTable.Assessment.DEAD, view(table, peer.key()).assessment());
+        assertFalse(view(table, peer.key()).endpointVerified());
+        assertEquals(MembershipTable.Assessment.ALIVE, view(table, restart.key()).assessment());
+
+        // The old boot's last heartbeats can still arrive from peers that had not passed them on yet.
+        table.merge(List.of(version(peer, 5)));
+        assertEquals(MembershipTable.Assessment.DEAD, view(table, peer.key()).assessment());
+        assertTrue(table.identityConflicts().isEmpty());
+
+        // Should the old boot answer there itself, the latest answer is the process at that endpoint.
+        table.mergeDirect(version(peer, 6), List.of());
+        assertEquals(MembershipTable.Assessment.ALIVE, view(table, peer.key()).assessment());
+        assertEquals(MembershipTable.Assessment.DEAD, view(table, restart.key()).assessment());
+        assertTrue(table.identityConflicts().isEmpty());
+    }
+
+    @Test void aSupersededBootThatMovesToANewEndpointIsNoLongerSupersededButMustBeVerifiedAgain() {
+        var table = table();
+        table.mergeDirect(peer, List.of());
+        table.mergeDirect(member("Peer", 3, 0), List.of());
+        var moved = new MemberRecord(peer.key(), "localhost", 9001, 7, MemberRecord.State.ALIVE, Map.of());
+        table.merge(List.of(moved));
+        assertEquals(MembershipTable.Assessment.CANDIDATE, view(table, peer.key()).assessment());
+        table.mergeDirect(version(moved, 8), List.of());
+        assertEquals(java.util.Set.of("Peer"), table.identityConflicts());
     }
 
     @Test void localPublicationIsImmutableAdvancesOnlyOnChangesAndCannotResumeAfterDeparture() {

@@ -173,6 +173,7 @@ public final class MembershipTable {
             }
         }
         entries.putAll(updates);
+        if (evidence instanceof FromResponder(var responder)) { supersede(responder); }
         var admitted = admit(admissions, evidence);
         admissionsSkipped += Math.min(admitted.skipped(), Long.MAX_VALUE - admissionsSkipped);
         var result = new MergeResult(admitted.count(), advanced, ignored + admitted.skipped());
@@ -215,8 +216,11 @@ public final class MembershipTable {
             return new Keep(known);
         }
         if (incoming.state() == LEFT || incoming.heartbeat() > previous.heartbeat()) {
-            boolean stillVerified = known.endpointVerified() && previous.sameEndpoint(incoming);
-            return new Advance(new Entry(incoming, now, known.lastDirectSuccess(), stillVerified, now));
+            boolean sameEndpoint = previous.sameEndpoint(incoming);
+            boolean stillVerified = known.endpointVerified() && sameEndpoint;
+            // A boot replaced at its endpoint stays replaced there, however late its last heartbeats arrive.
+            return new Advance(new Entry(incoming, now, known.lastDirectSuccess(), stillVerified, now,
+                    known.superseded() && sameEndpoint));
         }
         if (incoming.heartbeat() == previous.heartbeat() && !incoming.equals(previous)) {
             throw conflict(incoming.key());
@@ -255,6 +259,27 @@ public final class MembershipTable {
             return entry;
         }
         return new Entry(entry.record(), entry.lastAdvance(), OptionalLong.of(now), true, entry.stateSince());
+    }
+
+    /**
+     * Only one process can listen at an endpoint, so once a dialled endpoint answers as this boot, any other boot of the
+     * same server ID held at that endpoint is no longer reachable there: it is the process a restart replaced. Marking it
+     * superseded rates it DEAD at once, rather than leaving it ALIVE beside its replacement until it times out, which
+     * would report a routine restart as a duplicate server ID. Boots at other endpoints are untouched, so two live
+     * processes sharing an ID are still reported. The local record is never superseded.
+     */
+    private void supersede(MemberRecord responder) {
+        for (var item : entries.entrySet()) {
+            Entry entry = item.getValue();
+            MemberRecord record = entry.record();
+            if (item.getKey().equals(localKey) || item.getKey().equals(responder.key()) || entry.superseded()
+                    || record.state() != ALIVE || !record.key().serverId().equals(responder.key().serverId())
+                    || !record.sameEndpoint(responder)) {
+                continue;
+            }
+            item.setValue(new Entry(record, entry.lastAdvance(), entry.lastDirectSuccess(), false, entry.stateSince(),
+                    true));
+        }
     }
 
     /**
@@ -416,6 +441,7 @@ public final class MembershipTable {
     private Assessment assessment(Entry entry, long now) {
         if (entry.record().state() == LEFT) { return Assessment.LEFT; }
         if (entry.record().key().equals(localKey)) { return Assessment.ALIVE; }
+        if (entry.superseded()) { return Assessment.DEAD; }
         long elapsed = evidenceAge(entry, now);
         if (elapsed >= deadNanos) { return Assessment.DEAD; }
         if (elapsed >= suspectNanos) { return Assessment.SUSPECT; }
@@ -442,9 +468,17 @@ public final class MembershipTable {
         return new MembershipException(CONFLICT, "Conflicting owner record for " + key);
     }
 
-    /** {@code lastDirectSuccess} is empty until this process has exchanged with the member itself. */
+    /**
+     * {@code lastDirectSuccess} is empty until this process has exchanged with the member itself. {@code superseded}
+     * means another boot of the same server ID has since answered at this record's endpoint.
+     */
     private record Entry(MemberRecord record, long lastAdvance, OptionalLong lastDirectSuccess,
-                         boolean endpointVerified, long stateSince) { }
+                         boolean endpointVerified, long stateSince, boolean superseded) {
+        Entry(MemberRecord record, long lastAdvance, OptionalLong lastDirectSuccess, boolean endpointVerified,
+              long stateSince) {
+            this(record, lastAdvance, lastDirectSuccess, endpointVerified, stateSince, false);
+        }
+    }
     private record Suppression(MemberRecord.State state, long heartbeat, String fingerprint,
                                long lastAdvance, long retainedAt) { }
     private record Assessed(Entry entry, Assessment assessment) { }

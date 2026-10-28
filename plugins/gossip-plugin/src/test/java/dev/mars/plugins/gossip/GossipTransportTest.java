@@ -136,18 +136,59 @@ class GossipTransportTest {
         var table = table(config);
         var lines = new java.util.concurrent.CopyOnWriteArrayList<String>();
         var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, lines::add));
-        try (var transport = new GossipTransport(config, table, metrics)) {
-            for (int boot = 2; boot <= 3; boot++) {
-                int identity = boot;
-                try (var peer = new ProtocolPeer((socket, port, request) ->
-                        socket.getOutputStream().write(reply(config, request, responder(port, identity))))) {
-                    transport.exchange(peer.endpoint());
-                }
-            }
+        // Both open at once, so the two processes are certain to listen at different endpoints.
+        try (var transport = new GossipTransport(config, table, metrics);
+             var first = new ProtocolPeer((socket, port, request) ->
+                     socket.getOutputStream().write(reply(config, request, responder(port, 2))));
+             var second = new ProtocolPeer((socket, port, request) ->
+                     socket.getOutputStream().write(reply(config, request, responder(port, 3))))) {
+            transport.exchange(first.endpoint());
+            transport.exchange(second.endpoint());
             assertEquals(java.util.Set.of("Peer"), table.snapshot().identityConflicts());
             assertEquals(2, metrics.outbound.get());
             assertEquals(1, lines.size());
+            assertTrue(lines.getFirst().contains("] ERROR | plugin=gossip | event=IDENTITY_CONFLICT"), lines.getFirst());
             assertTrue(lines.getFirst().contains("Reachable duplicate server IDs: [Peer]"));
+        }
+    }
+
+    @Test void aRequestLostBehindAPartitionHoldsItsSlotOnlyForTheConfiguredConnectTimeout() throws Exception {
+        var properties = GossipConfigTest.minimal();
+        properties.setProperty("connect.timeout.millis", "300");
+        var config = GossipConfig.fromProperties(properties, "Self");
+        // Every request this process sends is lost, as behind a partition: the sender waits out its connect timeout.
+        dev.mars.client.NetworkFaults.install((source, destination) -> new dev.mars.client.NetworkFaults.Fault(0, true));
+        try (var transport = new GossipTransport(config, table(config))) {
+            long started = System.nanoTime();
+            assertThrows(SocketTimeoutException.class,
+                    () -> transport.exchange(new GossipConfig.Seed("Peer", "127.0.0.1", 9)));
+            long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            assertTrue(millis >= 250 && millis < 2_000, "lost after " + millis + " ms");
+            assertEquals(0, transport.inflight());
+        } finally {
+            dev.mars.client.NetworkFaults.clear();
+        }
+    }
+
+    @Test void aPeerRestartedAtTheSameEndpointIsNotLoggedAsADuplicate() throws Exception {
+        var config = GossipCommandsTest.config(32768, 4, 8);
+        var table = table(config);
+        var lines = new java.util.concurrent.CopyOnWriteArrayList<String>();
+        var metrics = new GossipMetrics(new GossipLog(config, table.snapshot().self(), System::nanoTime, lines::add));
+        var boot = new java.util.concurrent.atomic.AtomicLong(2);
+        try (var transport = new GossipTransport(config, table, metrics);
+             var peer = new ProtocolPeer(2, (socket, port, request) ->
+                     socket.getOutputStream().write(reply(config, request, responder(port, boot.get()))))) {
+            transport.exchange(peer.endpoint());
+            boot.set(3); // The peer restarts on the same port with a new boot ID.
+            transport.exchange(peer.endpoint());
+            assertTrue(table.snapshot().identityConflicts().isEmpty());
+            assertEquals(2, metrics.outbound.get());
+            assertEquals(List.of(), lines);
+            var assessments = new java.util.HashMap<UUID, MembershipTable.Assessment>();
+            table.snapshot().members().forEach(view -> assessments.put(view.record().key().bootId(), view.assessment()));
+            assertEquals(MembershipTable.Assessment.DEAD, assessments.get(new UUID(0, 2)));
+            assertEquals(MembershipTable.Assessment.ALIVE, assessments.get(new UUID(0, 3)));
         }
     }
 

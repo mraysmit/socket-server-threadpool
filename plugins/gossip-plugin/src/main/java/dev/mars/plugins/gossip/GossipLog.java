@@ -25,7 +25,7 @@ import java.util.function.LongSupplier;
 
 /** Per-instance, bounded console diagnostics. Never log member metadata or raw requests/replies. */
 final class GossipLog {
-    private enum Repeated { IDENTITY_CONFLICT, ROUND_FAILED }
+    private enum Repeated { IDENTITY_CONFLICT, DUPLICATE_SERVER_ID, ROUND_FAILED }
     private static final long INTERVAL_NANOS = Duration.ofSeconds(30).toNanos();
     private static final int FIELD_LIMIT = 512;
     private final String context;
@@ -46,9 +46,22 @@ final class GossipLog {
     }
 
     void identity(String direction, GossipConfig.Seed peer, UUID messageId, String reason) {
-        long suppressed = permit(Repeated.IDENTITY_CONFLICT);
+        identity(Repeated.IDENTITY_CONFLICT, "WARN", direction, peer, messageId, reason);
+    }
+
+    /**
+     * Two reachable processes advertising one server ID: a configuration error only an operator can resolve, so it is
+     * an ERROR, limited in its own window so that ordinary identity failures cannot hide it.
+     */
+    void duplicateServerIds(String direction, GossipConfig.Seed peer, UUID messageId, String reason) {
+        identity(Repeated.DUPLICATE_SERVER_ID, "ERROR", direction, peer, messageId, reason);
+    }
+
+    private void identity(Repeated window, String level, String direction, GossipConfig.Seed peer, UUID messageId,
+            String reason) {
+        long suppressed = permit(window);
         if (suppressed < 0) { return; }
-        emit("WARN", "IDENTITY_CONFLICT", " | direction=" + field(direction)
+        emit(level, "IDENTITY_CONFLICT", " | direction=" + field(direction)
                 + " | peerServerId=" + field(peer.serverId()) + " | peerHost=" + field(peer.host())
                 + " | peerPort=" + peer.port() + " | messageId=" + (messageId == null ? "-" : messageId)
                 + " | reason=" + field(reason) + " | suppressed=" + suppressed);

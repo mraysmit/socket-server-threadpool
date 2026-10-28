@@ -51,7 +51,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
 
     /** For callers that own a standalone table, as the design document describes. */
     public GossipTransport(GossipConfig config, MembershipTable table) {
-        this(config, table, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15));
+        this(config, table, new GossipMetrics());
     }
 
     public GossipTransport(GossipConfig config, MembershipTable table, Duration connectTimeout,
@@ -59,8 +59,13 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
         this(config, table, new GossipMetrics(), connectTimeout, readIdleTimeout, exchangeTimeout);
     }
 
+    /**
+     * The configured connect timeout. A request to an unreachable peer holds an exchange slot for that long, so it should
+     * be well below the suspect threshold: otherwise a partition can tie up every slot until reachable peers go suspect.
+     */
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics) {
-        this(config, table, metrics, Duration.ofSeconds(5), Duration.ofSeconds(10), Duration.ofSeconds(15));
+        this(config, table, metrics, Duration.ofMillis(config.connectTimeoutMillis()), Duration.ofSeconds(10),
+                Duration.ofSeconds(15));
     }
 
     GossipTransport(GossipConfig config, MembershipTable table, GossipMetrics metrics,
@@ -146,7 +151,7 @@ public final class GossipTransport implements GossipRuntime.ExchangeClient {
             merge(result);
             var conflicts = table.identityConflicts();
             if (!conflicts.isEmpty()) {
-                log.identity(OUTBOUND, peer, messageId, "Reachable duplicate server IDs: " + conflicts);
+                log.duplicateServerIds(OUTBOUND, peer, messageId, "Reachable duplicate server IDs: " + conflicts);
             }
             return result;
         }

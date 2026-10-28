@@ -33,14 +33,14 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
                            long roundMillis, long heartbeatMillis, int fanout, int maxInflight,
                            int maxMembers, int maxRecords, int maxBatchMembers, int maxExchangeBytes,
                            long suspectAfterMillis, long deadAfterMillis, long terminalRetentionMillis,
-                           boolean discoveryEnabled) {
+                           long connectTimeoutMillis, boolean discoveryEnabled) {
     public static final String CONFIG_PROPERTY = "gossip.config";
     /** The largest millisecond setting that still converts to nanoseconds without overflow. */
     private static final long MAX_MILLIS = TimeUnit.NANOSECONDS.toMillis(Long.MAX_VALUE);
     private static final Set<String> KEYS = Set.of("swarm.id", "advertise.host", "seeds", "round.millis",
             "heartbeat.millis", "fanout", "max.inflight", "max.members", "max.records", "max.batch.members",
             "max.exchange.bytes", "suspect.after.millis", "dead.after.millis", "terminal.retention.millis",
-            "discovery.enabled");
+            "connect.timeout.millis", "discovery.enabled");
 
     public GossipConfig {
         requireId(swarmId, "swarm.id");
@@ -54,6 +54,7 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
         requireMillis(suspectAfterMillis, "suspect.after.millis");
         requireMillis(deadAfterMillis, "dead.after.millis");
         requireMillis(terminalRetentionMillis, "terminal.retention.millis");
+        requireMillis(connectTimeoutMillis, "connect.timeout.millis");
         if (suspectAfterMillis <= heartbeatMillis || deadAfterMillis <= suspectAfterMillis
                 || terminalRetentionMillis < deadAfterMillis) {
             throw invalid("timing", "requires heartbeat < suspect < dead <= terminal retention");
@@ -130,10 +131,11 @@ public record GossipConfig(String swarmId, String advertiseHost, List<Seed> seed
         long suspectAfterMillis = number(resolved, "suspect.after.millis", 60000);
         long deadAfterMillis = number(resolved, "dead.after.millis", 180000);
         long terminalRetentionMillis = number(resolved, "terminal.retention.millis", 1800000);
+        long connectTimeoutMillis = number(resolved, "connect.timeout.millis", 5000);
         boolean discoveryEnabled = Boolean.parseBoolean(discovery);
         return new GossipConfig(swarmId, advertiseHost, seeds, roundMillis, heartbeatMillis, fanout, maxInflight,
                 maxMembers, maxRecords, maxBatchMembers, maxExchangeBytes, suspectAfterMillis, deadAfterMillis,
-                terminalRetentionMillis, discoveryEnabled);
+                terminalRetentionMillis, connectTimeoutMillis, discoveryEnabled);
     }
 
     private static boolean validOverride(String name) {

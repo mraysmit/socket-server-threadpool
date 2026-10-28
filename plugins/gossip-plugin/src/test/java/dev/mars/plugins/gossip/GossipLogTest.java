@@ -55,6 +55,16 @@ class GossipLogTest {
         }
     }
 
+    @Test void duplicateServerIdsAreErrorsInAWindowOrdinaryIdentityFailuresCannotUse() {
+        for (int i = 0; i < 5; i++) { log.identity("outbound", peer, null, "Gossip server ID mismatch"); }
+        log.duplicateServerIds("outbound", peer, null, "Reachable duplicate server IDs: [Server-002]");
+        log.duplicateServerIds("outbound", peer, null, "Reachable duplicate server IDs: [Server-002]");
+        assertEquals(2, lines.size());
+        assertTrue(lines.get(0).contains("] WARN | plugin=gossip | event=IDENTITY_CONFLICT"), lines.get(0));
+        assertTrue(lines.get(1).contains("] ERROR | plugin=gossip | event=IDENTITY_CONFLICT"), lines.get(1));
+        assertTrue(lines.get(1).contains("reason=Reachable duplicate server IDs: [Server-002] | suppressed=0"), lines.get(1));
+    }
+
     @Test void repeatedFailuresUseIndependentWindowsAndReportSuppressionOnTheNextEntry() {
         log.identity("inbound", peer, null, "conflict");
         for (int i = 0; i < 100; i++) { log.identity("inbound", peer, null, "conflict"); }

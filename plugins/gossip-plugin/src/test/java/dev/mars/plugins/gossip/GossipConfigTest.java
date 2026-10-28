@@ -53,6 +53,7 @@ class GossipConfigTest {
         assertEquals(60000, config.suspectAfterMillis());
         assertEquals(180000, config.deadAfterMillis());
         assertEquals(1800000, config.terminalRetentionMillis());
+        assertEquals(5000, config.connectTimeoutMillis());
         assertFalse(config.discoveryEnabled());
         assertTrue(config.seeds().isEmpty());
         assertThrows(UnsupportedOperationException.class,
@@ -69,6 +70,7 @@ class GossipConfigTest {
         properties.setProperty("suspect.after.millis", "1003");
         properties.setProperty("dead.after.millis", "1004");
         properties.setProperty("terminal.retention.millis", "1005");
+        properties.setProperty("connect.timeout.millis", "1006");
         properties.setProperty("fanout", "3");
         properties.setProperty("max.inflight", "4");
         properties.setProperty("max.members", "5");
@@ -84,6 +86,7 @@ class GossipConfigTest {
         assertEquals(1003, config.suspectAfterMillis());
         assertEquals(1004, config.deadAfterMillis());
         assertEquals(1005, config.terminalRetentionMillis());
+        assertEquals(1006, config.connectTimeoutMillis());
         assertEquals(3, config.fanout());
         assertEquals(4, config.maxInflight());
         assertEquals(5, config.maxMembers());
@@ -153,7 +156,8 @@ class GossipConfigTest {
             "max.members,0", "max.members,2147483648", "max.records,127", "max.batch.members,0",
             "max.batch.members,513", "fanout,0", "fanout,129", "max.inflight,0", "max.inflight,129",
             "max.exchange.bytes,1023", "max.exchange.bytes,65537", "suspect.after.millis,5000",
-            "dead.after.millis,60000", "terminal.retention.millis,179999", "discovery.enabled,yes",
+            "dead.after.millis,60000", "terminal.retention.millis,179999", "connect.timeout.millis,0",
+            "connect.timeout.millis,9223372036855", "discovery.enabled,yes",
             "discovery.enabled,true", "swarm.id,bad id", "advertise.host,http://localhost",
             "advertise.host,localhost:9000", "advertise.host,[::1]", "advertise.host,localhost/path",
             "advertise.host,localhost?query", "advertise.host,user@localhost", "round.milis,1000",
