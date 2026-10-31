@@ -130,6 +130,11 @@ public final class KeepAliveClient implements AutoCloseable {
         PeerClosedException() { super("Peer closed without a reply"); }
     }
 
+    /** An injected network fault swallowed the request; to its caller this is any other timeout. */
+    private static final class LostRequest extends SocketTimeoutException {
+        LostRequest(String message) { super(message); }
+    }
+
     private final Settings settings;
     private final Listener listener;
     private final Supplier<Socket> sockets;
@@ -221,6 +226,27 @@ public final class KeepAliveClient implements AutoCloseable {
     }
 
     private Exchange exchange(InetSocketAddress address, byte[] keepAlive, byte[] plain, long deadline) throws IOException {
+        var call = source == null ? null : PeerTraffic.begin(source, address, plain);
+        try {
+            var exchange = exchangeAfterFaults(address, keepAlive, plain, deadline);
+            var error = exchange.reply().error();
+            if (error == null) { PeerTraffic.end(call, PeerTraffic.Outcome.OK, null); }
+            else { PeerTraffic.end(call, PeerTraffic.Outcome.ERROR_REPLY, error.code().name()); }
+            return exchange;
+        } catch (IOException | RuntimeException failure) {
+            PeerTraffic.end(call, outcomeOf(failure), failure.getMessage());
+            throw failure;
+        }
+    }
+
+    private static PeerTraffic.Outcome outcomeOf(Exception failure) {
+        if (failure instanceof LostRequest) { return PeerTraffic.Outcome.LOST; }
+        if (failure instanceof SocketTimeoutException) { return PeerTraffic.Outcome.TIMEOUT; }
+        if (failure instanceof ConnectFailure) { return PeerTraffic.Outcome.REFUSED; }
+        return PeerTraffic.Outcome.FAILED;
+    }
+
+    private Exchange exchangeAfterFaults(InetSocketAddress address, byte[] keepAlive, byte[] plain, long deadline) throws IOException {
         injectFaults(address, deadline);
         var reply = parse(exchangeOver(address, keepAlive, plain, deadline));
         if (rejectsKeepAlive(reply)) {
@@ -242,7 +268,7 @@ public final class KeepAliveClient implements AutoCloseable {
         if (fault.delayMillis() > 0) { sleepUntil(Math.min(deadline, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(fault.delayMillis()))); }
         if (fault.lost()) {
             sleepUntil(Math.min(deadline, System.nanoTime() + connectNanos));
-            throw new SocketTimeoutException(settings.name() + " request to " + address + " was lost (injected network fault)");
+            throw new LostRequest(settings.name() + " request to " + address + " was lost (injected network fault)");
         }
         checkDeadline(deadline);
     }

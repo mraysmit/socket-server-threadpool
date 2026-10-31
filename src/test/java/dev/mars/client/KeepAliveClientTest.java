@@ -290,6 +290,66 @@ class KeepAliveClientTest {
         }
     }
 
+    @Test void anObserverIsToldOfEachCallAClientMakesForAServerAndHowItEnded() throws Exception {
+        var quick = KeepAliveClient.Settings.of("Test", 65_536, Duration.ofMillis(300), Duration.ofSeconds(5), Duration.ofSeconds(5));
+        var started = new CopyOnWriteArrayList<PeerTraffic.Call>();
+        var ended = new CopyOnWriteArrayList<PeerTraffic.Outcome>();
+        var details = new CopyOnWriteArrayList<String>();
+        int closedPort;
+        try (var closed = new ServerSocket(0)) { closedPort = closed.getLocalPort(); }
+        try (var running = new Running();
+             var observed = new KeepAliveClient(quick, KeepAliveClient.Listener.NONE, Socket::new, "Server-A");
+             var plain = new KeepAliveClient(quick)) {
+            PeerTraffic.install(new PeerTraffic.Observer() {
+                @Override public void started(PeerTraffic.Call call) { started.add(call); }
+                @Override public void finished(PeerTraffic.Call call, PeerTraffic.Outcome outcome, String detail, long elapsedNanos) {
+                    assertTrue(elapsedNanos >= 0);
+                    ended.add(outcome);
+                    details.add(detail);
+                }
+            });
+            assertEquals("x", echo(observed, running.address(), "x"));
+            var call = started.getFirst();
+            assertEquals("Server-A", call.source());
+            assertEquals(running.address(), call.destination());
+            assertEquals("echo", call.instruction());
+            assertNull(call.operation(), "Echo has no operation");
+            assertEquals(36, call.messageId().length());
+            assertTrue(call.requestBytes() > 0);
+            assertEquals(List.of(PeerTraffic.Outcome.OK), ended);
+            assertNull(details.getFirst());
+
+            assertThrows(CommandExecutionException.class, () -> observed.execute(running.address(), "nope", Map.of("operation", "try")));
+            assertEquals("nope", started.get(1).instruction());
+            assertEquals("try", started.get(1).operation());
+            assertEquals(PeerTraffic.Outcome.ERROR_REPLY, ended.get(1));
+            assertEquals("UNKNOWN_INSTRUCTION", details.get(1));
+
+            assertThrows(java.net.SocketException.class, () -> observed.execute(new InetSocketAddress("127.0.0.1", closedPort), "echo", Map.of("text", "x")));
+            assertEquals(PeerTraffic.Outcome.REFUSED, ended.get(2));
+
+            NetworkFaults.install((source, destination) -> new NetworkFaults.Fault(0, true));
+            assertThrows(java.net.SocketTimeoutException.class, () -> echo(observed, running.address(), "x"));
+            assertEquals(PeerTraffic.Outcome.LOST, ended.get(3));
+            assertTrue(details.get(3).contains("injected network fault"), details.get(3));
+            NetworkFaults.clear();
+
+            assertEquals("y", echo(plain, running.address(), "y"));
+            assertEquals(4, started.size(), "A client that sends for no server is not watched");
+
+            PeerTraffic.install(new PeerTraffic.Observer() {
+                @Override public void started(PeerTraffic.Call watched) { throw new IllegalStateException("broken observer"); }
+                @Override public void finished(PeerTraffic.Call watched, PeerTraffic.Outcome outcome, String detail, long elapsedNanos) {
+                    throw new IllegalStateException("broken observer");
+                }
+            });
+            assertEquals("z", echo(observed, running.address(), "z"), "A broken observer must not disturb the request");
+        } finally {
+            NetworkFaults.clear();
+            PeerTraffic.clear();
+        }
+    }
+
     @Test void settingsRefuseLimitsThatCannotWork() {
         assertThrows(IllegalArgumentException.class, () -> KeepAliveClient.Settings.of(" ", 1, Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1)));
         assertThrows(IllegalArgumentException.class, () -> KeepAliveClient.Settings.of("T", 0, Duration.ofSeconds(1), Duration.ofSeconds(1), Duration.ofSeconds(1)));
